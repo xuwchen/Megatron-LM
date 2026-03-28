@@ -3342,7 +3342,7 @@ class GradReducePipeline:
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
+            if len(double_buf_units) > 1:
                 keep_n -= 1
         self.wait_for_previous_grad_reduce(keep_n)
 
