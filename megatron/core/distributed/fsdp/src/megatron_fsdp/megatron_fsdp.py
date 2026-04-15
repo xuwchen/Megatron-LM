@@ -466,6 +466,12 @@ class MegatronFSDP(torch.nn.Module):
         if self.data_parallel_sharding_strategy == "no_shard":
             return
 
+        # Skip params not registered in param_to_param_group (CUDA graph compatibility).
+        param_map = self.param_and_grad_buffer.param_to_param_group
+        params = [p for p in params if p in param_map]
+        if len(params) == 0:
+            return
+
         ag_pipeline = self.all_gather_pipeline
         # Only all-gather HSDP buffer parameters in the beginning of a new optimization
         # step cycle, or on every step if model_auto_sync is enabled, i.e. update
@@ -572,8 +578,11 @@ class MegatronFSDP(torch.nn.Module):
                 - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
                 the FP8 transpose cache associated with the module’s parameters.
             """
+            param_map = self.param_and_grad_buffer.param_to_param_group
             for param in module.parameters():
-                bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                if param not in param_map:
+                    continue
+                bucket_id = param_map[param]
                 self.all_gather_pipeline.release_bucket(bucket_id, bwd, lazy=lazy)
 
             if not self.ddp_config.keep_fp8_transpose_cache:
@@ -692,7 +701,8 @@ class MegatronFSDP(torch.nn.Module):
                 - In hybrid FSDP configurations, an outer FSDP group gradient reduction
                 may be triggered.
             """
-            # Skip entire gradient processing during CUDA graph capture.
+            # Skip gradient processing during CUDA graph capture to avoid
+            # conflicting grad buffer allocations with graph-captured addresses.
             if is_graph_capturing():
                 return
 
@@ -893,6 +903,9 @@ class MegatronFSDP(torch.nn.Module):
             Sub-module pre-backward hook to all-gather the module parameters
             before the backward pass.
             """
+            if is_graph_capturing():  # skip param unshard during CUDA graph capture
+                return
+
             # Set the module's training state to PRE_BACKWARD.
             module._training_state = TrainingState.PRE_BACKWARD
 

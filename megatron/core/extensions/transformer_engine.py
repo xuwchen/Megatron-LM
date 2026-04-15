@@ -1757,12 +1757,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group_for_te = None
 
             if is_te_min_version("2.14.0"):
-                extra_kwargs["single_grouped_weight"] = getattr(
-                    config, "moe_single_grouped_weight", False
-                )
-                extra_kwargs["single_grouped_bias"] = getattr(
-                    config, "moe_single_grouped_bias", False
-                )
+                # Runtime check: some TE builds report >= 2.14.0 but lack this feature.
+                import inspect as _inspect
+                _gl_params = _inspect.signature(
+                    te.pytorch.GroupedLinear.__init__
+                ).parameters
+                if "single_grouped_weight" in _gl_params:
+                    extra_kwargs["single_grouped_weight"] = getattr(
+                        config, "moe_single_grouped_weight", False
+                    )
+                    extra_kwargs["single_grouped_bias"] = getattr(
+                        config, "moe_single_grouped_bias", False
+                    )
 
             super().__init__(
                 num_gemms=num_gemms,

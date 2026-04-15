@@ -769,13 +769,18 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                         self.idle_buffer.remove((buf_group_id, bucket_offset))
                         break
 
-            assert buffer_name is not None, (
-                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
-                f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
-                f"bucket_offset: {bucket_offset} \n"
-                f"current using_buffer: {self.using_buffer} \n"
-                f"current idle_buffer: {self.idle_buffer}"
-            )
+            if buffer_name is None:
+                # Pool exhausted — dynamically expand instead of asserting.
+                # This happens during CUDA graph capture backward warmup.
+                new_buf_group_id = self.size
+                self.size += 1
+                buffer_name = self._get_gbuf_name(new_buf_group_id, bucket_offset)
+                self.using_buffer[bucket_id] = (new_buf_group_id, bucket_offset)
+                # Add idle slots for other bucket offsets of this new buffer group
+                num_bucket = len(self.fsdp_unit_buckets[self.fsdp_double_buffer_units[0]])
+                for bo in range(num_bucket):
+                    if bo != bucket_offset:
+                        self.idle_buffer.append((new_buf_group_id, bo))
         elif self.fallback_to_persistent_buffer is True:
             buffer_name = f"{self.name}_not_fit_in_fixed_pool_{bucket_id}_{size}_{dtype}_{device}"
         else:
@@ -3769,7 +3774,13 @@ class AllGatherPipeline:
         if len(params) == 0:
             return
 
-        ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
+        # Skip params not registered in param_to_param_group (CUDA graph compatibility).
+        param_map = self.buffer.param_to_param_group
+        params = [p for p in params if p in param_map]
+        if len(params) == 0:
+            return
+
+        ag_buckets = [param_map[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
         if self.buffer.ddp_config.fsdp_double_buffer:

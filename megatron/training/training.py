@@ -2385,6 +2385,19 @@ def force_param_sync(model_chunks: list[DDP]) -> None:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
 
+
+def _get_megatron_fsdp_instances(model_chunks):
+    """Find MegatronFSDP instances from possibly-wrapped model chunks."""
+    results = []
+    for chunk in model_chunks:
+        obj = chunk
+        while hasattr(obj, 'module') and not hasattr(obj, '_replace_param_with_raw_if_needed'):
+            obj = obj.module
+        if hasattr(obj, '_replace_param_with_raw_if_needed'):
+            results.append(obj)
+    return results
+
+
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
 MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
@@ -3014,6 +3027,10 @@ def train(
         ):
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model, param_sync=False)
+            # For MFSDP: swap DTensor params to raw tensors before graph capture
+            # so that FSDP fetch_bucket updates are visible to TE ops.
+            for obj in _get_megatron_fsdp_instances(model):
+                obj._replace_param_with_raw_if_needed()
             cuda_graph_helper.create_cudagraphs()
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
