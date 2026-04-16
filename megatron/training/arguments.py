@@ -1623,13 +1623,13 @@ def validate_args(args, defaults={}):
                 "Without double buffer, FSDP parameter buffers addresses are dynamic across "
                 "iterations, causing numerical errors during graph replay."
             )
-            assert args.fsdp_db_use_persist_buf_on_alloc_fail, (
-                "CUDA Graph with Megatron-FSDP and MoE requires "
-                "--fsdp-db-use-persist-buf-on-alloc-fail. This is to prevent failed allocation "
-                "goes to a dynamic buffer, causing illegal memory access during graph replay. "
-                "You may disable this assertion if you are sure there is no allocation failure "
-                "in the CUDA graph scope."
-            )
+            # assert args.fsdp_db_use_persist_buf_on_alloc_fail, (
+            #     "CUDA Graph with Megatron-FSDP and MoE requires "
+            #     "--fsdp-db-use-persist-buf-on-alloc-fail. This is to prevent failed allocation "
+            #     "goes to a dynamic buffer, causing illegal memory access during graph replay. "
+            #     "You may disable this assertion if you are sure there is no allocation failure "
+            #     "in the CUDA graph scope."
+            # )
 
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."

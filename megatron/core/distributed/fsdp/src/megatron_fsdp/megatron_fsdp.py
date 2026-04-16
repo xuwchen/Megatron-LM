@@ -272,6 +272,11 @@ class MegatronFSDP(torch.nn.Module):
         self.enable_fine_grained_param_gather_hook = enable_fine_grained_param_gather_hook
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
+        # Set of param ids whose fused wgrad is captured inside a CUDA graph.
+        # During graph replay, _grad_acc must skip re-allocation and zero_()
+        # for these params to preserve the wgrad written by the graph.
+        self._cuda_graph_fused_wgrad_params = set()
+
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
         # If not provided, Megatron-FSDP will default to a simple data parallel index
         # supported by torch.distributed.group.WORLD.
@@ -600,23 +605,29 @@ class MegatronFSDP(torch.nn.Module):
             gbuf = group.hsdp_gbuf if group.hsdp_gbuf else group.main_grad_buffer
             if gbuf.is_data_distributed:
                 if not param.grad_added_to_main_grad:
-                    # Get `main_grad` will allocate bucket, check that the currently
-                    # used main_grad buffer does not exceed the scope of two FSDP Unit
-                    # Modules, i.e., the buffer limit imposed by double-buffer allocator.
-                    if self.ddp_config.fsdp_double_buffer:
-                        self.grad_reduce_pipeline._enforce_double_buffer_limit([group_id])
-
-                    param.main_grad = param.get_main_grad()
-                    if param.grad is not None:
-                        if self.report_nan_in_param_grad:
-                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
-                        # Copy the gradient into the allocated main gradient bucket.
-                        # It will be reduce-scattered and accumulated into gbuf.
-                        param.main_grad.copy_(to_local_if_dtensor(param.grad))
-                        del param.grad
+                    # During CUDA graph replay, fused wgrad GEMMs already wrote
+                    # gradients into main_grad at the graph-captured address.
+                    # Skip re-allocation and zero_() to preserve that data.
+                    if id(param) in self._cuda_graph_fused_wgrad_params:
+                        param.grad_added_to_main_grad = True
                     else:
-                        # Prepare for fused wgrad accumulation.
-                        param.main_grad.zero_()
+                        # Get `main_grad` will allocate bucket, check that the currently
+                        # used main_grad buffer does not exceed the scope of two FSDP Unit
+                        # Modules, i.e., the buffer limit imposed by double-buffer allocator.
+                        if self.ddp_config.fsdp_double_buffer:
+                            self.grad_reduce_pipeline._enforce_double_buffer_limit([group_id])
+
+                        param.main_grad = param.get_main_grad()
+                        if param.grad is not None:
+                            if self.report_nan_in_param_grad:
+                                _check_nan_in_grad(to_local_if_dtensor(param.grad))
+                            # Copy the gradient into the allocated main gradient bucket.
+                            # It will be reduce-scattered and accumulated into gbuf.
+                            param.main_grad.copy_(to_local_if_dtensor(param.grad))
+                            del param.grad
+                        else:
+                            # Prepare for fused wgrad accumulation.
+                            param.main_grad.zero_()
             # Unsharded Gradient Buffer
             else:
                 if not param.grad_added_to_main_grad:
@@ -692,8 +703,20 @@ class MegatronFSDP(torch.nn.Module):
                 - In hybrid FSDP configurations, an outer FSDP group gradient reduction
                 may be triggered.
             """
-            # Skip entire gradient processing during CUDA graph capture.
+            # During CUDA graph capture, TE's fused wgrad path allocates grad
+            # buffers and writes wgrad via GEMMs that get baked into the graph.
+            # Record which params have graph-captured wgrad so that _grad_acc
+            # skips re-allocation and zero_() during replay (which would destroy
+            # the wgrad the graph just wrote). Free pool slots to prevent exhaustion.
             if is_graph_capturing():
+                for param in param_list:
+                    if hasattr(param, 'main_grad') and param.main_grad is not None:
+                        self._cuda_graph_fused_wgrad_params.add(id(param))
+                    bucket_id = self.param_and_grad_buffer.param_to_param_group.get(param)
+                    if bucket_id is not None:
+                        gbuf = self.param_and_grad_buffer.parameter_groups[bucket_id].main_grad_buffer
+                        if gbuf is not None:
+                            gbuf.free_bucket_storage()
                 return
 
             # Filter out shared parameters whose gradients are handled by the root hook.
