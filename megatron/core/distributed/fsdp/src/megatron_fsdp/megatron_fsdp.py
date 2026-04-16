@@ -692,8 +692,17 @@ class MegatronFSDP(torch.nn.Module):
                 - In hybrid FSDP configurations, an outer FSDP group gradient reduction
                 may be triggered.
             """
-            # Skip entire gradient processing during CUDA graph capture.
+            # During CUDA graph capture, TE's fused wgrad path still allocates
+            # grad buffers via weight.get_main_grad(), but reduce-scatter must not
+            # run (no NCCL collectives during capture). Free the allocated grad
+            # buffers immediately so the double buffer pool doesn't exhaust.
             if is_graph_capturing():
+                for param in param_list:
+                    bucket_id = self.param_and_grad_buffer.param_to_param_group.get(param)
+                    if bucket_id is not None:
+                        gbuf = self.param_and_grad_buffer.parameter_groups[bucket_id].main_grad_buffer
+                        if gbuf is not None:
+                            gbuf.free_bucket_storage()
                 return
 
             # Filter out shared parameters whose gradients are handled by the root hook.
