@@ -85,6 +85,11 @@ try:
 except Exception:
     HAVE_TE = False
 
+try:
+    import torch.distributed._symmetric_memory as torch_symm_mem
+except ImportError:
+    torch_symm_mem = None
+
 NCCL_ALLOCATOR = None
 
 try:
@@ -226,6 +231,45 @@ class MultiGroupUBRAllocator:
                 f"group.group_desc:{group.group_desc}",
             )
             backend.register_mem_pool(self.pool)
+
+
+def _append_unique_ubr_group(groups, group):
+    """Append a process group once, preserving construction order."""
+    if group is None:
+        return
+    if any(group is existing_group for existing_group in groups):
+        return
+    groups.append(group)
+
+
+def _require_torch_symmetric_memory():
+    if torch_symm_mem is None:
+        raise RuntimeError(
+            "fsdp_use_torch_symmetric_memory requires "
+            "torch.distributed._symmetric_memory, but this PyTorch build does not provide it."
+        )
+    missing_attrs = [
+        name
+        for name in ("set_backend", "get_mem_pool", "rendezvous")
+        if not hasattr(torch_symm_mem, name)
+    ]
+    if missing_attrs:
+        raise RuntimeError(
+            "fsdp_use_torch_symmetric_memory requires PyTorch symmetric memory APIs: "
+            f"missing {missing_attrs}."
+        )
+    return torch_symm_mem
+
+
+def _get_torch_symmetric_memory_group_name(group):
+    group_name = getattr(group, "group_name", None)
+    if group_name is None:
+        group_desc = getattr(group, "group_desc", None)
+        raise RuntimeError(
+            "fsdp_use_torch_symmetric_memory requires ProcessGroup.group_name for "
+            f"rendezvous, but it is missing on group {group} ({group_desc})."
+        )
+    return group_name
 
 
 @dataclasses.dataclass
@@ -509,7 +553,11 @@ class TemporaryBucketAllocator:
         allocate a temporary bucket.
         """
         if bucket_id not in self.buckets:
-            self.buckets[bucket_id] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
+            mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
+            with mem_alloc_context():
+                self.buckets[bucket_id] = Bucket(
+                    data=torch.empty(size, dtype=dtype, device=device)
+                )
         return self.buckets[bucket_id]
 
     def free(self, bucket_id: int):
@@ -541,10 +589,15 @@ class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
         """
         allocate a temporary bucket.
         """
+        mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
         if bucket_id not in self.buckets:
-            self.buckets[bucket_id] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
+            with mem_alloc_context():
+                self.buckets[bucket_id] = Bucket(
+                    data=torch.empty(size, dtype=dtype, device=device)
+                )
         bucket = self.buckets[bucket_id]
-        _alloc_storage(bucket.data, torch.Size([size]))
+        with mem_alloc_context():
+            _alloc_storage(bucket.data, torch.Size([size]))
         return bucket
 
     def free(self, bucket_id: int):
@@ -784,7 +837,11 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             # will do dynamic memory allocation.
             logging.debug(f"[FSDP] Using backup allocator for {bucket_id} {fsdp_unit_id}")
             return self.backup_allocator.allocate(
-                bucket_id=bucket_id, size=size, dtype=dtype, device=device
+                bucket_id=bucket_id,
+                size=size,
+                dtype=dtype,
+                device=device,
+                mem_alloc_context=mem_alloc_context,
             )
 
         # Use buffer_name to get memory from global memory.
@@ -1658,24 +1715,31 @@ class ParamAndGradBuffer:
         self.reset_parameters_for_meta_device_init_module = (
             reset_parameters_for_meta_device_init_module
         )
-        self.ubr_groups = None
+        self.ubr_groups = []
+        self.nccl_memory_pool = None
         self.already_registered = False
-        # User buffer registration related settings
+        use_torch_symmetric_memory = self.ddp_config.fsdp_use_torch_symmetric_memory
+        if self.ddp_config.nccl_ub and use_torch_symmetric_memory:
+            raise ValueError("nccl_ub and fsdp_use_torch_symmetric_memory are mutually exclusive.")
+
+        # Registered or symmetric communication buffers require persistent reusable storage.
+        if self.ddp_config.nccl_ub or use_torch_symmetric_memory:
+            self.ddp_config.fsdp_double_buffer = True
+
+        # User buffer registration related settings.
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
                 "To use user buffer registration, "
                 "either requires megatron.core.nccl_allocator or apex.contrib.nccl_allocator"
             )
-            # Since the user buffer registration requires (non-dynamic) persistent memory,
-            # it always uses fsdp double buffer.
-            self.ddp_config.fsdp_double_buffer = True
             # Initialize the NCCL memory pool.
             global NCCL_MEMORY_POOL
             # Initialize NCCL allocator runtime if available
             nccl_allocator.init()
-            NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool(
+            self.nccl_memory_pool = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
+            NCCL_MEMORY_POOL = self.nccl_memory_pool
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -1687,42 +1751,55 @@ class ParamAndGradBuffer:
                 logging.INFO,
                 f"[Rank {torch.distributed.get_rank()}] FSDP double buffer is enabled.",
             )
-            # Select the communicator groups to register FSDP buffers.
-            self.ubr_groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
-            if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
-                # Expert-DP group when using EP
-                self.ubr_groups.append(self.dist_index.get_fsdp_group(is_expert_parallel=True))
-            if (
+
+        if use_torch_symmetric_memory:
+            symm_mem = _require_torch_symmetric_memory()
+            symm_mem.set_backend("NCCL")
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[Rank {torch.distributed.get_rank()}] PyTorch symmetric memory is enabled "
+                "for Megatron-FSDP all-gather buffers.",
+            )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[Rank {torch.distributed.get_rank()}] FSDP double buffer is enabled.",
+            )
+
+        if self.ddp_config.nccl_ub or use_torch_symmetric_memory:
+            # Select the communicator groups that can issue collectives on FSDP buffers.
+            # A group can appear through multiple lookup paths, so keep the list unique.
+            _append_unique_ubr_group(
+                self.ubr_groups, self.dist_index.get_fsdp_group(is_expert_parallel=False)
+            )
+            # Expert-DP group when using EP.
+            _append_unique_ubr_group(
+                self.ubr_groups, self.dist_index.get_fsdp_group(is_expert_parallel=True)
+            )
+            # All-gather groups used when overlapping all-gather and gradient reduction.
+            _append_unique_ubr_group(
+                self.ubr_groups,
                 self.dist_index.get_fsdp_group(
                     is_expert_parallel=False, independent_all_gather=True
-                )
-                is not None
-            ):
-                # All-gather group used when overlapping all-gather and gradient reduction.
-                self.ubr_groups.append(
-                    self.dist_index.get_fsdp_group(
-                        is_expert_parallel=False, independent_all_gather=True
-                    )
-                )
-            if (
-                self.dist_index.get_fsdp_group(is_expert_parallel=True, independent_all_gather=True)
-                is not None
-            ):
-                # Expert all-gather group used when overlapping all-gather and gradient reduction.
-                self.ubr_groups.append(
-                    self.dist_index.get_fsdp_group(
-                        is_expert_parallel=True, independent_all_gather=True
-                    )
-                )
-            if self.dist_index.get_outer_fsdp_group() is not None:
-                # Outer/Inter-FSDP group when using hybrid FSDP (IB domain, registered last).
-                self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
+                ),
+            )
+            _append_unique_ubr_group(
+                self.ubr_groups,
+                self.dist_index.get_fsdp_group(
+                    is_expert_parallel=True, independent_all_gather=True
+                ),
+            )
+            # Outer/Inter-FSDP group when using hybrid FSDP (IB domain, registered last).
+            _append_unique_ubr_group(self.ubr_groups, self.dist_index.get_outer_fsdp_group())
 
             log_single_rank(
                 logger,
                 logging.INFO,
-                f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):",
+                f"[ParamAndGradBuffer] FSDP communication buffer groups "
+                f"({len(self.ubr_groups)}):",
             )
+            # Force communicator initialization before registration or symmetric-memory rendezvous.
             # All ranks in each group must participate in the collective to avoid deadlock.
             for i, group in enumerate(self.ubr_groups):
                 log_single_rank(
@@ -1742,9 +1819,8 @@ class ParamAndGradBuffer:
             torch.distributed.barrier(async_op=False)
             log_single_rank(logger, logging.INFO, "Call Success with the global communicator group")
 
-        # If using nccl_ub, it returns a function that registers buffers to the NCCL memory pool
-        # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
-        # In the case of not using nccl_ub, it returns a nullcontext
+        # If using NCCL UBR or PyTorch symmetric memory, this returns an allocation context
+        # for FSDP communication buffers. Otherwise it returns a nullcontext.
         self.mem_alloc_context = self.get_mem_alloc_context(
             groups=self.ubr_groups, symmetric=not self.ddp_config.disable_symmetric_registration
         )
@@ -1782,33 +1858,36 @@ class ParamAndGradBuffer:
         """
         Get the memory allocation context for the parameter and gradient buffers.
         """
-        if self.ddp_config.nccl_ub:
+        if self.ddp_config.fsdp_use_torch_symmetric_memory:
+            _require_torch_symmetric_memory()
+            return self.get_torch_symmetric_memory_alloc_context
+        elif self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
                 "To use user buffer registration, "
                 "either requires megatron.core.nccl_allocator or apex.contrib.nccl_allocator"
             )
-            global NCCL_MEMORY_POOL
             if groups is None:
                 # data parallel group is a default group for user buffer registration
                 groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
+            assert self.nccl_memory_pool is not None, "NCCL memory pool is not initialized"
 
             if NCCL_ALLOCATOR == "MCORE":
                 if self.ddp_config.fsdp_manual_registration:
                     return functools.partial(
-                        nccl_allocator.MemPoolAllocatorWithoutRegistration, NCCL_MEMORY_POOL
+                        nccl_allocator.MemPoolAllocatorWithoutRegistration, self.nccl_memory_pool
                     )
                 if len(groups) == 1:
                     # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
                         nccl_allocator.nccl_mem,
-                        NCCL_MEMORY_POOL,
+                        self.nccl_memory_pool,
                         group=groups[0],
                         symmetric=symmetric,
                     )
                 else:
                     mem_alloc_context = functools.partial(
                         nccl_allocator.MultiGroupMemPoolAllocator,
-                        NCCL_MEMORY_POOL,
+                        self.nccl_memory_pool,
                         groups=groups,
                         symmetric=symmetric,
                     )
@@ -1829,18 +1908,38 @@ class ParamAndGradBuffer:
                 if len(groups) == 1:
                     # register buffers to the default group directly using nccl memory allocator
                     mem_alloc_context = functools.partial(
-                        nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=groups[0]
+                        nccl_allocator.nccl_mem, self.nccl_memory_pool, group=groups[0]
                     )
                 else:
                     # Supports multiple groups registration for APEX NCCL allocator.
                     mem_alloc_context = functools.partial(
-                        MultiGroupUBRAllocator, NCCL_MEMORY_POOL, groups=groups
+                        MultiGroupUBRAllocator, self.nccl_memory_pool, groups=groups
                     )
             else:
                 raise ValueError(f"Invalid NCCL allocator: {NCCL_ALLOCATOR}")
             return mem_alloc_context
         else:
             return nullcontext
+
+    def get_torch_symmetric_memory_alloc_context(self):
+        """
+        Return a PyTorch symmetric memory pool context for FSDP communication buffers.
+        """
+        symm_mem = _require_torch_symmetric_memory()
+        device = self.device
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        mem_pool = symm_mem.get_mem_pool(device)
+        return torch.cuda.use_mem_pool(mem_pool)
+
+    def rendezvous_torch_symmetric_memory(self, tensor: torch.Tensor, group) -> None:
+        """
+        Rendezvous a symmetric-memory all-gather output tensor for the given process group.
+        """
+        if not self.ddp_config.fsdp_use_torch_symmetric_memory:
+            return
+        symm_mem = _require_torch_symmetric_memory()
+        symm_mem.rendezvous(tensor, group=_get_torch_symmetric_memory_group_name(group))
 
     def manual_buffer_registration(self):
         """
@@ -1851,9 +1950,7 @@ class ParamAndGradBuffer:
         assert self.ddp_config.fsdp_manual_registration, "FSDP manual registration is not enabled"
         assert not self.already_registered, "Mem pool is already registered"
 
-        self.already_registered = True
-
-        global NCCL_MEMORY_POOL
+        assert self.nccl_memory_pool is not None, "NCCL memory pool is not initialized"
         torch.cuda.synchronize()
         torch.distributed.barrier(async_op=False)
         torch.cuda.synchronize()
@@ -1866,7 +1963,7 @@ class ParamAndGradBuffer:
                 f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
             )
             nccl_allocator.register_mem_pool(
-                NCCL_MEMORY_POOL,
+                self.nccl_memory_pool,
                 group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
@@ -1876,6 +1973,7 @@ class ParamAndGradBuffer:
                 f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
                 f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
             )
+        self.already_registered = True
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
@@ -2117,9 +2215,9 @@ class ParamAndGradBuffer:
                 f"DP-Outer Strategy: {self.ddp_config.outer_dp_sharding_strategy}"
             )
 
-        if self.ddp_config.nccl_ub:
+        if self.ddp_config.nccl_ub or self.ddp_config.fsdp_use_torch_symmetric_memory:
             assert self.ddp_config.fsdp_double_buffer, (
-                "NCCL UB is only supported with FSDP double buffer. "
+                "NCCL UB and PyTorch symmetric memory are only supported with FSDP double buffer. "
                 "Please set fsdp_double_buffer=True in the ddp config."
             )
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
@@ -3184,6 +3282,7 @@ class ParamAndGradBuffer:
                 if buf is None:
                     continue
                 shard = buf.get_shard_from_local_buffer()
+                self.rendezvous_torch_symmetric_memory(buf.data, buf.data_parallel_group)
                 all_gather_handler = torch.distributed.all_gather_into_tensor(
                     output_tensor=buf.data,
                     input_tensor=shard,
@@ -4095,6 +4194,9 @@ class AllGatherPipeline:
                             inner_dp_wbuf = self.get_fsdp_buffer(bucket_id, bwd=bwd)
                             shard_size = inner_dp_wbuf.data_size // outer_fsdp_group.size()
                             rank = outer_fsdp_group.rank()
+                            self.buffer.rendezvous_torch_symmetric_memory(
+                                inner_dp_wbuf.data, outer_fsdp_group
+                            )
                             torch.distributed.all_gather_into_tensor(
                                 output_tensor=inner_dp_wbuf.data,
                                 input_tensor=inner_dp_wbuf.data[
@@ -4251,6 +4353,7 @@ class AllGatherPipeline:
 
         # All-gather the module weights in each buffer shard into the allocated bucket.
         # Now each rank will have a copy of this FSDP unit module's weights.
+        self.buffer.rendezvous_torch_symmetric_memory(bucket.data, wbuf.data_parallel_group)
         param_gather_event = torch.distributed.all_gather_into_tensor(
             output_tensor=bucket.data,
             input_tensor=wbuf.get_shard_from_local_buffer(),

@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from math import log2
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,6 +13,59 @@ from tests.unit_tests.test_utilities import Utils
 rank = Utils.rank
 world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
+
+
+def test_get_nccl_options_sets_cta_policy(monkeypatch):
+    class FakeNCCLOptions:
+        def __init__(self, is_high_priority_stream=False):
+            self.is_high_priority_stream = is_high_priority_stream
+            self.config = SimpleNamespace()
+
+    monkeypatch.setattr(
+        torch.distributed,
+        'ProcessGroupNCCL',
+        SimpleNamespace(Options=FakeNCCLOptions),
+        raising=False,
+    )
+
+    options = ps.get_nccl_options(
+        'dp_cp',
+        {
+            'dp_cp': {
+                'is_high_priority_stream': True,
+                'cga_cluster_size': 4,
+                'max_ctas': 8,
+                'min_ctas': 1,
+                'cta_policy': 2,
+            }
+        },
+    )
+
+    assert options.is_high_priority_stream is True
+    assert options.config.cga_cluster_size == 4
+    assert options.config.max_ctas == 8
+    assert options.config.min_ctas == 1
+    assert options.config.cta_policy == 2
+
+
+def test_get_nccl_options_unsupported_cta_policy_error(monkeypatch):
+    class FakeNCCLConfig:
+        __slots__ = ()
+
+    class FakeNCCLOptions:
+        def __init__(self, is_high_priority_stream=False):
+            self.is_high_priority_stream = is_high_priority_stream
+            self.config = FakeNCCLConfig()
+
+    monkeypatch.setattr(
+        torch.distributed,
+        'ProcessGroupNCCL',
+        SimpleNamespace(Options=FakeNCCLOptions),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match='cta_policy is not supported'):
+        ps.get_nccl_options('dp_cp', {'dp_cp': {'cta_policy': 2}})
 
 
 @pytest.mark.parametrize('order', test_parallel_order)

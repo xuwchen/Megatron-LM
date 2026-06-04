@@ -150,8 +150,8 @@ def init() -> None:
     trigger NCCL errors. To avoid this, the pool is explicitly deregistered
     on entry and re-registered on exit for each context use.
     """
-    # Enables NCCL NVLS algorithm
-    os.environ["NCCL_NVLS_ENABLE"] = "1"
+    # Enable NCCL NVLS by default, while preserving an explicit user or recipe setting.
+    os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
     # Disables the use of the tensor register allocator hook
     os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "0"
     _build_nccl_allocator()

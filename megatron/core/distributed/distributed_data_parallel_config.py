@@ -150,6 +150,14 @@ class DistributedDataParallelConfig:
     initial communication cost.
     """
 
+    fsdp_use_torch_symmetric_memory: bool = False
+    """If true, allocate Megatron-FSDP all-gather communication buffers from PyTorch
+      symmetric memory and rendezvous them before all-gather. This avoids Megatron's
+      NCCL UBR inline C++ allocator path and lets NCCL select symmetric-memory
+      all-gather implementations, including Copy Engine all-gather when zero-CTA
+      policy is enabled.
+    """
+
     outer_dp_sharding_strategy: str = 'no_shard'
     """
     Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.
@@ -213,12 +221,17 @@ class DistributedDataParallelConfig:
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 
-        if self.nccl_ub:
+        if self.nccl_ub and self.fsdp_use_torch_symmetric_memory:
+            raise ValueError("nccl_ub and fsdp_use_torch_symmetric_memory are mutually exclusive.")
+
+        if self.nccl_ub or self.fsdp_use_torch_symmetric_memory:
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
-                    "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
+                    "with nccl_ub or fsdp_use_torch_symmetric_memory due to compatibility issue "
+                    "with torch.cuda.MemPool API."
                 )
+            self.fsdp_double_buffer = True
 
         if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
             assert not self.grad_reduce_in_fp32, (

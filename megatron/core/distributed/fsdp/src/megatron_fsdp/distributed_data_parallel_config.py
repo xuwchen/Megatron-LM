@@ -89,6 +89,14 @@ class DistributedDataParallelConfig:
     initial communication cost.
     """
 
+    fsdp_use_torch_symmetric_memory: bool = False
+    """If true, allocate Megatron-FSDP all-gather communication buffers from PyTorch
+      symmetric memory and rendezvous them before all-gather. This avoids Megatron's
+      NCCL UBR inline C++ allocator path and lets NCCL select symmetric-memory
+      all-gather implementations, including Copy Engine all-gather when zero-CTA
+      policy is enabled.
+    """
+
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 
@@ -155,9 +163,14 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
-        if self.nccl_ub:
+        if self.nccl_ub and self.fsdp_use_torch_symmetric_memory:
+            raise ValueError("nccl_ub and fsdp_use_torch_symmetric_memory are mutually exclusive.")
+
+        if self.nccl_ub or self.fsdp_use_torch_symmetric_memory:
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
-                    "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
+                    "with nccl_ub or fsdp_use_torch_symmetric_memory due to compatibility issue "
+                    "with torch.cuda.MemPool API."
                 )
+            self.fsdp_double_buffer = True

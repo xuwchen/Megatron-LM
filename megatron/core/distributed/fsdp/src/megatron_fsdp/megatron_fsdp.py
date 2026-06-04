@@ -167,9 +167,12 @@ class MegatronFSDP(torch.nn.Module):
             computation performance.
             This flag automatically sets fsdp_double_buffer to True, which uses
             additional GPU memory.
+        fsdp_use_torch_symmetric_memory (bool): Whether to allocate FSDP all-gather
+            communication buffers from PyTorch symmetric memory and rendezvous them
+            before all-gather. Mutually exclusive with nccl_ub.
         fsdp_double_buffer (bool): Whether to use persistently allocated double buffers
             for the temporary memory needed in the FSDP communication. This flag is
-            automatically set to True when nccl_ub is True.
+            automatically set to True when nccl_ub or fsdp_use_torch_symmetric_memory is True.
         fsdp_db_use_persist_buf_on_alloc_fail (bool): Whether to fall back to persistent buffer
             allocator when a bucket does not fit FSDP double buffer size.
         disable_symmetric_registration (bool): Whether to disable symmetric (window) registration
@@ -212,6 +215,7 @@ class MegatronFSDP(torch.nn.Module):
         sync_model_each_microbatch: bool = False,
         keep_fp8_transpose_cache: bool = False,
         nccl_ub: bool = False,
+        fsdp_use_torch_symmetric_memory: bool = False,
         fsdp_double_buffer: bool = False,
         fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
         disable_symmetric_registration: bool = False,
@@ -257,7 +261,10 @@ class MegatronFSDP(torch.nn.Module):
                 average_in_collective=False,
                 keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
                 nccl_ub=nccl_ub,
-                fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+                fsdp_use_torch_symmetric_memory=fsdp_use_torch_symmetric_memory,
+                fsdp_double_buffer=(
+                    fsdp_double_buffer or nccl_ub or fsdp_use_torch_symmetric_memory
+                ),
                 fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
                 disable_symmetric_registration=disable_symmetric_registration,
                 check_for_nan_in_grad=False,

@@ -1274,6 +1274,14 @@ def validate_args(args, defaults={}):
         args.fsdp_manual_registration = True
         warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
 
+    if args.fsdp_use_torch_symmetric_memory:
+        assert (
+            args.use_megatron_fsdp
+        ), "Torch symmetric memory for FSDP is only supported with Megatron FSDP."
+        assert (
+            not args.nccl_ub
+        ), "Torch symmetric memory for FSDP is mutually exclusive with --use-nccl-ub."
+
     if args.fsdp_manual_registration:
         assert (
             args.use_megatron_fsdp
@@ -3880,6 +3888,15 @@ def _add_distributed_args(parser):
         default=False,
         help='Manually register the FSDP communication buffers to NCCL user buffer.'
         'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.',
+    )
+    group.add_argument(
+        '--use-torch-symmetric-memory-for-fsdp',
+        action='store_true',
+        dest='fsdp_use_torch_symmetric_memory',
+        default=False,
+        help='Allocate Megatron-FSDP all-gather buffers from PyTorch symmetric memory and '
+        'rendezvous them before all-gather. This path avoids the Megatron NCCL UBR inline '
+        'C++ allocator and can enable NCCL Copy Engine all-gather when zero-CTA policy is set.',
     )
     group.add_argument(
         '--create-all-gather-group',

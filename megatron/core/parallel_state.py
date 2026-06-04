@@ -174,6 +174,13 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
             nccl_options.config.max_ctas = nccl_comm_cfgs[pg_name]["max_ctas"]
         if "min_ctas" in nccl_comm_cfgs[pg_name]:
             nccl_options.config.min_ctas = nccl_comm_cfgs[pg_name]["min_ctas"]
+        if "cta_policy" in nccl_comm_cfgs[pg_name]:
+            try:
+                nccl_options.config.cta_policy = nccl_comm_cfgs[pg_name]["cta_policy"]
+            except AttributeError as exc:
+                raise RuntimeError(
+                    "cta_policy is not supported by this PyTorch ProcessGroupNCCL version."
+                ) from exc
         if "net_name" in nccl_comm_cfgs[pg_name]:
             nccl_options.config.net_name = nccl_comm_cfgs[pg_name]["net_name"]
             # verify net_name value
@@ -647,7 +654,7 @@ def initialize_model_parallel(
 
         nccl_communicator_config_path (str, default = None):
             Path to the yaml file of NCCL communicator configurations.
-            `min_ctas`, `max_ctas`, and `cga_cluster_size` can be set
+            `min_ctas`, `max_ctas`, `cga_cluster_size`, and `cta_policy` can be set
             for each communicator.
 
         distributed_timeout_minutes (int, default = 30): Timeout, in

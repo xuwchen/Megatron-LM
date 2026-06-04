@@ -142,6 +142,11 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
     - **Only effective when using with Megatron-Core.**
     - Defaults to `False`.
     - By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registration.
+- `fsdp_use_torch_symmetric_memory` allocates Megatron-FSDP all-gather communication buffers from PyTorch symmetric memory and rendezvouses them before `all_gather_into_tensor`. This path does not use Megatron's NCCL UBR inline C++ allocator. It can enable NCCL Copy Engine all-gather when the process group uses zero-CTA policy, e.g. by setting `cta_policy: 2` in the NCCL communicator config or `NCCL_CTA_POLICY=2`.
+    - Defaults to `False`.
+    - Mutually exclusive with `nccl_ub`.
+    - Automatically enables `fsdp_double_buffer`.
+    - Requires a PyTorch build with `torch.distributed._symmetric_memory`.
 - `fsdp_manual_registration` will manually register the FSDP communication buffers with the NCCL user buffer. For symmetric registration with large models, the registration itself can take a significant amount of time. This option minimizes the number of registration calls to reduce the registration time. However, with this option enabled, you need to manually call the `ParamAndGradBuffer.manual_buffer_registration()` function after the first iteration. This is already implemented in the Megatron-LM training loop. In other use cases, users are expected to call this function themselves. 
     - This is an example of required modification in the training loop.
         ```python
