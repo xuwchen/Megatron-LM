@@ -11,6 +11,23 @@ def _param_generator(cpu_optimizer):
             yield param
 
 
+def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the local shard for DTensor-backed parameters or gradients."""
+    local = getattr(tensor, "_local_tensor", None)
+    if local is not None:
+        return local
+    data = getattr(tensor, "data", None)
+    local = getattr(data, "_local_tensor", None)
+    if local is not None:
+        return local
+    return tensor
+
+
+def _copy_to_param_data(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
+    """Copy into either a regular Tensor parameter or a DTensor local shard."""
+    _local_tensor(dst).data.copy_(_local_tensor(src).data, non_blocking=non_blocking)
+
+
 class HybridDeviceOptimizer(torch.optim.Optimizer):
     """
     HybridDeviceOptimizer is a custom optimizer designed to facilitate
@@ -105,6 +122,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     continue
 
                 param.requires_grad = False
+                grad = _local_tensor(grad)
                 if param not in self.cpu_copy_map_grad:
                     self.cpu_copy_map_grad[param] = torch.empty(
                         param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
@@ -121,7 +139,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        gpu_param.data.copy_(param.data, non_blocking=True)
+                        _copy_to_param_data(gpu_param, param, non_blocking=True)
                 self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
@@ -137,7 +155,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
                         if param in self.param_to_fp32_param:
                             fp32_param = self.param_to_fp32_param[param]
-                            param.data.copy_(fp32_param.data)
+                            _copy_to_param_data(param, fp32_param)
 
             return fp32_param_copy_back_gpu_hook
 
@@ -271,7 +289,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 orig_param = param
                 cpu_copy = False
                 if offload_params_numel < offload_threshold and param.is_cuda:
-                    param = param.detach().clone().cpu().pin_memory()
+                    param = _local_tensor(param).detach().clone().cpu()
+                    if self.pin_cpu_params:
+                        param = param.pin_memory()
                     offload_params_numel += param.numel()
                     cpu_copy = True
                 if self.param_update_in_fp32 and param.dtype != torch.float32:

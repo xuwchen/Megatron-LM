@@ -233,21 +233,21 @@ def count_zeros_fp32(
     total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
     data_parallel_group = None
     use_megatron_fsdp = False
+    grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
     for param in parameters:
-        if getattr(param, "__fsdp_param__", False) and param.grad is not None:
+        grad_obj = getattr(param, grad_attr, None)
+        if getattr(param, "__fsdp_param__", False) and grad_obj is not None:
             # If the parameter is managed by Megatron FSDP, we need to handle it differently.
             use_megatron_fsdp = True
-            grad = param.grad._local_tensor
+            grad = to_local_if_dtensor(grad_obj).detach()
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros += num_zeros
             continue
 
-        grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
-        grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
+        grad_not_none = grad_obj is not None
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
         if grad_not_none and is_not_shared and is_not_tp_duplicate:
-            grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
             grad = to_local_if_dtensor(grad_obj).detach()
             num_zeros = grad.numel() - torch.count_nonzero(grad)
