@@ -22,9 +22,20 @@ class TestNCCLAllocator:
         version.parse(torch.__version__) < version.parse('2.7.0'),
         reason="Requires PyTorch 2.7.0 or later",
     )
-    def test_nccl_allocator_init_sets_env_vars(self):
+    def test_nccl_allocator_init_sets_env_vars(self, monkeypatch):
+        monkeypatch.delenv("NCCL_NVLS_ENABLE", raising=False)
         nccl_allocator.init()
         assert os.environ.get("NCCL_NVLS_ENABLE") == "1"
+        assert os.environ.get("TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK") == "0"
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.7.0'),
+        reason="Requires PyTorch 2.7.0 or later",
+    )
+    def test_nccl_allocator_init_preserves_explicit_nvls_env(self, monkeypatch):
+        monkeypatch.setenv("NCCL_NVLS_ENABLE", "0")
+        nccl_allocator.init()
+        assert os.environ.get("NCCL_NVLS_ENABLE") == "0"
         assert os.environ.get("TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK") == "0"
 
     @pytest.mark.skipif(
@@ -47,7 +58,7 @@ class TestNCCLAllocator:
         nccl_allocator.init()
 
         # Create mempool via our allocator and register it around allocation
-        pool = nccl_allocator.create_nccl_mem_pool()
+        pool = nccl_allocator.create_nccl_mem_pool(group=pg)
         with nccl_allocator.nccl_mem(pool, group=pg):
             tensor = torch.ones([1], device=device)
 
@@ -82,7 +93,7 @@ class TestNCCLAllocator:
 
         nccl_allocator.init()
 
-        pool = nccl_allocator.create_nccl_mem_pool()
+        pool = nccl_allocator.create_nccl_mem_pool(group=pg)
         target_tensor_numel = 1000000
         with nccl_allocator.nccl_mem(pool, group=pg):
             tensor_shard = torch.ones([target_tensor_numel // world_size], device=device)

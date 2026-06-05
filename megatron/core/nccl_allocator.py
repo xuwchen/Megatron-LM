@@ -6,95 +6,67 @@ from functools import lru_cache
 
 import torch
 
-# This import is needed for the cpp extension to work.
-# pylint: disable=unused-import
-from torch.utils import cpp_extension
-
 from megatron.core.utils import is_torch_min_version, log_single_rank
 
 logger = logging.getLogger(__name__)
 
-# MCORE NCCL Allocator copies and modifies the APEX NCCL allocator.
-# The original APEX NCCL allocator is available at:
-# https://github.com/NVIDIA/apex/blob/master/apex/contrib/nccl_allocator.py
-# https://github.com/NVIDIA/apex/blob/master/apex/contrib/csrc/nccl_allocator/NCCLAllocator.cpp
-
-_allocator = None
+# MCore NCCL allocator uses the NCCL allocator exposed by ProcessGroupNCCL.
+# This avoids runtime inline C++ compilation while keeping allocations backed
+# by NCCL's user-buffer allocator.
 
 
-def _build_nccl_allocator():
-    global _allocator
-    # If the allocator is already built, return
-    if _allocator is not None:
-        return
+def _resolve_cuda_device(device=None):
+    """Return an indexed CUDA device for ProcessGroupNCCL backend lookup."""
+    if device is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("NCCL allocator requires CUDA, but CUDA is not available.")
+        return torch.device("cuda", torch.cuda.current_device())
+    if isinstance(device, int):
+        return torch.device("cuda", device)
+    if isinstance(device, str):
+        device = torch.device(device)
+    if not isinstance(device, torch.device):
+        raise TypeError(f"device must be None, int, str, or torch.device, got {type(device)}")
+    if device.type != "cuda":
+        raise RuntimeError(f"NCCL allocator only supports CUDA devices, got {device}.")
+    if device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
 
-    nccl_allocator_source = """
-    #include <c10/cuda/CUDACachingAllocator.h>
-    #include <c10/util/Exception.h>
-    #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
-    #include <torch/extension.h>
 
-    #include <nccl.h>
-    #include <iostream>
-    #include <cstdio>
+def _get_default_group():
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError(
+            "NCCL allocator requires a process group. Pass group=... or initialize "
+            "torch.distributed before calling create_nccl_mem_pool()."
+        )
+    return torch.distributed.distributed_c10d._get_default_group()
 
-    extern "C" {
-        #define NCCL_CHECK(cmd) do { \
-        ncclResult_t r = cmd; \
-        if (r != ncclSuccess) { \
-            printf("Failed, NCCL error %s:%d '%s':", \
-                __FILE__,__LINE__,ncclGetErrorString(r)); \
-            exit(EXIT_FAILURE); \
-        } \
-        } while(0)
 
-        void* nccl_alloc_plug(size_t size, int device, void* stream) {
-            void* ptr;
-            NCCL_CHECK(ncclMemAlloc(&ptr, size));
-            return ptr;
-        }
+def _get_nccl_backend(group=None, device=None):
+    device = _resolve_cuda_device(device)
+    group = _get_default_group() if group is None else group
+    if not hasattr(group, "_get_backend"):
+        raise TypeError(f"group must be a torch.distributed.ProcessGroup, got {type(group)}")
+    return group._get_backend(device), group, device
 
-        void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
-            NCCL_CHECK(ncclMemFree(ptr));
-        }
 
-        std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator> nccl_allocator;
+def get_nccl_allocator(group=None, device=None):
+    """Return the NCCL user-buffer allocator exposed by ProcessGroupNCCL."""
+    backend, group, device = _get_nccl_backend(group=group, device=device)
+    allocator = getattr(backend, "mem_allocator", None)
+    if allocator is None:
+        group_desc = getattr(group, "group_desc", None)
+        raise RuntimeError(
+            "ProcessGroupNCCL backend does not expose mem_allocator on this PyTorch build. "
+            "Megatron NCCL UBR cannot run without the legacy inline C++ allocator. "
+            f"group={group!r}, group_desc={group_desc}, device={device}."
+        )
 
-        void maybe_init() {
-            if (!nccl_allocator) {
-                nccl_allocator = std::make_shared<
-                    torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator>(
-                    nccl_alloc_plug, nccl_free_plug);
-            }
-        }
-
-        std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
-        get_nccl_allocator() {
-        maybe_init();
-        return nccl_allocator;
-        }
-
-        PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-        m.def("get_nccl_allocator", []() { return get_nccl_allocator(); });
-        };
-    }
-    """
-    module_dir = os.path.dirname(__file__)
-    source_dir = os.path.join(module_dir, "build")
-    nccl_allocator_libname = "nccl_allocator"
-    os.makedirs(source_dir, exist_ok=True)
-
-    nccl_allocator = torch.utils.cpp_extension.load_inline(
-        name=nccl_allocator_libname,
-        cpp_sources=nccl_allocator_source,
-        with_cuda=True,
-        extra_ldflags=["-lnccl"],
-        verbose=True,
-        is_python_module=True,
-        build_directory=source_dir,
-    )
-
-    _allocator = nccl_allocator.get_nccl_allocator()
+    # Some downstream builds expose a zero-argument method instead of a property.
+    if callable(allocator):
+        allocator = allocator()
+    return allocator
 
 
 @lru_cache(maxsize=None)
@@ -108,11 +80,12 @@ def get_func_args(func):
     return [arg.name for arg in sig.parameters.values()]
 
 
-def create_nccl_mem_pool(symmetric=None):  # symmetric: bool | None = None -> torch.cuda.MemPool:
+def create_nccl_mem_pool(
+    symmetric=None, group=None, device=None
+):  # symmetric: bool | None = None -> torch.cuda.MemPool:
     """
     Create a memory pool using the NCCL allocator.
     """
-    _build_nccl_allocator()
     if not is_torch_min_version("2.9.0a0") and symmetric is True:
         logging.info(
             f"Symmetric memory pool is not supported with torch version < 2.9.0a0"
@@ -121,22 +94,22 @@ def create_nccl_mem_pool(symmetric=None):  # symmetric: bool | None = None -> to
         )
         symmetric = False
 
-    assert _allocator is not None, "NCCL allocator is not initialized"
+    allocator = get_nccl_allocator(group=group, device=device)
     if not symmetric:
-        _pool = torch.cuda.MemPool(_allocator)
+        _pool = torch.cuda.MemPool(allocator)
     else:
         if 'symmetric' in get_func_args(torch.cuda.MemPool):
             # The PyTorch version >= 2.9.0a0 and before PyTorch PR #161238,
             # The symmetric knob should passed to the MemPool constructor.
             # Since PyTorch PR #161238 symmetric knob is now in registration function.
-            _pool = torch.cuda.MemPool(_allocator, symmetric=symmetric)
+            _pool = torch.cuda.MemPool(allocator, symmetric=symmetric)
         elif 'symm_mem' in get_func_args(torch.cuda.MemPool):
             # This path handles argument name divergence between
             # nvidia pytorch and the official pytorch.
-            _pool = torch.cuda.MemPool(_allocator, symm_mem=symmetric)
+            _pool = torch.cuda.MemPool(allocator, symm_mem=symmetric)
         else:
             # This path handles the case where the symmetric knob is in the registration function.
-            _pool = torch.cuda.MemPool(_allocator)
+            _pool = torch.cuda.MemPool(allocator)
     return _pool
 
 
@@ -154,8 +127,11 @@ def init() -> None:
     os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
     # Disables the use of the tensor register allocator hook
     os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "0"
-    _build_nccl_allocator()
-    log_single_rank(logger, logging.INFO, "[MCORE][NCCL_ALLOCATOR] Initialized NCCL Allocator")
+    log_single_rank(
+        logger,
+        logging.INFO,
+        "[MCORE][NCCL_ALLOCATOR] Configured ProcessGroupNCCL mem_allocator",
+    )
 
 
 # register_mem_pool/deregister_mem_pool are used for manual (de)registration of the memory pool.
@@ -289,9 +265,9 @@ class MultiGroupMemPoolAllocator:
         ```
         import megatron.core.nccl_allocator as nccl_allocator
         nccl_allocator.init()
-        pool = nccl_allocator.create_nccl_mem_pool()
         group_1 = torch.distributed.new_group(ranks=[0, 1, 2, 3, 4, 5, 6, 7], backend="nccl")
         group_2 = torch.distributed.new_group(ranks=[0, 2, 4, 6], backend="nccl")
+        pool = nccl_allocator.create_nccl_mem_pool(group=group_1)
         with MultiGroupMemPoolAllocator(pool, [group_1, group_2]):
             a = torch.zeros(1024, dtype=torch.float32, device="cuda")
             b = torch.zeros(1024, dtype=torch.float32, device="cuda")

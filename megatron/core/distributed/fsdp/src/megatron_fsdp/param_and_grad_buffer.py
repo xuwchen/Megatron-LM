@@ -1737,7 +1737,9 @@ class ParamAndGradBuffer:
             # Initialize NCCL allocator runtime if available
             nccl_allocator.init()
             self.nccl_memory_pool = nccl_allocator.create_nccl_mem_pool(
-                symmetric=not self.ddp_config.disable_symmetric_registration
+                symmetric=not self.ddp_config.disable_symmetric_registration,
+                group=self.dist_index.get_fsdp_group(is_expert_parallel=False),
+                device=self.device,
             )
             NCCL_MEMORY_POOL = self.nccl_memory_pool
             log_single_rank(

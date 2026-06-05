@@ -1014,7 +1014,8 @@ class _ParamAndGradBuffer:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
             nccl_allocator.init()
             pool = nccl_allocator.create_nccl_mem_pool(
-                symmetric=not self.ddp_config.disable_symmetric_registration
+                symmetric=not self.ddp_config.disable_symmetric_registration,
+                group=self.data_parallel_group,
             )
             mem_alloc_context = functools.partial(
                 nccl_allocator.nccl_mem,

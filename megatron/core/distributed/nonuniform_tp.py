@@ -1005,7 +1005,8 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
         if self.nccl_ub:
             pgb.nccl_allocator.init()
             pool = pgb.nccl_allocator.create_nccl_mem_pool(
-                symmetric=not self.ddp_config.disable_symmetric_registration
+                symmetric=not self.ddp_config.disable_symmetric_registration,
+                group=self.data_parallel_group,
             )
             mem_alloc_context = functools.partial(
                 pgb.nccl_allocator.nccl_mem,
