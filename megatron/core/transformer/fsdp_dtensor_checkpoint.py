@@ -82,6 +82,7 @@ def _make_split_component_dtensor(
     chunk_offsets = [0] * len(meta_shape)
     chunk_offsets[split_dim] = component_start // trailing_numel
     chunk_sizes = list(data.shape)
+    tensor_shape = list(meta_shape)
     tp_partition_dim = get_mcore_tensor_parallel_partition_dim(meta)
     if tp_partition_dim is not None:
         tp_mesh = dist_index.get_submesh(
@@ -89,13 +90,14 @@ def _make_split_component_dtensor(
         )
         tp_rank = dist.get_rank(tp_mesh.get_group())
         chunk_offsets[tp_partition_dim] += tp_rank * meta_shape[tp_partition_dim]
+        tensor_shape[tp_partition_dim] *= tp_mesh.mesh.numel()
 
     assert all(
-        offset + size <= meta_shape[dim]
+        offset + size <= tensor_shape[dim]
         for dim, (offset, size) in enumerate(zip(chunk_offsets, chunk_sizes))
     ), (
         f"Split component chunk metadata is out of bounds: offsets={chunk_offsets}, "
-        f"sizes={chunk_sizes}, shape={meta_shape}"
+        f"sizes={chunk_sizes}, shape={tensor_shape}"
     )
 
     dtensor = make_fsdp_dtensor(
@@ -346,6 +348,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         """
         # Use dist_param (always a DTensor) for global shape/numel,
         # as data may be a regular Tensor (e.g., optimizer states).
+        data_is_dtensor = isinstance(data, DTensor)
         global_shape = dist_param.shape
         assert global_shape[swiglu_shard_axis] % 2 == 0, (
             f"SWiGLU FC1 must have even global size along axis {swiglu_shard_axis}, "
@@ -364,7 +367,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
         view_shape = list(global_shape)
         view_shape[swiglu_shard_axis] = -1
-        if isinstance(data, DTensor):
+        if data_is_dtensor:
             assert data.shape == global_shape, (
                 f"DTensor shape mismatch: data.shape={data.shape} vs "
                 f"dist_param.shape={global_shape}"
@@ -562,7 +565,8 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             split_dim: Dimension along which to split.
         """
         total_split = sum(split_sizes)
-        if isinstance(data, DTensor) and data.shape[split_dim] == total_split:
+        data_is_dtensor = isinstance(data, DTensor)
+        if data_is_dtensor and data.shape[split_dim] == total_split:
             # GDN tensors are already TP-local here (fast-path from #4799).
             return list(
                 split_dtensor(
@@ -581,7 +585,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         data_size = dist_param.numel() // tp_mesh.mesh.numel()
         elems_per_unit = data_size // total_split
 
-        if isinstance(data, DTensor):
+        if data_is_dtensor:
             assert data.shape == global_shape, (
                 f"DTensor shape mismatch: data.shape={data.shape} vs "
                 f"dist_param.shape={global_shape}"

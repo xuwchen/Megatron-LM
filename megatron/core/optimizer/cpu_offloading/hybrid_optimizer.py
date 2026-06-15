@@ -347,6 +347,20 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 for param in group["params"]:
                     orig_param = self.inner_param_to_orig_param[param]
                     new_state[param] = self.state[orig_param]
+                    if (
+                        isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW))
+                        and "step" not in new_state[param]
+                    ):
+                        step = group.get("step", 0)
+                        if isinstance(step, torch.Tensor):
+                            step = step.detach().clone().to(
+                                device=param.device, dtype=torch.float32
+                            )
+                        else:
+                            step = torch.tensor(
+                                float(step), device=param.device, dtype=torch.float32
+                            )
+                        new_state[param]["step"] = step
             optimizer.state = new_state
         self._update_fp32_params_by_new_state()
         self._move_new_state_to_right_device()

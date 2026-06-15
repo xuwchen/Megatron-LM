@@ -112,17 +112,22 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     )
 
 
-def set_explicit_dtensor_chunk_metadata(
-    dtensor: DTensor, offsets: Iterable[int], sizes: Iterable[int]
+def set_explicit_tensor_chunk_metadata(
+    local_tensor: torch.Tensor,
+    offsets: Iterable[int],
+    sizes: Iterable[int],
+    tensor_size: Iterable[int] | torch.Size | None = None,
 ) -> None:
-    """Attach explicit DCP chunk metadata to a DTensor."""
+    """Attach explicit DCP chunk metadata to a local tensor shard."""
     chunk_meta = ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(sizes))
+    tensor_size = torch.Size(tensor_size) if tensor_size is not None else local_tensor.size()
 
     def create_chunk_list():
         return [chunk_meta]
 
-    def create_write_items(fqn: str, tensor: DTensor) -> List[WriteItem]:
-        if tensor.to_local().numel() == 0:
+    def create_write_items(fqn: str, tensor: torch.Tensor | DTensor) -> List[WriteItem]:
+        tensor = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+        if tensor.numel() == 0:
             return []
 
         return [
@@ -131,14 +136,23 @@ def set_explicit_dtensor_chunk_metadata(
                 index=MetadataIndex(fqn, chunk_meta.offsets),
                 tensor_data=TensorWriteData(
                     chunk=chunk_meta,
-                    properties=TensorProperties.create_from_tensor(tensor.to_local()),
-                    size=tensor.size(),
+                    properties=TensorProperties.create_from_tensor(tensor),
+                    size=tensor_size,
                 ),
             )
         ]
 
-    dtensor._local_tensor.__create_chunk_list__ = create_chunk_list
-    dtensor._local_tensor.__create_write_items__ = create_write_items
+    local_tensor.__create_chunk_list__ = create_chunk_list
+    local_tensor.__create_write_items__ = create_write_items
+
+
+def set_explicit_dtensor_chunk_metadata(
+    dtensor: DTensor, offsets: Iterable[int], sizes: Iterable[int]
+) -> None:
+    """Attach explicit DCP chunk metadata to a DTensor."""
+    set_explicit_tensor_chunk_metadata(
+        dtensor._local_tensor, offsets, sizes, tensor_size=dtensor.size()
+    )
 
 
 def validate_uneven_dtensor(dtensor: DTensor) -> None:

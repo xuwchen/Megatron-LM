@@ -5,6 +5,7 @@
 import gc
 import itertools
 import logging
+import math
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -16,6 +17,11 @@ import torch.nn.functional
 from megatron.core.utils import log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
+from ..distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import make_fsdp_dtensor
+from ..distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    set_explicit_dtensor_chunk_metadata,
+)
+from ..distributed.fsdp.src.megatron_fsdp.utils import get_mcore_tensor_parallel_partition_dim
 
 HAVE_APEX_OR_TE = True
 USING_TE_OPTIMIZER = False
@@ -1605,6 +1611,88 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             new_param_groups.append(new_group)
         return new_param_groups
 
+    def _add_fsdp_chunk_metadata_to_hdo_state(
+        self, param: torch.Tensor, state: dict[str, Any], use_cuda_local_tensor: bool = False
+    ) -> dict[str, Any]:
+        """Mark HybridDeviceOptimizer local state tensors as FSDP shards for DCP."""
+        fsdp_slice = getattr(param, "megatron_fsdp_slice", None)
+        dist_index = getattr(param, "megatron_fsdp_dist_index", None)
+        if fsdp_slice is None or dist_index is None:
+            return state
+
+        fsdp_numel = fsdp_slice.stop - fsdp_slice.start
+        if fsdp_numel < 0:
+            return state
+
+        param_shape = tuple(param.shape)
+        local_param = param.to_local() if hasattr(param, "to_local") else param
+        local_param_shape = tuple(local_param.shape)
+        trailing_numel = math.prod(local_param_shape[1:]) if len(local_param_shape) > 1 else 1
+        if trailing_numel == 0:
+            return state
+        if fsdp_slice.start % trailing_numel != 0 or fsdp_numel % trailing_numel != 0:
+            return state
+
+        chunk_offsets = [0] * len(param_shape)
+        chunk_offsets[0] = fsdp_slice.start // trailing_numel
+        param_name = self._param_name(param)
+        is_expert_param = "mlp.experts" in param_name
+        tp_partition_dim = get_mcore_tensor_parallel_partition_dim(param)
+        if tp_partition_dim is not None and getattr(dist_index, "tp_dim", None) is not None:
+            tp_mesh = dist_index.get_submesh(
+                [dist_index.tp_dim], is_expert_parallel=is_expert_param
+            )
+            tp_size = tp_mesh.mesh.numel()
+            if tp_size > 1:
+                tp_rank = torch.distributed.get_rank(tp_mesh.get_group())
+                chunk_offsets[tp_partition_dim] += tp_rank * (param_shape[tp_partition_dim] // tp_size)
+
+        new_state = {}
+        local_rows = fsdp_numel // trailing_numel
+        local_shape = (
+            (local_rows, *local_param_shape[1:])
+            if len(local_param_shape) > 1
+            else (fsdp_numel,)
+        )
+        state_dtypes = {
+            "exp_avg": self.config.exp_avg_dtype,
+            "exp_avg_sq": self.config.exp_avg_sq_dtype,
+        }
+        for state_name, state_dtype in state_dtypes.items():
+            value = state.get(state_name)
+            if value is None:
+                device = (
+                    torch.device("cuda", torch.cuda.current_device())
+                    if use_cuda_local_tensor
+                    else local_param.device
+                )
+                value = torch.empty(local_shape, dtype=state_dtype, device=device)
+            elif not isinstance(value, torch.Tensor) or hasattr(value, "to_local"):
+                new_state[state_name] = value
+                continue
+            elif value.numel() != fsdp_numel:
+                continue
+            local_value = value.view(local_shape) if tuple(value.shape) != local_shape else value
+            dcp_value = local_value
+            if use_cuda_local_tensor and not dcp_value.is_cuda:
+                dcp_value = dcp_value.to(torch.cuda.current_device())
+            state_dtensor = make_fsdp_dtensor(
+                dcp_value.data,
+                param,
+                dist_index=dist_index,
+                is_expert_param=is_expert_param,
+                run_check=False,
+                update_uneven_dtensor_chunk_meta=False,
+            )
+            set_explicit_dtensor_chunk_metadata(
+                state_dtensor,
+                chunk_offsets,
+                local_value.shape,
+            )
+            new_state[state_name] = state_dtensor
+
+        return new_state
+
     def sharded_param_state_fsdp_dtensor(self, is_loading: bool = False):
         """
         Sharded state dict where each parameter is a separate PyTorch DTensor.
@@ -1619,12 +1707,35 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Get the optimizer's parameter groups in distributed key value format.
         param_to_group_meta = self._param_groups_to_param2group_meta(self.optimizer.param_groups)
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            hdo_only_group_keys = {
+                "offload_fraction",
+                "cpu_optimizer_cls",
+                "gpu_optimizer_cls",
+                "param_update_in_fp32",
+                "pin_cpu_grads",
+                "pin_cpu_params",
+                "overlap_cpu_optimizer_d2h_h2d",
+                "fused",
+            }
+            for group_meta in param_to_group_meta.values():
+                for key in hdo_only_group_keys:
+                    group_meta.pop(key, None)
 
         # Remap state to use order indices as keys
-        packed_state = {
-            (self._param_name(k) if isinstance(k, torch.Tensor) else k): v
-            for k, v in self.state.items()
-        }
+        packed_state = {}
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            for group in self.optimizer.param_groups:
+                for param in group["params"]:
+                    param_name = self._param_name(param)
+                    packed_state[param_name] = self._add_fsdp_chunk_metadata_to_hdo_state(
+                        param,
+                        self.state.get(param, {}),
+                        use_cuda_local_tensor=is_loading,
+                    )
+        else:
+            for k, v in self.state.items():
+                packed_state[self._param_name(k) if isinstance(k, torch.Tensor) else k] = v
 
         state_dict = {"state": packed_state, "param_to_group_meta": param_to_group_meta}
         return state_dict
