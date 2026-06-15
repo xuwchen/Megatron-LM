@@ -1,5 +1,4 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
-import math
 from collections import defaultdict
 from typing import Dict
 
@@ -190,37 +189,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             d2h_event = self._cpu_optimizer_map_data_event.pop(cpu_optimizer, None)
             if d2h_event is not None:
                 d2h_event.synchronize()
-            self._adjust_cpu_adamw_eps_for_fused_adam(cpu_optimizer)
             cpu_optimizer.step(closure)
 
         # Sync state and param_groups to HDO after each step.
         # NOTE: It is possible for the optimizer to change the properties
         #   in param_groups.
         self._sync_sub_optimizers_state_to_hdo()
-
-    def _adjust_cpu_adamw_eps_for_fused_adam(self, optimizer):
-        if not isinstance(optimizer, torch.optim.AdamW):
-            return
-        for group in optimizer.param_groups:
-            if not group.get("bias_correction", True):
-                continue
-            beta2 = group["betas"][1]
-            eps = group["eps"]
-            if "_hdo_base_eps" not in group:
-                group["_hdo_base_eps"] = eps
-            base_eps = group["_hdo_base_eps"]
-            step = group.get("step", 0)
-            for param in group["params"]:
-                state_step = optimizer.state.get(param, {}).get("step")
-                if state_step is not None:
-                    step = state_step
-                    break
-            if isinstance(step, torch.Tensor):
-                step = step.item()
-            next_step = int(step) + 1
-            bias_correction2 = 1 - beta2**next_step
-            if bias_correction2 > 0:
-                group["eps"] = base_eps / math.sqrt(bias_correction2)
 
     def _init_sub_optimizers(self):
         (
