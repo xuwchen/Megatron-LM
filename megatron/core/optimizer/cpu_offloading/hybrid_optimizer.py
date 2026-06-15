@@ -197,6 +197,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self._sync_sub_optimizers_state_to_hdo()
 
     def _init_sub_optimizers(self):
+        if self.defaults.get("fused") is not None:
+            for group in self.param_groups:
+                if group.get("fused") is None:
+                    group["fused"] = self.defaults["fused"]
         (
             self.cpu_param_groups,
             self.gpu_param_groups,
@@ -345,6 +349,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             new_state = defaultdict(dict)
             for group in optimizer.param_groups:
                 for param in group["params"]:
+                    if param.numel() == 0:
+                        continue
                     orig_param = self.inner_param_to_orig_param[param]
                     new_state[param] = self.state[orig_param]
                     if (
@@ -383,6 +389,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 group_id, _ = param_in_param_group_index[group["params"][0]]
                 update_group_attrs = self.param_groups[group_id].copy()
                 del update_group_attrs["params"]
+                if update_group_attrs.get("fused") is None and new_group.get("fused") is not None:
+                    update_group_attrs.pop("fused")
                 new_group.update(update_group_attrs)
 
                 new_param_groups.append(new_group)
