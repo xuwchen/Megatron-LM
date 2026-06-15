@@ -624,13 +624,14 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             meta = torch.empty(*meta_shape, device="meta")
             copy_tensor_model_parallel_attributes(meta, dist_param)
 
-            dtensor = make_fsdp_dtensor(
-                comp_data.data,
+            dtensor = _make_split_component_dtensor(
+                comp_data,
                 meta,
-                dist_index=dist_index,
-                is_expert_param=False,
-                run_check=True,
-                update_uneven_dtensor_chunk_meta=True,
+                dist_index,
+                False,
+                fsdp_slice,
+                comp_slice,
+                split_dim,
             )
             results.append(dtensor)
             flat_offset += comp_flat
