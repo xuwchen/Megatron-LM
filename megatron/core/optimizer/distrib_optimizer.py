@@ -1693,6 +1693,36 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return new_state
 
+    def _get_hdo_common_step(self) -> Optional[int]:
+        """Return the common HybridDeviceOptimizer step when it is available."""
+        steps = set()
+
+        def add_step(step):
+            if step is None:
+                return
+            if isinstance(step, torch.Tensor):
+                if step.numel() == 0:
+                    return
+                step = step.item()
+            steps.add(int(step))
+
+        for state in self.optimizer.state.values():
+            if isinstance(state, dict):
+                add_step(state.get("step"))
+
+        for optimizer in self.optimizer.sub_optimizers:
+            for state in optimizer.state.values():
+                if isinstance(state, dict):
+                    add_step(state.get("step"))
+            for group in optimizer.param_groups:
+                add_step(group.get("step"))
+
+        for group in self.optimizer.param_groups:
+            add_step(group.get("step"))
+
+        assert len(steps) <= 1, f"HybridDeviceOptimizer has inconsistent steps: {steps}"
+        return next(iter(steps), None)
+
     def sharded_param_state_fsdp_dtensor(self, is_loading: bool = False):
         """
         Sharded state dict where each parameter is a separate PyTorch DTensor.
@@ -1708,6 +1738,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Get the optimizer's parameter groups in distributed key value format.
         param_to_group_meta = self._param_groups_to_param2group_meta(self.optimizer.param_groups)
         if isinstance(self.optimizer, HybridDeviceOptimizer):
+            hdo_step = self._get_hdo_common_step()
             hdo_only_group_keys = {
                 "offload_fraction",
                 "cpu_optimizer_cls",
@@ -1721,6 +1752,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for group_meta in param_to_group_meta.values():
                 for key in hdo_only_group_keys:
                     group_meta.pop(key, None)
+                if hdo_step is not None:
+                    group_meta["step"] = hdo_step
+                elif is_loading:
+                    group_meta["step"] = 0
 
         # Remap state to use order indices as keys
         packed_state = {}
