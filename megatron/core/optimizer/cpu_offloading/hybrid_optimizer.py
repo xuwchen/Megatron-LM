@@ -11,6 +11,23 @@ def _param_generator(cpu_optimizer):
             yield param
 
 
+def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the local shard for DTensor-backed parameters or gradients."""
+    local = getattr(tensor, "_local_tensor", None)
+    if local is not None:
+        return local
+    data = getattr(tensor, "data", None)
+    local = getattr(data, "_local_tensor", None)
+    if local is not None:
+        return local
+    return tensor
+
+
+def _copy_to_param_data(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
+    """Copy into either a regular Tensor parameter or a DTensor local shard."""
+    _local_tensor(dst).data.copy_(_local_tensor(src).data, non_blocking=non_blocking)
+
+
 class HybridDeviceOptimizer(torch.optim.Optimizer):
     """
     HybridDeviceOptimizer is a custom optimizer designed to facilitate
@@ -105,6 +122,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     continue
 
                 param.requires_grad = False
+                grad = _local_tensor(grad)
                 if param not in self.cpu_copy_map_grad:
                     self.cpu_copy_map_grad[param] = torch.empty(
                         param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
@@ -121,7 +139,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        gpu_param.data.copy_(param.data, non_blocking=True)
+                        _copy_to_param_data(gpu_param, param, non_blocking=True)
                 self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
@@ -137,7 +155,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
                         if param in self.param_to_fp32_param:
                             fp32_param = self.param_to_fp32_param[param]
-                            param.data.copy_(fp32_param.data)
+                            _copy_to_param_data(param, fp32_param)
 
             return fp32_param_copy_back_gpu_hook
 
@@ -179,6 +197,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self._sync_sub_optimizers_state_to_hdo()
 
     def _init_sub_optimizers(self):
+        if self.defaults.get("fused") is not None:
+            for group in self.param_groups:
+                if group.get("fused") is None:
+                    group["fused"] = self.defaults["fused"]
         (
             self.cpu_param_groups,
             self.gpu_param_groups,
@@ -271,7 +293,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 orig_param = param
                 cpu_copy = False
                 if offload_params_numel < offload_threshold and param.is_cuda:
-                    param = param.detach().clone().cpu().pin_memory()
+                    param = _local_tensor(param).detach().clone().cpu()
+                    if self.pin_cpu_params:
+                        param = param.pin_memory()
                     offload_params_numel += param.numel()
                     cpu_copy = True
                 if self.param_update_in_fp32 and param.dtype != torch.float32:
@@ -325,8 +349,24 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             new_state = defaultdict(dict)
             for group in optimizer.param_groups:
                 for param in group["params"]:
+                    if param.numel() == 0:
+                        continue
                     orig_param = self.inner_param_to_orig_param[param]
                     new_state[param] = self.state[orig_param]
+                    if (
+                        isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW))
+                        and "step" not in new_state[param]
+                    ):
+                        step = group.get("step", 0)
+                        if isinstance(step, torch.Tensor):
+                            step = step.detach().clone().to(
+                                device=param.device, dtype=torch.float32
+                            )
+                        else:
+                            step = torch.tensor(
+                                float(step), device=param.device, dtype=torch.float32
+                            )
+                        new_state[param]["step"] = step
             optimizer.state = new_state
         self._update_fp32_params_by_new_state()
         self._move_new_state_to_right_device()
@@ -349,6 +389,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 group_id, _ = param_in_param_group_index[group["params"][0]]
                 update_group_attrs = self.param_groups[group_id].copy()
                 del update_group_attrs["params"]
+                if update_group_attrs.get("fused") is None and new_group.get("fused") is not None:
+                    update_group_attrs.pop("fused")
                 new_group.update(update_group_attrs)
 
                 new_param_groups.append(new_group)
@@ -360,6 +402,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 for k, v in state.items():
                     if not isinstance(v, torch.Tensor):
                         continue
+                    v = _local_tensor(v)
+                    if v.numel() == param.numel() and v.shape != param.shape:
+                        v = v.view_as(param)
                     orig_param = self.inner_param_to_orig_param.get(param, param)
                     if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
                         self.state[orig_param][k] = state[k] = v.to("cpu")
@@ -370,15 +415,21 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            fp32_param = self.param_to_fp32_param[param]
-            fp32_param.data.copy_(v["master_param"])
+            fp32_param = self.param_to_fp32_param.get(param)
+            if fp32_param is None:
+                continue
+            master_param = v.get("master_param")
+            master_param = (
+                _local_tensor(master_param) if master_param is not None else _local_tensor(param)
+            )
+            fp32_param.data.copy_(master_param)
 
     def update_fp32_param_by_new_param(self):
         """
         Update the fp32 parameters by the new parameters.
         """
         for param, fp32_param in self.param_to_fp32_param.items():
-            fp32_param.data.copy_(param)
+            fp32_param.data.copy_(_local_tensor(param))
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
