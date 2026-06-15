@@ -6,6 +6,7 @@ import gc
 import itertools
 import logging
 import math
+import os
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -913,6 +914,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
                 del state_dict["param_to_group_meta"]
             self.optimizer.load_state_dict(state_dict)
+            self._debug_fsdp_optimizer_state_checksum()
             return
 
         if len(self.optimizer.state) == 0:
@@ -1041,6 +1043,66 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
+
+    def _debug_fsdp_optimizer_state_checksum(self):
+        if os.getenv("MEGATRON_OPTIM_DEBUG_CHECKSUM") != "1":
+            return
+        if not torch.distributed.is_initialized():
+            return
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        totals: dict[str, torch.Tensor] = {}
+
+        def to_local(tensor):
+            local = getattr(tensor, "_local_tensor", None)
+            if local is not None:
+                return local
+            return tensor
+
+        def add_tensor(name, tensor):
+            if not isinstance(tensor, torch.Tensor):
+                return
+            local = to_local(tensor)
+            if local is None or local.numel() == 0:
+                return
+            value = local.detach().to(dtype=torch.float64)
+            stats = torch.tensor(
+                [value.sum().item(), value.square().sum().item(), float(value.numel())],
+                dtype=torch.float64,
+                device=device,
+            )
+            if name not in totals:
+                totals[name] = torch.zeros(3, dtype=torch.float64, device=device)
+            totals[name] += stats
+
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                add_tensor("optimizer_param", param)
+
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            for optimizer in self.optimizer.sub_optimizers:
+                for group in optimizer.param_groups:
+                    for param in group["params"]:
+                        add_tensor("hdo_inner_param", param)
+
+        for state in self.optimizer.state.values():
+            if not isinstance(state, dict):
+                continue
+            add_tensor("exp_avg", state.get("exp_avg"))
+            add_tensor("exp_avg_sq", state.get("exp_avg_sq"))
+
+        for stats in totals.values():
+            torch.distributed.all_reduce(stats)
+
+        if torch.distributed.get_rank() == 0:
+            for name in sorted(totals):
+                stats = totals[name]
+                print(
+                    "[optim checksum] "
+                    f"{name}: sum={stats[0].item():.17e} "
+                    f"sqsum={stats[1].item():.17e} numel={int(stats[2].item())}",
+                    flush=True,
+                )
             else:
                 log_single_rank(
                     logger,
