@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 import re
 
 import torch
@@ -31,6 +32,7 @@ try:
         make_fsdp_dtensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        set_explicit_dtensor_chunk_metadata,
         split_dtensor,
         uneven_dtensor_to_full_tensor,
     )
@@ -47,6 +49,67 @@ from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model
+
+
+def _make_split_component_dtensor(
+    data,
+    meta,
+    dist_index,
+    is_expert_param,
+    fsdp_slice,
+    component_slice,
+    split_dim,
+):
+    """Create a DTensor for one component split out of an FSDP-sharded fused tensor."""
+    meta_shape = list(meta.shape)
+    trailing_numel = math.prod(meta_shape[split_dim + 1 :])
+    assert trailing_numel > 0, f"Invalid split component shape: {meta_shape}"
+
+    shard_start = max(fsdp_slice.start, component_slice.start)
+    shard_stop = min(fsdp_slice.stop, component_slice.stop)
+    component_start = 0 if shard_start >= shard_stop else shard_start - component_slice.start
+    assert component_start % trailing_numel == 0, (
+        f"Split component shard is not aligned with tensor rows: "
+        f"component_start={component_start}, trailing_numel={trailing_numel}, "
+        f"meta_shape={meta_shape}, component_slice={component_slice}, fsdp_slice={fsdp_slice}"
+    )
+    assert data.numel() % trailing_numel == 0, (
+        f"Split component shard size is not aligned with tensor rows: "
+        f"numel={data.numel()}, trailing_numel={trailing_numel}, "
+        f"meta_shape={meta_shape}, component_slice={component_slice}, fsdp_slice={fsdp_slice}"
+    )
+
+    chunk_offsets = [0] * len(meta_shape)
+    chunk_offsets[split_dim] = component_start // trailing_numel
+    chunk_sizes = list(data.shape)
+    tensor_shape = list(meta_shape)
+    tp_partition_dim = get_mcore_tensor_parallel_partition_dim(meta)
+    if tp_partition_dim is not None:
+        tp_mesh = dist_index.get_submesh(
+            [dist_index.tp_dim], is_expert_parallel=is_expert_param
+        )
+        tp_rank = dist.get_rank(tp_mesh.get_group())
+        chunk_offsets[tp_partition_dim] += tp_rank * meta_shape[tp_partition_dim]
+        tensor_shape[tp_partition_dim] *= tp_mesh.mesh.numel()
+
+    assert all(
+        offset + size <= tensor_shape[dim]
+        for dim, (offset, size) in enumerate(zip(chunk_offsets, chunk_sizes))
+    ), (
+        f"Split component chunk metadata is out of bounds: offsets={chunk_offsets}, "
+        f"sizes={chunk_sizes}, shape={tensor_shape}"
+    )
+
+    dtensor = make_fsdp_dtensor(
+        data.data,
+        meta,
+        dist_index=dist_index,
+        is_expert_param=is_expert_param,
+        run_check=False,
+        update_uneven_dtensor_chunk_meta=False,
+    )
+    set_explicit_dtensor_chunk_metadata(dtensor, chunk_offsets, chunk_sizes)
+    return dtensor
 
 
 def get_ep_layer_offset(num_experts: int | None = None) -> int:
@@ -339,21 +402,23 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         copy_tensor_model_parallel_attributes(w_meta, dist_param)
         copy_tensor_model_parallel_attributes(v_meta, dist_param)
 
-        weight_w = make_fsdp_dtensor(
-            weight_w.data,
+        weight_w = _make_split_component_dtensor(
+            weight_w,
             w_meta,
-            dist_index=megatron_fsdp_dist_index,
-            is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
+            megatron_fsdp_dist_index,
+            is_expert_param,
+            fsdp_slice,
+            w_slice,
+            swiglu_shard_axis,
         )
-        weight_v = make_fsdp_dtensor(
-            weight_v.data,
+        weight_v = _make_split_component_dtensor(
+            weight_v,
             v_meta,
-            dist_index=megatron_fsdp_dist_index,
-            is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
+            megatron_fsdp_dist_index,
+            is_expert_param,
+            fsdp_slice,
+            v_slice,
+            swiglu_shard_axis,
         )
         return weight_w, weight_v
 
