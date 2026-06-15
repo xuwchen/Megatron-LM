@@ -380,6 +380,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 for k, v in state.items():
                     if not isinstance(v, torch.Tensor):
                         continue
+                    v = _local_tensor(v)
+                    if v.numel() == param.numel() and v.shape != param.shape:
+                        v = v.view_as(param)
                     orig_param = self.inner_param_to_orig_param.get(param, param)
                     if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
                         self.state[orig_param][k] = state[k] = v.to("cpu")
@@ -390,15 +393,21 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            fp32_param = self.param_to_fp32_param[param]
-            fp32_param.data.copy_(v["master_param"])
+            fp32_param = self.param_to_fp32_param.get(param)
+            if fp32_param is None:
+                continue
+            master_param = v.get("master_param")
+            master_param = (
+                _local_tensor(master_param) if master_param is not None else _local_tensor(param)
+            )
+            fp32_param.data.copy_(master_param)
 
     def update_fp32_param_by_new_param(self):
         """
         Update the fp32 parameters by the new parameters.
         """
         for param, fp32_param in self.param_to_fp32_param.items():
-            fp32_param.data.copy_(param)
+            fp32_param.data.copy_(_local_tensor(param))
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
