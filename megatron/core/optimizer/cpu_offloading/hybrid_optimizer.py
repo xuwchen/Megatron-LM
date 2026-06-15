@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
+import os
 from collections import defaultdict
 from typing import Dict
 
@@ -341,6 +342,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.state = new_state
 
     def _sync_hdo_state_to_sub_optimizers(self):
+        debug_load = os.getenv("MEGATRON_HDO_DEBUG_LOAD") == "1"
+        debug_printed = False
         for optimizer in self.sub_optimizers:
             new_state = defaultdict(dict)
             for group in optimizer.param_groups:
@@ -361,6 +364,25 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                                 float(step), device=param.device, dtype=torch.float32
                             )
                         new_state[param]["step"] = step
+                    if debug_load and not debug_printed:
+                        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                        if rank == 0:
+                            state = new_state[param]
+                            exp_avg = state.get("exp_avg")
+                            exp_avg_sq = state.get("exp_avg_sq")
+                            step = state.get("step")
+                            print(
+                                "[HDO debug] "
+                                f"optimizer={type(optimizer).__name__} "
+                                f"param_shape={tuple(param.shape)} param_dtype={param.dtype} "
+                                f"param_device={param.device} group_step={group.get('step')} "
+                                f"state_step={step.item() if isinstance(step, torch.Tensor) else step} "
+                                f"exp_avg_norm={exp_avg.norm().item() if isinstance(exp_avg, torch.Tensor) else None} "
+                                f"exp_avg_sq_norm={exp_avg_sq.norm().item() if isinstance(exp_avg_sq, torch.Tensor) else None} "
+                                f"param_norm={param.norm().item() if isinstance(param, torch.Tensor) else None}",
+                                flush=True,
+                            )
+                        debug_printed = True
             optimizer.state = new_state
         self._update_fp32_params_by_new_state()
         self._move_new_state_to_right_device()
