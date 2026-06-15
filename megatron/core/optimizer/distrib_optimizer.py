@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional
+from torch.distributed._tensor import DTensor
 
 from megatron.core.utils import log_single_rank
 
@@ -1677,14 +1678,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             dcp_value = local_value
             if use_cuda_local_tensor and not dcp_value.is_cuda:
                 dcp_value = dcp_value.to(cuda_device)
-            state_dtensor = make_fsdp_dtensor(
-                dcp_value.data,
-                param,
-                dist_index=dist_index,
-                is_expert_param=is_expert_param,
-                run_check=False,
-                update_uneven_dtensor_chunk_meta=False,
-            )
+            if isinstance(param, DTensor) and len(param.placements) > 1:
+                state_dtensor = DTensor.from_local(
+                    local_tensor=dcp_value.data,
+                    device_mesh=param.device_mesh,
+                    placements=param.placements,
+                    run_check=False,
+                    shape=param.shape,
+                    stride=param.stride(),
+                )
+            else:
+                state_dtensor = make_fsdp_dtensor(
+                    dcp_value.data,
+                    param,
+                    dist_index=dist_index,
+                    is_expert_param=is_expert_param,
+                    run_check=False,
+                    update_uneven_dtensor_chunk_meta=False,
+                )
             set_explicit_dtensor_chunk_metadata(
                 state_dtensor,
                 chunk_offsets,
