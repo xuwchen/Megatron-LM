@@ -702,10 +702,13 @@ class TEGroupedMLP(MegatronModule):
         self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor
     ) -> list[int]:
         """Assign HybridEP static-budget padding rows to the final local expert."""
-        if (
+        is_hybridep_full_cg = (
             self.config.cuda_graph_impl == "full_iteration"
-            and torch.cuda.is_current_stream_capturing()
-        ):
+            and self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+        )
+        capture_active = torch.cuda.is_current_stream_capturing()
+        if is_hybridep_full_cg and capture_active and tokens_per_expert.device.type != "cpu":
             tokens_per_expert_list = getattr(self, "_cuda_graph_tokens_per_expert_list", None)
             if tokens_per_expert_list is None:
                 raise RuntimeError(
@@ -714,14 +717,9 @@ class TEGroupedMLP(MegatronModule):
                 )
         else:
             tokens_per_expert_list = tokens_per_expert.tolist()
-            if self.config.cuda_graph_impl == "full_iteration":
+            if is_hybridep_full_cg:
                 self._cuda_graph_tokens_per_expert_list = tokens_per_expert_list
 
-        is_hybridep_full_cg = (
-            self.config.cuda_graph_impl == "full_iteration"
-            and self.config.moe_token_dispatcher_type == "flex"
-            and self.config.moe_flex_dispatcher_backend == "hybridep"
-        )
         if not is_hybridep_full_cg:
             return tokens_per_expert_list
         padded_tokens_per_expert = list(tokens_per_expert_list)
