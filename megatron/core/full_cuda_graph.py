@@ -288,6 +288,7 @@ class FullCudaGraphWrapper:
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         self.use_single_mempool = use_single_mempool
         self.use_pytorch_stale_stream_fix = _use_pytorch_stale_stream_fix()
+        self.force_post_forward_backward_sync = _env_flag("MEGATRON_FULL_CG_FORCE_POST_FB_SYNC")
 
     def _forward_backward_on_capture_stream(self, *args, **kwargs):
         """Run eager warmup on the same stream that will later be captured."""
@@ -416,6 +417,11 @@ class FullCudaGraphWrapper:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
             torch.cuda.current_stream().wait_stream(capture_stream)
             result = FullCudaGraphWrapper.result[training_str]
+        if training and self.force_post_forward_backward_sync:
+            # Debug/correctness valve for stream-dependency gaps between graph FWD/BWD
+            # side effects and the eager optimizer step. This is intentionally broad;
+            # once a mismatch is isolated, replace it with a narrower event wait.
+            torch.cuda.synchronize()
         self.next_iter(training_str)
         return result
 
