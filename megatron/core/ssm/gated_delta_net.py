@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 # Some of this code was adopted from https://github.com/huggingface/transformers
@@ -81,6 +81,9 @@ class GatedDeltaNet(MegatronModule):
     GDN layer takes input with size [s, b, h]
     and returns output of the same size.
     """
+
+    # The FLA GDN kernels currently replay different values under TE partial CUDA graphs.
+    supports_te_cuda_graph = False
 
     def __init__(
         self,
