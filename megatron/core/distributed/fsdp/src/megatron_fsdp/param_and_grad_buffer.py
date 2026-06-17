@@ -4131,6 +4131,13 @@ class AllGatherPipeline:
         if not self.buffer.ddp_config.megatron_fsdp_cuda_graph_mode:
             return False
         try:
+            from megatron.core.full_cuda_graph import is_full_cuda_graph_capturing
+
+            if is_full_cuda_graph_capturing():
+                return True
+        except ImportError:
+            pass
+        try:
             return torch.cuda.is_current_stream_capturing()
         except RuntimeError:
             return False
