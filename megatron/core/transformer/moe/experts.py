@@ -268,9 +268,11 @@ class TEGroupedMLP(MegatronModule):
 
         # Fused implementation with Transformer Engine op fuser API
         if self.config.use_transformer_engine_op_fuser:
-            assert (
-                self._is_fused_impl_supported()
-            ), "Fused GroupedMLP is not supported for this configuration."
+            if not self._is_fused_impl_supported():
+                reason = getattr(self, "_fused_impl_unsupported_reason", "unknown reason")
+                raise AssertionError(
+                    "Fused GroupedMLP is not supported for this configuration: " + reason
+                )
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
@@ -329,6 +331,7 @@ class TEGroupedMLP(MegatronModule):
         """
 
         def _unsupported(reason):
+            self._fused_impl_unsupported_reason = reason
             logger.warning("TE fused GroupedMLP not available: %s", reason)
             return False
 
