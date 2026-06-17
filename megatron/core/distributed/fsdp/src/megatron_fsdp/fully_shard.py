@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 import types
 from enum import IntEnum
 from typing import Callable, Optional, Sequence, Type
@@ -26,6 +27,83 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _distributed_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _local_tensor(tensor):
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    if hasattr(tensor, "_local_tensor"):
+        return tensor._local_tensor
+    return tensor
+
+
+def _sample_checksum(tensor, max_elems: int):
+    tensor = _local_tensor(tensor)
+    if tensor is None or not torch.is_tensor(tensor) or tensor.numel() == 0:
+        return None, 0
+    sample = tensor.detach().reshape(-1)[:max_elems].to(dtype=torch.float32)
+    return sample.sum(), sample.numel()
+
+
+def _debug_optimizer_checksum(optimizer, step: int, stage: str) -> None:
+    max_steps = int(os.environ.get("MEGATRON_FSDP_DEBUG_OPT_CHECKSUM_STEPS", "5"))
+    if step >= max_steps:
+        return
+    max_params = int(os.environ.get("MEGATRON_FSDP_DEBUG_OPT_CHECKSUM_MAX_PARAMS", "256"))
+    max_elems = int(os.environ.get("MEGATRON_FSDP_DEBUG_OPT_CHECKSUM_ELEMS", "256"))
+
+    grad_sum = None
+    data_sum = None
+    grad_tensors = 0
+    grad_elems = 0
+    data_tensors = 0
+    data_elems = 0
+    params_seen = 0
+
+    for group in optimizer.param_groups:
+        for param in group.get("params", []):
+            if max_params > 0 and params_seen >= max_params:
+                break
+            params_seen += 1
+
+            grad_checksum, elems = _sample_checksum(getattr(param, "grad", None), max_elems)
+            if grad_checksum is not None:
+                grad_sum = grad_checksum if grad_sum is None else grad_sum + grad_checksum
+                grad_tensors += 1
+                grad_elems += elems
+
+            data_checksum, elems = _sample_checksum(getattr(param, "data", param), max_elems)
+            if data_checksum is not None:
+                data_sum = data_checksum if data_sum is None else data_sum + data_checksum
+                data_tensors += 1
+                data_elems += elems
+        if max_params > 0 and params_seen >= max_params:
+            break
+
+    zero_kwargs = {"device": torch.cuda.current_device()} if torch.cuda.is_available() else {}
+    if grad_sum is None:
+        grad_sum = torch.zeros((), **zero_kwargs)
+    if data_sum is None:
+        data_sum = torch.zeros((), **zero_kwargs)
+
+    print(
+        "[mfsdp_opt_debug] "
+        f"rank={_distributed_rank()} step={step} stage={stage} "
+        f"params={params_seen} grad_tensors={grad_tensors} grad_elems={grad_elems} "
+        f"grad_sum={grad_sum.item():.9e} data_tensors={data_tensors} data_elems={data_elems} "
+        f"data_sum={data_sum.item():.9e}",
+        flush=True,
+    )
 
 
 class ShardingStrategy(IntEnum):
@@ -518,6 +596,8 @@ def fully_shard_optimizer(
     # Define a new optimizer.step() method that distributes optimizer state and gradients,
     # waits for asynchronous gradient reduce-scatter work to be completed, and updates
     # model weights. These options can be turned off via arguments in optimizer.step().
+    debug_step = {"value": 0}
+
     def megatron_fsdp_optimizer_step(optimizer, *args, **kwargs):
         # Extract extended kwargs.
         sync_grad_before_optimizer_step = kwargs.pop("sync_grad_before_optimizer_step", True)
@@ -533,12 +613,19 @@ def fully_shard_optimizer(
         if sync_grad_before_optimizer_step and not mfsdp_model.model_auto_sync:
             mfsdp_model.finish_grad_sync()
 
+        if _env_flag("MEGATRON_FSDP_DEBUG_OPT_CHECKSUM"):
+            _debug_optimizer_checksum(optimizer, debug_step["value"], "pre_step")
+
         # Execute the base optimizer.step() on the model optimizer named parameters.
         optimizer_step_base_func(optimizer, *args, **kwargs)
+
+        if _env_flag("MEGATRON_FSDP_DEBUG_OPT_CHECKSUM"):
+            _debug_optimizer_checksum(optimizer, debug_step["value"], "post_step")
 
         # Update the raw module training parameters with optimized values.
         if install_optimized_model_weights:
             mfsdp_model.install_optimized_model_weights()
+        debug_step["value"] += 1
 
     # Define a new optimizer.zero_grad() method that zeros the gradient in both
     # the optimizer as well as the Megatron-FSDP gradient buffer. These options
