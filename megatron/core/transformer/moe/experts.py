@@ -297,6 +297,13 @@ class TEGroupedMLP(MegatronModule):
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
             return intermediate_parallel
+        if isinstance(tokens_per_expert, torch.Tensor):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Full CUDA graph HybridEP with tensor expert counts does not support "
+                    "MoE expert bias because torch.split requires host split sizes."
+                )
+            tokens_per_expert = tokens_per_expert.tolist()
         shape = intermediate_parallel.shape
         return (
             torch.cat(
@@ -701,7 +708,7 @@ class TEGroupedMLP(MegatronModule):
 
     def _pad_hybridep_static_budget_tokens_per_expert(
         self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor
-    ) -> list[int]:
+    ) -> list[int] | torch.Tensor:
         """Assign HybridEP static-budget padding rows to the final local expert."""
         is_hybridep_full_cg = (
             self.config.cuda_graph_impl == "full_iteration"
@@ -709,19 +716,24 @@ class TEGroupedMLP(MegatronModule):
             and self.config.moe_flex_dispatcher_backend == "hybridep"
         )
         capture_active = torch.cuda.is_current_stream_capturing()
-        if is_hybridep_full_cg and capture_active and tokens_per_expert.device.type != "cpu":
-            tokens_per_expert_list = getattr(self, "_cuda_graph_tokens_per_expert_list", None)
-            if tokens_per_expert_list is None:
-                raise RuntimeError(
-                    "Full CUDA graph capture reached MoE experts before expert token counts "
-                    "were cached during warmup."
-                )
-        else:
-            tokens_per_expert_list = tokens_per_expert.tolist()
-            if is_hybridep_full_cg:
-                self._cuda_graph_tokens_per_expert_list = tokens_per_expert_list
+        if not is_hybridep_full_cg:
+            return tokens_per_expert.tolist()
 
-        if is_hybridep_full_cg and os.environ.get("MEGATRON_FULL_CG_DEBUG_LOSS"):
+        if tokens_per_expert.device.type == "cpu":
+            padded_tokens_per_expert = tokens_per_expert.tolist()
+            token_padding = permuted_local_hidden_states.shape[0] - sum(padded_tokens_per_expert)
+            padded_tokens_per_expert[-1] += token_padding
+            debug_counts = padded_tokens_per_expert
+            debug_source = "current_cpu"
+        else:
+            padded_tokens_per_expert = tokens_per_expert.to(dtype=torch.int64).clone()
+            padded_tokens_per_expert[-1] = (
+                permuted_local_hidden_states.shape[0] - padded_tokens_per_expert[:-1].sum()
+            )
+            debug_counts = None
+            debug_source = "current_cuda_tensor"
+
+        if os.environ.get("MEGATRON_FULL_CG_DEBUG_LOSS"):
             debug_count = getattr(self, "_full_cg_tpe_debug_count", 0)
             if debug_count < 12:
                 self._full_cg_tpe_debug_count = debug_count + 1
@@ -733,28 +745,24 @@ class TEGroupedMLP(MegatronModule):
                     rank = 0
                     world_size = 1
                 if rank == world_size - 1:
-                    source = (
-                        "cached"
-                        if capture_active and tokens_per_expert.device.type != "cpu"
-                        else "current"
+                    if debug_counts is None and not capture_active:
+                        debug_counts = padded_tokens_per_expert.detach().cpu().tolist()
+                    counts_msg = (
+                        f"counts_sum={sum(debug_counts)} counts={debug_counts}"
+                        if debug_counts is not None
+                        else "counts=<cuda_tensor>"
                     )
                     # pylint: disable=bad-builtin
                     print(
                         "[full_cuda_graph_debug] hybridep_tpe "
                         f"module={getattr(self, 'name', None)} "
-                        f"capture={capture_active} source={source} "
+                        f"capture={capture_active} source={debug_source} "
                         f"device={tokens_per_expert.device} dtype={tokens_per_expert.dtype} "
                         f"hidden_rows={permuted_local_hidden_states.shape[0]} "
-                        f"counts_sum={sum(tokens_per_expert_list)} "
-                        f"counts={tokens_per_expert_list}",
+                        f"{counts_msg}",
                         flush=True,
                     )
 
-        if not is_hybridep_full_cg:
-            return tokens_per_expert_list
-        padded_tokens_per_expert = list(tokens_per_expert_list)
-        token_padding = permuted_local_hidden_states.shape[0] - sum(padded_tokens_per_expert)
-        padded_tokens_per_expert[-1] += token_padding
         return padded_tokens_per_expert
 
     def _tokens_per_expert_to_device(self, tokens_per_expert, device: torch.device) -> torch.Tensor:
