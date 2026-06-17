@@ -1122,7 +1122,8 @@ class _HybridEPManager(_DispatchManager):
                 * self.moe_expert_rank_capacity_factor
             )
             # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
-            budget += -budget % pad_multiple
+            if pad_multiple > 0:
+                budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
         elif self.config.cuda_graph_impl == "full_iteration":
             # Full-iteration CUDA graph capture cannot safely use HybridEP's dynamic
@@ -1131,7 +1132,8 @@ class _HybridEPManager(_DispatchManager):
             # the TE op-fuser that is incompatible with fine-grained activation offload.
             pad_multiple = get_align_size_for_quantization(self.config)
             budget = int(padded_num_tokens * self.config.moe_router_topk * 1.2)
-            budget += -budget % pad_multiple
+            if pad_multiple > 0:
+                budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
         # else: num_permuted_tokens stays None; HybridEP sizes buffers dynamically (CPU sync
         # in dispatch) and does not drop tokens or report overflow.
