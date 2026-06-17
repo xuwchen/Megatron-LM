@@ -687,6 +687,11 @@ class MegatronFSDP(torch.nn.Module):
             for sub_module in module.modules():
                 sub_module._training_state = TrainingState.IDLE
 
+        # Tags for cuda_graphs.py: A2A-overlap schedules drive FSDP release
+        # explicitly, so TE capture_time_hooks must not call this handler.
+        # Attribute name must match _CUDA_GRAPH_FSDP_RELEASE_ATTR in cuda_graphs.py.
+        _post_backward_release_module._cuda_graph_fsdp_release_handler = True
+
         @torch.compiler.disable
         def _process_post_backward_gradients(param_list, from_delayed_wgrad=False):
             """
@@ -820,6 +825,11 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
             return None
+
+        # Tag for cuda_graphs.py: TE partial graph capture pre-gathers graph
+        # buckets and restores this eager hook for normal replay/manual handling.
+        # Attribute name must match _CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR in cuda_graphs.py.
+        _pre_forward_param_unshard._cuda_graph_fsdp_param_unshard_handler = True
 
         @torch.compiler.disable
         def _register_post_backward_hook(
@@ -959,6 +969,11 @@ class MegatronFSDP(torch.nn.Module):
                 self.all_gather_and_wait_parameters_ready(
                     param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
                 )
+
+        # Tag for cuda_graphs.py: TE partial graph capture pre-gathers graph
+        # buckets and restores this eager hook for normal backward handling.
+        # Attribute name must match _CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR in cuda_graphs.py.
+        _pre_backward_param_unshard._cuda_graph_fsdp_param_unshard_handler = True
 
         self._root_pre_backward_hook_issued = False
 

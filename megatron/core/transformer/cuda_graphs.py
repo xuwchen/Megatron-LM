@@ -1501,6 +1501,10 @@ _CUDA_GRAPH_BACKWARD_HANDLER_ATTR = '_cuda_graph_backward_handler'
 _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR = '_cuda_graph_backward_pre_handler'
 # Set on a forward hook: hook is restored after capture, but withheld from TE capture.
 _CUDA_GRAPH_FORWARD_RELEASE_ATTR = '_cuda_graph_forward_release_handler'
+# Set on FSDP parameter unshard hooks that are driven outside TE capture.
+_CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR = '_cuda_graph_fsdp_param_unshard_handler'
+# Set on FSDP parameter release hooks that are driven outside TE capture.
+_CUDA_GRAPH_FSDP_RELEASE_ATTR = '_cuda_graph_fsdp_release_handler'
 
 
 def _apply_fsdp_hook_transforms(hooks_dict):
@@ -1510,8 +1514,14 @@ def _apply_fsdp_hook_transforms(hooks_dict):
         to_remove = []
         new_bh = {}
         for hook_id, hook_fn in fph.items():
+            if getattr(hook_fn, _CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR, None) is not None:
+                to_remove.append(hook_id)
+                continue
             handler = getattr(hook_fn, _CUDA_GRAPH_BACKWARD_HANDLER_ATTR, None)
             if handler is not None:
+                if getattr(handler, _CUDA_GRAPH_FSDP_RELEASE_ATTR, None) is not None:
+                    to_remove.append(hook_id)
+                    continue
                 new_bh[hook_id] = handler
                 to_remove.append(hook_id)
         for hook_id in to_remove:
@@ -1533,6 +1543,9 @@ def _apply_fsdp_hook_transforms(hooks_dict):
                 continue
             handler = getattr(hook_fn, _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR, None)
             if handler is not None:
+                if getattr(handler, _CUDA_GRAPH_FSDP_PARAM_UNSHARD_ATTR, None) is not None:
+                    to_remove.append(hook_id)
+                    continue
                 new_bph[hook_id] = handler
                 to_remove.append(hook_id)
         for hook_id in to_remove:
@@ -2814,6 +2827,7 @@ class TECudaGraphHelper:
             was_distributed = getattr(fsdp_module, 'is_param_fsdp_distributed', False)
             self._fsdp_capture_param_states.append((fsdp_module, was_distributed))
             fsdp_module._replace_param_with_raw_if_needed()
+        self._all_gather_graph_fsdp_buckets_for_capture()
 
     def _get_graph_fsdp_bucket_keys(self, fsdp_module):
         """Return FSDP all-gather bucket keys whose storage is captured by TE graphs."""
@@ -2837,6 +2851,20 @@ class TECudaGraphHelper:
                     graph_bucket_keys.add(ag_pipeline.get_bucket_key(group_id, bwd=False))
                     graph_bucket_keys.add(ag_pipeline.get_bucket_key(group_id, bwd=True))
         return graph_bucket_keys
+
+    def _all_gather_graph_fsdp_buckets_for_capture(self):
+        """Make graph-covered FSDP buckets ready before TE invokes capture hooks."""
+        if not self.config.overlap_moe_expert_parallel_comm:
+            return
+        for fsdp_module, _ in self._fsdp_capture_param_states:
+            pgb = fsdp_module.param_and_grad_buffer
+            for bucket_id, bwd in sorted(self._get_graph_fsdp_bucket_keys(fsdp_module)):
+                param_group = pgb.parameter_groups[bucket_id]
+                fsdp_module.all_gather_and_wait_parameters_ready(
+                    param_group.params,
+                    prefetch=False,
+                    bwd=bwd,
+                )
 
     def _release_non_graph_fsdp_buckets_after_capture(self):
         """Drop capture-time FSDP buckets that are not needed by TE graph replay."""
