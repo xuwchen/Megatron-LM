@@ -37,6 +37,50 @@ def _print_rank0(message):
         print(f"[full_cuda_graph] {message}", flush=True)
 
 
+def _debug_enabled():
+    """Whether verbose full-CG loss/data diagnostics are enabled."""
+    return _env_flag("MEGATRON_FULL_CG_DEBUG_LOSS")
+
+
+def _print_rank_last(message):
+    """Print a full-CG debug marker on the last rank."""
+    try:
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        rank = torch.distributed.get_rank() if distributed else 0
+        world_size = torch.distributed.get_world_size() if distributed else 1
+    except RuntimeError:
+        rank = 0
+        world_size = 1
+    if rank == world_size - 1:
+        # pylint: disable=bad-builtin
+        print(f"[full_cuda_graph_debug] {message}", flush=True)
+
+
+def _tensor_checksum(tensor):
+    """Return a lightweight numeric checksum for a CUDA tensor."""
+    if tensor is None:
+        return "none"
+    if not isinstance(tensor, torch.Tensor):
+        return type(tensor).__name__
+    flat = tensor.detach().view(-1)
+    if flat.numel() == 0:
+        return "empty"
+    sample = flat[: min(flat.numel(), 1024)].to(dtype=torch.float32)
+    return f"shape={tuple(tensor.shape)} first={flat[0].item()} sum1024={sample.sum().item():.1f}"
+
+
+def _debug_static_batch(stage, iteration, microbatch, batch):
+    """Log static input checksums outside CUDA graph capture/replay."""
+    if not _debug_enabled():
+        return
+    _print_rank_last(
+        f"{stage} iter={iteration} mb={microbatch} "
+        f"tokens={_tensor_checksum(batch.get('tokens'))} "
+        f"labels={_tensor_checksum(batch.get('labels'))} "
+        f"loss_mask={_tensor_checksum(batch.get('loss_mask'))}"
+    )
+
+
 def _synchronize_fsdp_param_gathers(model):
     """Drain Megatron-FSDP parameter all-gathers before full-iteration capture."""
     seen = set()
@@ -263,11 +307,10 @@ class FullCudaGraphWrapper:
             data_list = []
             if iterator0 is not None:
                 for b in range(num_microbatches):
-                    data_list.append(
-                        self.static_loader(
-                            next(iterator0), 'training' if training else 'validation', b
-                        )
-                    )
+                    stage = 'training' if training else 'validation'
+                    batch = self.static_loader(next(iterator0), stage, b)
+                    _debug_static_batch(stage, self.curr_iter(stage), b, batch)
+                    data_list.append(batch)
                 data_list = [iter(data_list)]
             else:
                 data_list.append(None)
@@ -278,11 +321,10 @@ class FullCudaGraphWrapper:
                 if data_iterator[i] is not None:
                     data_list_i = []
                     for b in range(num_microbatches):
-                        data_list_i.append(
-                            self.static_loader(
-                                next(data_iterator[i]), 'training' if training else 'validation', b
-                            )
-                        )
+                        stage = 'training' if training else 'validation'
+                        batch = self.static_loader(next(data_iterator[i]), stage, b)
+                        _debug_static_batch(stage, self.curr_iter(stage), b, batch)
+                        data_list_i.append(batch)
                     data_list.append(iter(data_list_i))
                 else:
                     data_list.append(None)

@@ -2299,6 +2299,36 @@ def dummy_train_step(data_iterator):
             )
 
 
+def _debug_full_cg_loss_enabled():
+    return os.environ.get("MEGATRON_FULL_CG_DEBUG_LOSS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _debug_full_cg_rank_last():
+    if not _debug_full_cg_loss_enabled():
+        return False
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank() == torch.distributed.get_world_size() - 1
+    except RuntimeError:
+        return False
+    return True
+
+
+def _debug_full_cg_tensor_values(tensor):
+    tensor = tensor.detach().view(-1).to(dtype=torch.float32)
+    return "[" + ", ".join(f"{x:.6f}" for x in tensor.cpu().tolist()) + "]"
+
+
+def _debug_full_cg_loss(message):
+    if _debug_full_cg_rank_last():
+        print(f"[full_cuda_graph_debug] {message}", flush=True)
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection] = None):
     """Single training step.
 
@@ -2512,6 +2542,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         loss_reduced = {}
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
+            if _debug_full_cg_rank_last():
+                _debug_full_cg_loss(
+                    f"train_iter={iteration} raw {key} "
+                    f"{' '.join(_debug_full_cg_tensor_values(x) for x in val)}"
+                )
             if val[0].numel() == 2:
                 # there is one dict per microbatch. in new reporting, we average
                 # over the total number of tokens across the global batch.
@@ -2524,6 +2559,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 loss_reduced[key] = val
             else:
                 raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+            _debug_full_cg_loss(
+                f"train_iter={iteration} reduced {key} "
+                f"{_debug_full_cg_tensor_values(loss_reduced[key])}"
+            )
         return (
             loss_reduced,
             skipped_iter,

@@ -75,6 +75,49 @@ except ImportError:
 stimer = StragglerDetector()
 
 
+def _debug_loss_enabled():
+    return os.environ.get("MEGATRON_FULL_CG_DEBUG_LOSS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _debug_rank_last():
+    if not _debug_loss_enabled():
+        return False
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return False
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank() == torch.distributed.get_world_size() - 1
+    except RuntimeError:
+        return False
+    return int(os.environ.get("RANK", 0)) == int(os.environ.get("WORLD_SIZE", 1)) - 1
+
+
+def _debug_tensor_checksum(tensor):
+    if tensor is None:
+        return "none"
+    flat = tensor.detach().view(-1)
+    if flat.numel() == 0:
+        return "empty"
+    sample = flat[: min(flat.numel(), 1024)].to(dtype=torch.float32)
+    return f"shape={tuple(tensor.shape)} first={flat[0].item()} sum1024={sample.sum().item():.1f}"
+
+
+def _debug_print_batch(tokens, labels, loss_mask):
+    if _debug_rank_last():
+        print(
+            "[full_cuda_graph_debug] get_batch "
+            f"tokens={_debug_tensor_checksum(tokens)} "
+            f"labels={_debug_tensor_checksum(labels)} "
+            f"loss_mask={_debug_tensor_checksum(loss_mask)}",
+            flush=True,
+        )
+
+
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch.
 
@@ -232,6 +275,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch['position_ids'] = position_ids
 
     # Unpack explicitly to avoid relying on dict insertion order.
+    _debug_print_batch(
+        batch.get('tokens'),
+        batch.get('labels'),
+        batch.get('loss_mask'),
+    )
     return (
         batch.get('tokens'),
         batch.get('labels'),
