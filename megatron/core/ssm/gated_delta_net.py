@@ -6,9 +6,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from functools import lru_cache
-from typing import Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -59,7 +60,14 @@ try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
     from fla.ops.cp import build_cp_context
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+    if os.environ.get("MCORE_GDN_USE_OPT_WRAPPER", "0") == "1":
+        try:
+            from mcore_gdn_opt.gated_delta_rule import chunk_gated_delta_rule
+        except ImportError:
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    else:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
