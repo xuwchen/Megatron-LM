@@ -363,7 +363,8 @@ class FullCudaGraphWrapper:
             torch.distributed.barrier()
             _print_rank0(f"{training_str} iteration {curr_iteration}: CUDA graph capture done")
             logger.info(f'CUDA graph capture done for {training_str}!!!')
-        if FullCudaGraphWrapper.cuda_graph[training_str] is None:
+            result = FullCudaGraphWrapper.result[training_str]
+        elif FullCudaGraphWrapper.cuda_graph[training_str] is None:
             if self.use_pytorch_stale_stream_fix:
                 result = self.forward_backward_func(*args, **kwargs)
             else:
