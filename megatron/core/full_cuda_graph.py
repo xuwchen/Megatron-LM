@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 # tools/debug_cuda_graph_pool_memory*.py).
 _shared_graph_pool = None
 _shared_capture_stream = None
-_full_cuda_graph_capture_active = False
 
 
 def _env_flag(name):
@@ -41,23 +40,6 @@ def _print_rank0(message):
 def _debug_enabled():
     """Whether verbose full-CG loss/data diagnostics are enabled."""
     return _env_flag("MEGATRON_FULL_CG_DEBUG_LOSS")
-
-
-def is_full_cuda_graph_capturing():
-    """Return whether a full-iteration CUDA graph capture body is active."""
-    return _full_cuda_graph_capture_active
-
-
-@contextmanager
-def _full_cuda_graph_capture_scope():
-    """Mark Python-side full-iteration capture state for graph-safe helpers."""
-    global _full_cuda_graph_capture_active
-    prior = _full_cuda_graph_capture_active
-    _full_cuda_graph_capture_active = True
-    try:
-        yield
-    finally:
-        _full_cuda_graph_capture_active = prior
 
 
 def _print_rank_last(message):
@@ -409,14 +391,13 @@ class FullCudaGraphWrapper:
             # invalidating PyTorch allocator state during stream capture.
             with _override_stale_capture_stream(self.use_pytorch_stale_stream_fix):
                 with torch.autograd.set_multithreading_enabled(False):
-                    with _full_cuda_graph_capture_scope():
-                        with torch.cuda.graph(
-                            FullCudaGraphWrapper.cuda_graph[training_str],
-                            stream=capture_stream,
-                            pool=get_graph_pool(self.use_single_mempool),
-                            capture_error_mode="relaxed",
-                        ):
-                            captured_result = self.forward_backward_func(*args, **kwargs)
+                    with torch.cuda.graph(
+                        FullCudaGraphWrapper.cuda_graph[training_str],
+                        stream=capture_stream,
+                        pool=get_graph_pool(self.use_single_mempool),
+                        capture_error_mode="relaxed",
+                    ):
+                        captured_result = self.forward_backward_func(*args, **kwargs)
             _print_rank0(f"{training_str} iteration {curr_iteration}: capture body done")
             FullCudaGraphWrapper.result[training_str] = captured_result
             torch.cuda.synchronize()
