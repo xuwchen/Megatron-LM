@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -719,6 +720,35 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert_list = tokens_per_expert.tolist()
             if is_hybridep_full_cg:
                 self._cuda_graph_tokens_per_expert_list = tokens_per_expert_list
+
+        if is_hybridep_full_cg and os.environ.get("MEGATRON_FULL_CG_DEBUG_LOSS"):
+            debug_count = getattr(self, "_full_cg_tpe_debug_count", 0)
+            if debug_count < 12:
+                self._full_cg_tpe_debug_count = debug_count + 1
+                try:
+                    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+                    rank = torch.distributed.get_rank() if distributed else 0
+                    world_size = torch.distributed.get_world_size() if distributed else 1
+                except RuntimeError:
+                    rank = 0
+                    world_size = 1
+                if rank == world_size - 1:
+                    source = (
+                        "cached"
+                        if capture_active and tokens_per_expert.device.type != "cpu"
+                        else "current"
+                    )
+                    # pylint: disable=bad-builtin
+                    print(
+                        "[full_cuda_graph_debug] hybridep_tpe "
+                        f"module={getattr(self, 'name', None)} "
+                        f"capture={capture_active} source={source} "
+                        f"device={tokens_per_expert.device} dtype={tokens_per_expert.dtype} "
+                        f"hidden_rows={permuted_local_hidden_states.shape[0]} "
+                        f"counts_sum={sum(tokens_per_expert_list)} "
+                        f"counts={tokens_per_expert_list}",
+                        flush=True,
+                    )
 
         if not is_hybridep_full_cg:
             return tokens_per_expert_list
