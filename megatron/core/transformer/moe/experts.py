@@ -751,10 +751,29 @@ class TEGroupedMLP(MegatronModule):
         )
         capture_active = torch.cuda.is_current_stream_capturing()
         if not is_hybridep_full_cg:
+            if self._with_fused_impl and tokens_per_expert.device.type == "cpu":
+                padded_tokens_per_expert = tokens_per_expert.to(dtype=torch.int64)
+                token_padding = (
+                    permuted_local_hidden_states.shape[0] - int(padded_tokens_per_expert.sum())
+                )
+                if token_padding:
+                    padded_tokens_per_expert = padded_tokens_per_expert.clone()
+                    padded_tokens_per_expert[-1] += token_padding
+                return padded_tokens_per_expert
             return tokens_per_expert.tolist()
 
         use_tensor_counts = tokens_per_expert.device.type != "cpu" and self._with_fused_impl
-        if tokens_per_expert.device.type == "cpu" or not use_tensor_counts:
+        if self._with_fused_impl and tokens_per_expert.device.type == "cpu":
+            padded_tokens_per_expert = tokens_per_expert.to(dtype=torch.int64)
+            token_padding = (
+                permuted_local_hidden_states.shape[0] - int(padded_tokens_per_expert.sum())
+            )
+            if token_padding:
+                padded_tokens_per_expert = padded_tokens_per_expert.clone()
+                padded_tokens_per_expert[-1] += token_padding
+            debug_counts = padded_tokens_per_expert.tolist()
+            debug_source = "current_cpu_tensor"
+        elif tokens_per_expert.device.type == "cpu" or not use_tensor_counts:
             if capture_active and tokens_per_expert.device.type != "cpu":
                 padded_tokens_per_expert = getattr(
                     self, "_cuda_graph_padded_tokens_per_expert_list", None

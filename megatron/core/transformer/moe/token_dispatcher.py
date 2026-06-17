@@ -1213,7 +1213,8 @@ class _HybridEPManager(_DispatchManager):
             self.moe_expert_rank_capacity_factor is not None
             or self.config.cuda_graph_impl == "full_iteration"
         ):
-            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+            if not self.drop_and_pad:
+                self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
     def combine(
