@@ -4091,6 +4091,11 @@ class AllGatherPipeline:
             for bwd in [False, True]:
                 self.bucket_can_be_released[self.get_bucket_key(i, bwd)] = False
 
+        # Bucket storage captured by a CUDA graph cannot be returned to the temporary
+        # allocator: graph replay keeps writing to the captured data pointers even
+        # though the Python FSDP hooks do not run on replay.
+        self.cuda_graph_preserved_bucket_keys = set()
+
         # Map each bucket to the bucket group it belongs to by enumerated ID.
         # Made to collect a subset of buckets in the same bucket group.
         self.bucket_to_bucket_group = {}
@@ -4120,6 +4125,22 @@ class AllGatherPipeline:
             self.buffer.parameter_groups[bucket_id].transpose_weight_buffer is not None
         )
         return (bucket_id, has_transpose_buffer and bwd)
+
+    def _cuda_graph_capture_active(self) -> bool:
+        """Return whether the current CUDA stream is capturing a graph."""
+        if not self.buffer.ddp_config.megatron_fsdp_cuda_graph_mode:
+            return False
+        try:
+            return torch.cuda.is_current_stream_capturing()
+        except RuntimeError:
+            return False
+
+    def _preserve_cuda_graph_bucket(self, bucket_key) -> bool:
+        """Preserve storage for buckets whose address is baked into a CUDA graph."""
+        return (
+            self.buffer.ddp_config.megatron_fsdp_cuda_graph_mode
+            and bucket_key in self.cuda_graph_preserved_bucket_keys
+        )
 
     @property
     def num_buckets(self):
@@ -4156,12 +4177,17 @@ class AllGatherPipeline:
                 # storage in place.
                 if preserve_non_fsdp_units and not is_unit_bucket:
                     self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+                elif self._preserve_cuda_graph_bucket(bucket_key):
+                    self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+                    self.bucket_can_be_released[bucket_key] = False
                 else:
                     self.bucket_can_be_released[bucket_key] = True
         self.recycle_unused_buckets()
 
         expected_statuses = (BucketStatus.EMPTY,)
         if preserve_non_fsdp_units:
+            expected_statuses += (BucketStatus.PRESERVED,)
+        elif self.cuda_graph_preserved_bucket_keys:
             expected_statuses += (BucketStatus.PRESERVED,)
 
         assert all(status in expected_statuses for status in self.bucket_status.values()), (
@@ -4423,6 +4449,20 @@ class AllGatherPipeline:
         if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
             return
 
+        preserve_for_cuda_graph = (
+            self._cuda_graph_capture_active() or self._preserve_cuda_graph_bucket(bucket_key)
+        )
+        if preserve_for_cuda_graph:
+            self.cuda_graph_preserved_bucket_keys.add(bucket_key)
+            self.bucket_can_be_released[bucket_key] = False
+            if lazy:
+                return
+
+            self.wait_bucket_ready(bucket_id, bwd, empty_ok=True)
+            if self.bucket_status[bucket_key] != BucketStatus.EMPTY:
+                self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+            return
+
         if lazy:
             # Mark the bucket can be released later.
             self.bucket_can_be_released[bucket_key] = True
@@ -4444,6 +4484,11 @@ class AllGatherPipeline:
         """Recycle the unused buckets."""
         for bucket_key, can_be_released in self.bucket_can_be_released.items():
             if can_be_released:
+                if self._preserve_cuda_graph_bucket(bucket_key):
+                    if self.bucket_status[bucket_key] != BucketStatus.EMPTY:
+                        self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+                    self.bucket_can_be_released[bucket_key] = False
+                    continue
                 bucket_id, is_transpose_weight = bucket_key[0], bucket_key[1]
                 self.release_bucket(bucket_id, is_transpose_weight)
                 self.bucket_can_be_released[bucket_key] = False
