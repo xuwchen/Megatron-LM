@@ -632,6 +632,8 @@ class TEGroupedMLP(MegatronModule):
             self._fused_ops = (self._make_fused_ops(),)
         (ops,) = self._fused_ops
 
+        self._prepare_fused_wgrad_main_grads(ops)
+
         is_hybridep_full_cg = (
             self.config.cuda_graph_impl == "full_iteration"
             and self.config.moe_token_dispatcher_type == "flex"
@@ -697,6 +699,22 @@ class TEGroupedMLP(MegatronModule):
         if self.config.moe_paged_stash:
             output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
+
+    def _prepare_fused_wgrad_main_grads(self, ops: torch.nn.Module) -> None:
+        """Ensure TE op-fuser has FSDP main_grad targets before forward."""
+        if not self.linear_fc1.delay_wgrad_compute:
+            return
+
+        for param in ops.parameters():
+            if (
+                not hasattr(param, "get_main_grad")
+                or getattr(param, "main_grad", None) is not None
+            ):
+                continue
+
+            param.main_grad = param.get_main_grad()
+            if getattr(param, "overwrite_main_grad", False):
+                param.main_grad.zero_()
 
     def _align_hybridep_static_budget_probs(
         self, permuted_local_hidden_states: torch.Tensor, permuted_probs: torch.Tensor
