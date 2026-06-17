@@ -1499,6 +1499,50 @@ _RESTORE_KEYS = frozenset(
 _CUDA_GRAPH_BACKWARD_HANDLER_ATTR = '_cuda_graph_backward_handler'
 # Set on a forward hook: inner handler goes to backward_pre_hooks (pre-backward).
 _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR = '_cuda_graph_backward_pre_handler'
+# Set on a forward hook: hook is restored after capture, but withheld from TE capture.
+_CUDA_GRAPH_FORWARD_RELEASE_ATTR = '_cuda_graph_forward_release_handler'
+
+
+def _apply_fsdp_hook_transforms(hooks_dict):
+    """Reroute or withhold tagged FSDP wrapper hooks before TE capture."""
+    fph = hooks_dict.get('forward_pre_hooks')
+    if fph:
+        to_remove = []
+        new_bh = {}
+        for hook_id, hook_fn in fph.items():
+            handler = getattr(hook_fn, _CUDA_GRAPH_BACKWARD_HANDLER_ATTR, None)
+            if handler is not None:
+                new_bh[hook_id] = handler
+                to_remove.append(hook_id)
+        for hook_id in to_remove:
+            del fph[hook_id]
+            hooks_dict.get('forward_pre_hooks_with_kwargs', {}).pop(hook_id, None)
+        if new_bh:
+            hooks_dict.setdefault('backward_hooks', {}).update(new_bh)
+        if not fph:
+            del hooks_dict['forward_pre_hooks']
+            hooks_dict.pop('forward_pre_hooks_with_kwargs', None)
+
+    fh = hooks_dict.get('forward_hooks')
+    if fh:
+        to_remove = []
+        new_bph = {}
+        for hook_id, hook_fn in fh.items():
+            if getattr(hook_fn, _CUDA_GRAPH_FORWARD_RELEASE_ATTR, None) is not None:
+                to_remove.append(hook_id)
+                continue
+            handler = getattr(hook_fn, _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR, None)
+            if handler is not None:
+                new_bph[hook_id] = handler
+                to_remove.append(hook_id)
+        for hook_id in to_remove:
+            del fh[hook_id]
+            hooks_dict.get('forward_hooks_with_kwargs', {}).pop(hook_id, None)
+        if new_bph:
+            hooks_dict.setdefault('backward_pre_hooks', {}).update(new_bph)
+        if not fh:
+            del hooks_dict['forward_hooks']
+            hooks_dict.pop('forward_hooks_with_kwargs', None)
 
 
 class CudaGraphManager(torch.nn.Module):
@@ -2621,44 +2665,6 @@ class TECudaGraphHelper:
                 module._backward_hooks.clear()
 
             return hooks_dict
-
-        def _apply_fsdp_hook_transforms(hooks_dict):
-            """Reroute tagged FSDP wrapper hooks into TE-facing backward hook dicts."""
-            fph = hooks_dict.get('forward_pre_hooks')
-            if fph:
-                to_remove = []
-                new_bh = {}
-                for hook_id, hook_fn in fph.items():
-                    handler = getattr(hook_fn, _CUDA_GRAPH_BACKWARD_HANDLER_ATTR, None)
-                    if handler is not None:
-                        new_bh[hook_id] = handler
-                        to_remove.append(hook_id)
-                for hook_id in to_remove:
-                    del fph[hook_id]
-                    hooks_dict.get('forward_pre_hooks_with_kwargs', {}).pop(hook_id, None)
-                if new_bh:
-                    hooks_dict.setdefault('backward_hooks', {}).update(new_bh)
-                if not fph:
-                    del hooks_dict['forward_pre_hooks']
-                    hooks_dict.pop('forward_pre_hooks_with_kwargs', None)
-
-            fh = hooks_dict.get('forward_hooks')
-            if fh:
-                to_remove = []
-                new_bph = {}
-                for hook_id, hook_fn in fh.items():
-                    handler = getattr(hook_fn, _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR, None)
-                    if handler is not None:
-                        new_bph[hook_id] = handler
-                        to_remove.append(hook_id)
-                for hook_id in to_remove:
-                    del fh[hook_id]
-                    hooks_dict.get('forward_hooks_with_kwargs', {}).pop(hook_id, None)
-                if new_bph:
-                    hooks_dict.setdefault('backward_pre_hooks', {}).update(new_bph)
-                if not fh:
-                    del hooks_dict['forward_hooks']
-                    hooks_dict.pop('forward_hooks_with_kwargs', None)
 
         extracted_hooks = []
         restore_hooks = []

@@ -1028,6 +1028,12 @@ class MegatronFSDP(torch.nn.Module):
 
             return output
 
+        # Tag for cuda_graphs.py: this forward hook releases FSDP buckets after
+        # eager forward. TE partial CUDA graph capture must withhold it because
+        # the A2A-overlap schedule performs FSDP release explicitly.
+        # Attribute name must match _CUDA_GRAPH_FORWARD_RELEASE_ATTR in cuda_graphs.py.
+        _post_forward._cuda_graph_forward_release_handler = release_module_parameters
+
         @torch.compiler.disable
         def _release_module_fp8_transpose_cache(module: nn.Module, *unused):
             release_params_fp8_transpose_cache(module.parameters(recurse=False))
