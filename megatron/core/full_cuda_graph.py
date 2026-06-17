@@ -411,8 +411,10 @@ class FullCudaGraphWrapper:
             else:
                 result = self._forward_backward_on_capture_stream(*args, **kwargs)
         else:
+            capture_stream = get_shared_capture_stream()
+            capture_stream.wait_stream(torch.cuda.current_stream())
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
-            torch.cuda.current_stream().wait_stream(get_shared_capture_stream())
+            torch.cuda.current_stream().wait_stream(capture_stream)
             result = FullCudaGraphWrapper.result[training_str]
         self.next_iter(training_str)
         return result
