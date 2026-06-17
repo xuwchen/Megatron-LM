@@ -629,6 +629,19 @@ class TEGroupedMLP(MegatronModule):
             self._fused_ops = (self._make_fused_ops(),)
         (ops,) = self._fused_ops
 
+        is_hybridep_full_cg = (
+            self.config.cuda_graph_impl == "full_iteration"
+            and self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+        )
+        if is_hybridep_full_cg:
+            tokens_per_expert = self._pad_hybridep_static_budget_tokens_per_expert(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+            permuted_probs = self._align_hybridep_static_budget_probs(
+                permuted_local_hidden_states, permuted_probs
+            )
+
         # Apply padding if needed
         unpadded_tokens_per_expert = None
         if skip_routed_expert_padding(self.config):
@@ -719,12 +732,29 @@ class TEGroupedMLP(MegatronModule):
         if not is_hybridep_full_cg:
             return tokens_per_expert.tolist()
 
-        if tokens_per_expert.device.type == "cpu":
-            padded_tokens_per_expert = tokens_per_expert.tolist()
-            token_padding = permuted_local_hidden_states.shape[0] - sum(padded_tokens_per_expert)
-            padded_tokens_per_expert[-1] += token_padding
+        use_tensor_counts = tokens_per_expert.device.type != "cpu" and self._with_fused_impl
+        if tokens_per_expert.device.type == "cpu" or not use_tensor_counts:
+            if capture_active and tokens_per_expert.device.type != "cpu":
+                padded_tokens_per_expert = getattr(
+                    self, "_cuda_graph_padded_tokens_per_expert_list", None
+                )
+                if padded_tokens_per_expert is None:
+                    raise RuntimeError(
+                        "Full CUDA graph capture reached unfused MoE experts before padded "
+                        "expert token counts were cached during warmup. Enable "
+                        "use_transformer_engine_op_fuser to keep expert counts in graph."
+                    )
+                debug_source = "cached_unfused"
+            else:
+                padded_tokens_per_expert = tokens_per_expert.tolist()
+                token_padding = permuted_local_hidden_states.shape[0] - sum(padded_tokens_per_expert)
+                padded_tokens_per_expert[-1] += token_padding
+                if tokens_per_expert.device.type != "cpu":
+                    self._cuda_graph_padded_tokens_per_expert_list = padded_tokens_per_expert
+                debug_source = (
+                    "current_cpu" if tokens_per_expert.device.type == "cpu" else "current_unfused"
+                )
             debug_counts = padded_tokens_per_expert
-            debug_source = "current_cpu"
         else:
             padded_tokens_per_expert = tokens_per_expert.to(dtype=torch.int64).clone()
             padded_tokens_per_expert[-1] = (
