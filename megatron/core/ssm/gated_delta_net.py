@@ -38,6 +38,7 @@ from megatron.core.ssm.utils import (
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -283,13 +284,19 @@ class GatedDeltaNet(MegatronModule):
         # the entire GatedDeltaNet compute is wrapped in a normal checkpoint and recomputed
         # in the backward pass.
         self.recompute_gdn = False
-        # gdn_norm_out: recompute only the gated output norm + HP-to-CP all-to-all block as a
-        # discard-output checkpoint.
+        # gdn_norm_out / gdn_qkv: discard-output recompute of the gated output norm + HP-to-CP
+        # all-to-all block (gdn_norm_out) and/or the QKV projection + preparation block (gdn_qkv:
+        # in_proj -> CP a2a -> conv1d -> _prepare_qkv -> g/beta). When both are enabled the two
+        # discard-output checkpoints share a CheckpointManager that replays their recompute in
+        # forward order (qkv -> norm_out), since norm_out's recompute consumes the qkv `gate`.
         self.recompute_norm_out = False
-        self.norm_out_checkpoint = None
+        self.recompute_qkv = False
+        # Per-forward CheckpointManager for the GDN discard-output recompute (set in forward()).
+        self.gdn_recompute_manager = None
         if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_gdn = "gdn" in self.config.recompute_modules
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_qkv = "gdn_qkv" in self.config.recompute_modules
 
         # Cache for CP context objects consumed by FLA kernels. Rebuilding these per-forward
         # is unsafe under CUDA graph capture because build_cp_context allocates
@@ -518,6 +525,155 @@ class GatedDeltaNet(MegatronModule):
         Returns:
             Tuple of (output, output_bias).
         """
+        # gdn_qkv (QKV proj+prep) and gdn_norm_out (gated norm + a2a) are discard-output
+        # checkpoints; the QKV output `gate` feeds the gated-norm block, so when both are on the
+        # CheckpointManager replays them in forward order (qkv -> norm_out) from one unified grad
+        # hook on `out`.
+        recompute_qkv = self.recompute_qkv and self.training
+        recompute_norm_out = self.recompute_norm_out and self.training
+        self.gdn_recompute_manager = (
+            CheckpointManager() if (recompute_qkv or recompute_norm_out) else None
+        )
+
+        # QKV projection + prep block (in_proj -> zigzag-to-contiguous -> CP a2a cp2hp ->
+        # conv1d -> _prepare_qkv -> g/beta). The THD headwise-CP a2a inverse is layout metadata,
+        # not a differentiable output, so it rides outside the checkpoint via `qkv_side`.
+        qkv_side = {}
+
+        def _qkv_proj_and_prepare(hidden_states):
+            query, key, value, gate, beta, g, thd_cp_a2a_inv = (
+                self._compute_qkv_for_gated_delta_rule(
+                    hidden_states,
+                    batch,
+                    seq_len_post_headwise,
+                    cp_size_headwise,
+                    cp_group_headwise,
+                    cp_size_chunkwise,
+                    cp_group_chunkwise,
+                    cu_seqlens_q,
+                    chunkwise_cp_context,
+                    packed_seq_params,
+                )
+            )
+            qkv_side["thd_cp_a2a_inv"] = thd_cp_a2a_inv
+            return query, key, value, gate, beta, g
+
+        # gdn_qkv: discard the QKV-prep outputs now and regenerate them from a grad hook in the
+        # backward, freeing the large GDN QKV-prep activations. Synchronous recompute (no async
+        # reload), so it is safe with the fla/compiled gated_delta_rule backward.
+        if recompute_qkv:
+            query, key, value, gate, beta, g = tensor_parallel.CheckpointWithoutOutput(
+                fp8=(self.config.fp8 or self.config.fp4),
+                ckpt_manager=self.gdn_recompute_manager,
+            ).checkpoint(_qkv_proj_and_prepare, hidden_states)
+            if qkv_side["thd_cp_a2a_inv"] is not None:
+                raise NotImplementedError(
+                    "gdn_qkv recompute with a THD headwise-CP all-to-all inverse is not "
+                    "supported: the inverse is produced inside the discarded block and cannot "
+                    "be replayed across the checkpoint boundary yet. Disable gdn_qkv recompute "
+                    "for THD with headwise CP, or use BSHD / CP=1."
+                )
+        else:
+            query, key, value, gate, beta, g = _qkv_proj_and_prepare(hidden_states)
+        thd_cp_a2a_inv = qkv_side["thd_cp_a2a_inv"]
+
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, _ = self.gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+            cp_context=chunkwise_cp_context,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
+            # RMSNorm
+            nvtx_range_push(suffix="gated_norm")
+            norm_out = self._apply_gated_norm(core_attn_out, gate)
+            nvtx_range_pop(suffix="gated_norm")
+
+            # Transpose: b s x --> s b x
+            # From bshd back to sbhd format
+            norm_out = norm_out.reshape(batch, seq_len_post_headwise, -1)
+            norm_out = norm_out.transpose(0, 1).contiguous()
+
+            # Inverse of the zigzag -> contiguous reshuffle performed before conv1d.
+            # Restores the Megatron attention-load-balanced layout that downstream
+            # layers and loss computation expect.
+            # TODO: The planned CP layout refactor should keep consecutive GDN layers contiguous
+            # and restore zigzag only at SDPA/canonical-layout boundaries.
+            if cp_size_chunkwise > 1:
+                nvtx_range_push(suffix="contiguous_to_zigzag")
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                    norm_out = contiguous_to_zigzag_chunks(
+                        norm_out, cp_group=cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
+                    )
+                else:
+                    norm_out = contiguous_to_zigzag_chunks(
+                        norm_out, cp_group=cp_group_chunkwise, seq_dim=0
+                    )
+                nvtx_range_pop(suffix="contiguous_to_zigzag")
+
+            norm_out = self._a2a_hp_to_cp(
+                norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
+            )
+
+            return norm_out
+
+        # gdn_norm_out: discard the gated-norm + a2a outputs now and regenerate them from a grad
+        # hook in the backward, freeing the gated-norm activations. Synchronous recompute, so it is
+        # safe with the fla/compiled gated_delta_rule backward.
+        if recompute_norm_out:
+            norm_out = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=self.gdn_recompute_manager
+            ).checkpoint(_gated_norm_and_a2a, core_attn_out, gate)
+        else:
+            norm_out = _gated_norm_and_a2a(core_attn_out, gate)
+
+        # Output projection
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        # Discard the checkpointed block outputs (now consumed) and register the unified recompute
+        # hook on `out` — its grad is computed first in backward, before the backwards that need
+        # them. The manager replays the registered checkpoints in forward order (qkv -> norm_out),
+        # so the qkv `gate` is restored before the gated-norm recompute consumes it.
+        if self.gdn_recompute_manager is not None:
+            self.gdn_recompute_manager.discard_all_outputs_and_register_unified_recompute(out)
+            self.gdn_recompute_manager = None
+
+        return out, out_bias
+
+    def _compute_qkv_for_gated_delta_rule(
+        self,
+        hidden_states,
+        batch,
+        seq_len_post_headwise,
+        cp_size_headwise,
+        cp_group_headwise,
+        cp_size_chunkwise,
+        cp_group_chunkwise,
+        cu_seqlens_q,
+        chunkwise_cp_context,
+        packed_seq_params,
+    ):
+        """QKV projection + preparation block for the gated delta rule.
+
+        Runs in_proj -> CP all-to-all (cp2hp) -> conv1d -> _prepare_qkv -> g/beta (or the fused
+        streamed pre-GDR path when enabled), producing the tensors consumed by
+        ``self.gated_delta_rule`` plus the ``gate`` for the gated norm. Extracted so it can be
+        checkpointed when ``recompute_modules`` contains ``"gdn_qkv"``.
+
+        Returns:
+            Tuple of (query, key, value, gate, beta, g, thd_cp_a2a_inv).
+        """
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
@@ -611,76 +767,7 @@ class GatedDeltaNet(MegatronModule):
             )
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-            cp_context=chunkwise_cp_context,
-        )
-        nvtx_range_pop(suffix="gated_delta_rule")
-
-        def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
-            # RMSNorm
-            nvtx_range_push(suffix="gated_norm")
-            norm_out = self._apply_gated_norm(core_attn_out, gate)
-            nvtx_range_pop(suffix="gated_norm")
-
-            # Transpose: b s x --> s b x
-            # From bshd back to sbhd format
-            norm_out = norm_out.reshape(batch, seq_len_post_headwise, -1)
-            norm_out = norm_out.transpose(0, 1).contiguous()
-
-            # Inverse of the zigzag -> contiguous reshuffle performed before conv1d.
-            # Restores the Megatron attention-load-balanced layout that downstream
-            # layers and loss computation expect.
-            # TODO: The planned CP layout refactor should keep consecutive GDN layers contiguous
-            # and restore zigzag only at SDPA/canonical-layout boundaries.
-            if cp_size_chunkwise > 1:
-                nvtx_range_push(suffix="contiguous_to_zigzag")
-                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                    norm_out = contiguous_to_zigzag_chunks(
-                        norm_out, cp_group=cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
-                    )
-                else:
-                    norm_out = contiguous_to_zigzag_chunks(
-                        norm_out, cp_group=cp_group_chunkwise, seq_dim=0
-                    )
-                nvtx_range_pop(suffix="contiguous_to_zigzag")
-
-            norm_out = self._a2a_hp_to_cp(
-                norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
-            )
-
-            return norm_out
-
-        # gdn_norm_out: discard the gated-norm + a2a outputs now and regenerate them from a grad
-        # hook in the backward, freeing the gated-norm activations. Synchronous recompute, so it is
-        # safe with the fla/compiled gated_delta_rule backward.
-        recompute_norm_out = self.recompute_norm_out and self.training
-        if recompute_norm_out:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_out = self.norm_out_checkpoint.checkpoint(_gated_norm_and_a2a, core_attn_out, gate)
-        else:
-            norm_out = _gated_norm_and_a2a(core_attn_out, gate)
-
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        # Discard the checkpointed norm_out (now consumed by out_proj) and register the recompute
-        # hook on `out` — its grad is computed first in backward, before the backward that needs it.
-        if recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
-        return out, out_bias
+        return query, key, value, gate, beta, g, thd_cp_a2a_inv
 
     def pre_gated_delta_rule(
         self,
