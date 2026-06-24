@@ -72,6 +72,11 @@ _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
 
 
+def _fsdp_cuda_graph_bucket_pinning_enabled():
+    value = os.getenv("MCORE_FSDP_CUDA_GRAPH_PIN_BUCKETS", "1").lower()
+    return value not in ("0", "false", "no", "off")
+
+
 def _clone_rng_state(state):
     """Clone a Tensor or graph-safe CUDA Generator state for later restoration."""
     if hasattr(state, "clone_state"):
@@ -2781,7 +2786,11 @@ class TECudaGraphHelper:
             # TE's make_graphed_callables asserts that all capture_time_hooks return None.
             def _wrap_none(fn):
                 def wrapper(*args, **kwargs):
-                    fn(*args, **kwargs)
+                    result = fn(*args, **kwargs)
+                    if result is not None:
+                        raise RuntimeError(
+                            "CUDA graph capture-time hooks must not modify inputs or outputs."
+                        )
 
                 return wrapper
 
@@ -2875,7 +2884,11 @@ class TECudaGraphHelper:
             ag_pipeline = fsdp_module.all_gather_pipeline
             for bucket_key, status in list(ag_pipeline.bucket_status.items()):
                 if bucket_key in graph_bucket_keys:
-                    ag_pipeline.bucket_can_be_released[bucket_key] = False
+                    bucket_id, bwd = bucket_key
+                    if _fsdp_cuda_graph_bucket_pinning_enabled():
+                        ag_pipeline.pin_cuda_graph_bucket(bucket_id, bwd)
+                    else:
+                        ag_pipeline.bucket_can_be_released[bucket_key] = False
                     continue
                 if getattr(status, "name", None) != "EMPTY":
                     bucket_id, bwd = bucket_key
@@ -2890,6 +2903,41 @@ class TECudaGraphHelper:
             else:
                 fsdp_module._replace_param_with_raw_if_needed()
         self._fsdp_capture_param_states = []
+
+    def _restore_hooks_after_capture(self, restore_hooks):
+        """Restore PyTorch hooks removed before TE graph capture."""
+        if not restore_hooks or not any(h for h in restore_hooks):
+            return
+        for callable_module, restore in zip(self.flattened_callables, restore_hooks):
+            if not isinstance(callable_module, torch.nn.Module) or not restore:
+                continue
+            if 'forward_pre_hooks_restore' in restore:
+                for hook_id, hook_fn in restore['forward_pre_hooks_restore'].items():
+                    callable_module._forward_pre_hooks[hook_id] = hook_fn
+            if 'forward_hooks_restore' in restore:
+                for hook_id, hook_fn in restore['forward_hooks_restore'].items():
+                    callable_module._forward_hooks[hook_id] = hook_fn
+            if 'backward_pre_hooks_restore' in restore:
+                for hook_id, hook_fn in restore['backward_pre_hooks_restore'].items():
+                    callable_module._backward_pre_hooks[hook_id] = hook_fn
+            if 'backward_hooks_restore' in restore:
+                for hook_id, hook_fn in restore['backward_hooks_restore'].items():
+                    callable_module._backward_hooks[hook_id] = hook_fn
+
+    def _clear_fsdp_cuda_graph_bucket_pins(self):
+        """Allow FSDP graph buckets to be released once no graph can replay them."""
+        for fsdp_module in self._get_megatron_fsdp_instances():
+            fsdp_module.all_gather_pipeline.clear_cuda_graph_pinned_buckets()
+
+    def _abort_capturing(self):
+        """Best-effort local cleanup when TE graph capture raises."""
+        _set_capture_end()
+        self._clear_fsdp_cuda_graph_bucket_pins()
+        self._restore_fsdp_params_after_capture()
+        if FREEZE_GC:
+            gc.unfreeze()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _start_capturing(self):
         """
@@ -2942,25 +2990,31 @@ class TECudaGraphHelper:
         if self.config.fine_grained_activation_offloading:
             off_interface.reset()
 
-        torch.distributed.barrier()
-        for model_chunk in self.model:
-            model_chunk.zero_grad_buffer()
-        for optimizer in self.optimizers:
-            optimizer.zero_grad()
-        from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+        keep_fsdp_bucket_pins = False
+        try:
+            torch.distributed.barrier()
+            for model_chunk in self.model:
+                model_chunk.zero_grad_buffer()
+            for optimizer in self.optimizers:
+                optimizer.zero_grad()
+            from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 
-        get_moe_metrics_tracker().clear()
-        reset_model_temporary_tensors(self.config, self.model)
+            get_moe_metrics_tracker().clear()
+            reset_model_temporary_tensors(self.config, self.model)
 
-        torch.cuda.synchronize()
-        self._reset_after_capture()
-        self._release_non_graph_fsdp_buckets_after_capture()
-        self._restore_fsdp_params_after_capture()
+            torch.cuda.synchronize()
+            self._reset_after_capture()
+            self._release_non_graph_fsdp_buckets_after_capture()
+            keep_fsdp_bucket_pins = True
+        finally:
+            if not keep_fsdp_bucket_pins:
+                self._clear_fsdp_cuda_graph_bucket_pins()
+            self._restore_fsdp_params_after_capture()
 
-        if FREEZE_GC:
-            gc.unfreeze()
-        gc.collect()
-        torch.cuda.empty_cache()
+            if FREEZE_GC:
+                gc.unfreeze()
+            gc.collect()
+            torch.cuda.empty_cache()
 
         self._capture_finished = True
 
@@ -2969,65 +3023,60 @@ class TECudaGraphHelper:
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
         start_time = self._start_capturing()
+        restore_hooks = None
+        hooks_restored = False
 
-        if not self.flattened_callables:
-            # Check if there are any graphable layers. If not, log a warning and skip capture,
-            # but still call _finish_capturing to ensure all ranks complete the capture phase.
-            logger.warning(
-                'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
-            )
-        else:
-            # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-            sample_args, kwargs, restore_hooks = self._get_cuda_graph_input_data()
-            if self.config.sequence_parallel:
-                rng_context = get_cuda_rng_tracker().fork()
+        try:
+            if not self.flattened_callables:
+                # Check if there are any graphable layers. If not, log a warning and skip capture,
+                # but still call _finish_capturing to ensure all ranks complete the capture phase.
+                logger.warning(
+                    'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
+                )
             else:
-                rng_context = nullcontext()
-            rng_snapshot = _snapshot_training_rng_state()
-            try:
-                with rng_context:
-                    graphs = make_graphed_callables(
-                        tuple(self.flattened_callables), sample_args, **kwargs
-                    )
-            finally:
-                _restore_training_rng_state(rng_snapshot)
+                # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
+                sample_args, kwargs, restore_hooks = self._get_cuda_graph_input_data()
+                if self.config.sequence_parallel:
+                    rng_context = get_cuda_rng_tracker().fork()
+                else:
+                    rng_context = nullcontext()
+                rng_snapshot = _snapshot_training_rng_state()
+                try:
+                    with rng_context:
+                        graphs = make_graphed_callables(
+                            tuple(self.flattened_callables), sample_args, **kwargs
+                        )
+                finally:
+                    _restore_training_rng_state(rng_snapshot)
 
-            if restore_hooks and any(h for h in restore_hooks):
-                for callable_module, restore in zip(self.flattened_callables, restore_hooks):
-                    if isinstance(callable_module, torch.nn.Module) and restore:
-                        if 'forward_pre_hooks_restore' in restore:
-                            for hook_id, hook_fn in restore['forward_pre_hooks_restore'].items():
-                                callable_module._forward_pre_hooks[hook_id] = hook_fn
-                        if 'forward_hooks_restore' in restore:
-                            for hook_id, hook_fn in restore['forward_hooks_restore'].items():
-                                callable_module._forward_hooks[hook_id] = hook_fn
-                        if 'backward_pre_hooks_restore' in restore:
-                            for hook_id, hook_fn in restore['backward_pre_hooks_restore'].items():
-                                callable_module._backward_pre_hooks[hook_id] = hook_fn
-                        if 'backward_hooks_restore' in restore:
-                            for hook_id, hook_fn in restore['backward_hooks_restore'].items():
-                                callable_module._backward_hooks[hook_id] = hook_fn
+                self._restore_hooks_after_capture(restore_hooks)
+                hooks_restored = True
 
-            # Push the captured graphs to the corresponding TransformerBlock.
-            num_layers_accumulated = 0
-            for layers in self.callables_per_chunk:
-                for layer_number, layer in enumerate(layers):
-                    layer.cuda_graphs = []
-                    for batch_number in range(self.num_microbatches):
-                        if self.config.overlap_moe_expert_parallel_comm:
-                            graph_idx = (
-                                num_layers_accumulated + layer_number
-                            ) * self.num_microbatches + batch_number
-                        else:
-                            graph_idx = (
-                                num_layers_accumulated * self.num_microbatches
-                                + batch_number * len(layers)
-                                + layer_number
-                            )
-                        layer.cuda_graphs.append(graphs[graph_idx])
-                num_layers_accumulated += len(layers)
+                # Push the captured graphs to the corresponding TransformerBlock.
+                num_layers_accumulated = 0
+                for layers in self.callables_per_chunk:
+                    for layer_number, layer in enumerate(layers):
+                        layer.cuda_graphs = []
+                        for batch_number in range(self.num_microbatches):
+                            if self.config.overlap_moe_expert_parallel_comm:
+                                graph_idx = (
+                                    num_layers_accumulated + layer_number
+                                ) * self.num_microbatches + batch_number
+                            else:
+                                graph_idx = (
+                                    num_layers_accumulated * self.num_microbatches
+                                    + batch_number * len(layers)
+                                    + layer_number
+                                )
+                            layer.cuda_graphs.append(graphs[graph_idx])
+                    num_layers_accumulated += len(layers)
 
-            self._graphs_created = True
+                self._graphs_created = True
+        except Exception:
+            if not hooks_restored:
+                self._restore_hooks_after_capture(restore_hooks)
+            self._abort_capturing()
+            raise
 
         self._finish_capturing(start_time)
 
@@ -3111,6 +3160,8 @@ class TECudaGraphHelper:
                         graphs_not_reset += 1
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
+
+        self._clear_fsdp_cuda_graph_bucket_pins()
 
         log_on_each_pipeline_stage(
             logger=logger,
