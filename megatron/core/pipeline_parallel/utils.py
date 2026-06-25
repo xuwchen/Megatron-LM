@@ -20,6 +20,12 @@ from megatron.core.utils import (
 logger = logging.getLogger(__name__)
 
 
+def is_cuda_graph_capture_active():
+    """Return True while PyTorch is capturing the current CUDA stream."""
+    is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    return is_capturing is not None and is_capturing()
+
+
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
     return get_pg_rank(pp_group) == 0
@@ -288,6 +294,16 @@ class ScheduleNode:
         Args:
             name: Optional name for NVTX range profiling
         """
+        if is_cuda_graph_capture_active():
+            if name:
+                nvtx_range_push(name)
+            try:
+                yield
+            finally:
+                if name:
+                    nvtx_range_pop(name)
+            return
+
         self.event.wait(self.stream)
         if name:
             nvtx_range_push(name)

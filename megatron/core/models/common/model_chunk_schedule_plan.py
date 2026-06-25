@@ -13,6 +13,7 @@ from megatron.core.pipeline_parallel.utils import (
     NoopScheduleNode,
     get_comm_stream,
     get_comp_stream,
+    is_cuda_graph_capture_active,
 )
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
@@ -426,11 +427,15 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
     def record_current_stream(self):
         """Records the current CUDA stream in the event."""
+        if is_cuda_graph_capture_active():
+            return
         stream = torch.cuda.current_stream()
         self.event.record(stream)
 
     def wait_current_stream(self):
         """Waits for the event to complete on the current CUDA stream."""
+        if is_cuda_graph_capture_active():
+            return
         stream = torch.cuda.current_stream()
         self.event.wait(stream)
 
