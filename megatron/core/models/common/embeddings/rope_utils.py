@@ -431,6 +431,16 @@ def _apply_rotary_pos_emb_thd(
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
+    if cp_size == 1 and freqs.dim() >= 1 and freqs.size(0) == t.size(0):
+        return _apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1),
+            freqs,
+            rotary_interleaved=rotary_interleaved,
+            mla_rotary_interleaved=mla_rotary_interleaved,
+            mscale=mscale,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
+        ).squeeze(1)
     cu_seqlens_list, seqlens = _get_thd_cp_splits(cu_seqlens, cp_size)
 
     # Handle two different frequency tensor formats:

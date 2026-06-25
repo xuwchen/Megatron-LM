@@ -6,6 +6,7 @@ Provides ModuleSpec builders that define the transformer layer composition.
 Both the standalone and MIMO training paths import from here.
 """
 
+import inspect
 from typing import Optional
 
 from examples.multimodal_dev.models.base import _NO_CP_GROUP
@@ -19,7 +20,29 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
+_APPLY_THD_SUPPORTS_MAX_SEQLEN: Optional[bool] = None
+
+
+def _apply_thd_supports_max_seqlen(apply_thd):
+    """Return whether this Megatron branch accepts max_seqlen for THD RoPE."""
+    global _APPLY_THD_SUPPORTS_MAX_SEQLEN
+    if _APPLY_THD_SUPPORTS_MAX_SEQLEN is None:
+        _APPLY_THD_SUPPORTS_MAX_SEQLEN = (
+            "max_seqlen" in inspect.signature(apply_thd).parameters
+        )
+    return _APPLY_THD_SUPPORTS_MAX_SEQLEN
+
+
+def _apply_rope_fp32(
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    max_seqlen=None,
+    **kwargs,
+):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
 
     Mirrors ``Qwen3VLSelfAttention.apply_rotary_pos_emb_absolute`` in Megatron-Bridge
@@ -45,19 +68,30 @@ def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=Non
     else:
         if cp_group is None:
             cp_group = parallel_state.get_context_parallel_group()
-        out = _apply_rotary_pos_emb_thd(
-            t_fp32,
-            cu_seqlens,
-            freqs,
-            rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=getattr(config, 'multi_latent_attention', False),
-            mscale=mscale,
-            cp_group=cp_group,
-        )
+        thd_kwargs = {
+            "rotary_interleaved": config.rotary_interleaved,
+            "multi_latent_attention": getattr(config, 'multi_latent_attention', False),
+            "mscale": mscale,
+            "cp_group": cp_group,
+        }
+        if max_seqlen is not None and _apply_thd_supports_max_seqlen(
+            _apply_rotary_pos_emb_thd
+        ):
+            thd_kwargs["max_seqlen"] = max_seqlen
+        out = _apply_rotary_pos_emb_thd(t_fp32, cu_seqlens, freqs, **thd_kwargs)
     return out.to(orig_dtype)
 
 
-def _apply_rope_fp32_no_cp(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
+def _apply_rope_fp32_no_cp(
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    max_seqlen=None,
+    **kwargs,
+):
     """Same as ``_apply_rope_fp32`` but forces CP-size=1.
 
     The vision encoder uses THD packed sequences for variable-resolution
@@ -66,7 +100,14 @@ def _apply_rope_fp32_no_cp(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_gro
     trivial group so the vision RoPE sees the full packed sequence.
     """
     return _apply_rope_fp32(
-        t, freqs, config, cu_seqlens, mscale, cp_group=_NO_CP_GROUP,
+        t,
+        freqs,
+        config,
+        cu_seqlens,
+        mscale,
+        cp_group=_NO_CP_GROUP,
+        max_seqlen=max_seqlen,
+        **kwargs,
     )
 
 

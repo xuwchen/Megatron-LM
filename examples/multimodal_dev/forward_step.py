@@ -42,6 +42,16 @@ def _id_to_dtype(id_val):
     return _ID_MAP.get(id_val, torch.float32)
 
 
+def _int_list_to_cuda_tensor(values, dtype, device):
+    """Build a CUDA integer tensor without host-to-device copies during capture."""
+    if torch.cuda.is_current_stream_capturing():
+        tensor = torch.empty(len(values), dtype=dtype, device=device)
+        for i, value in enumerate(values):
+            tensor[i].fill_(value)
+        return tensor
+    return torch.tensor(values, dtype=dtype, device=device)
+
+
 # -------------------------------------------------------------------
 # Tensor broadcast helper
 # -------------------------------------------------------------------
@@ -83,6 +93,14 @@ def _broadcast_tensor(tensor, src, group, device):
 
 def broadcast_data_batch(data, device="cuda"):
     """Broadcast a data-batch dict from TP rank 0 to all TP ranks."""
+    if mpu.get_tensor_model_parallel_world_size() == 1:
+        if data is None:
+            return {}
+        return {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in data.items()
+        }
+
     src = get_tensor_model_parallel_src_rank()
     group = get_tensor_model_parallel_group()
 
@@ -207,6 +225,7 @@ def pack_or_pad_batch(
         if is_src:
             assert batch is not None, "source TP rank must provide a batch"
             input_ids_list, labels_list, loss_mask_list = [], [], []
+            position_ids_list = []
             pixel_values_list, image_grid_thw_list = [], []
             seqlens_list, seqlens_padded_list = [], []
 
@@ -219,6 +238,10 @@ def pack_or_pad_batch(
                 input_ids_list.append(F.pad(sample["input_ids"], (0, target_len - seqlen), value=0))
                 labels_list.append(F.pad(sample["labels"], (0, target_len - seqlen), value=-100))
                 loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
+                if sample.get("position_ids", None) is not None:
+                    position_ids_list.append(
+                        F.pad(sample["position_ids"], (0, target_len - seqlen), value=1)
+                    )
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
                 pixel_values_list.append(sample["pixel_values"])
@@ -233,7 +256,7 @@ def pack_or_pad_batch(
             # routing in megatron.core to exclude padded tokens from aux loss,
             # z-loss, and expert-bias accumulation.
             total_tokens_padded = cu_seqlens_padded[-1]
-            padding_mask_thd = torch.zeros(total_tokens_padded, dtype=torch.bool)
+            padding_mask_thd = torch.zeros(total_tokens_padded, dtype=torch.bool, device=device)
             for i, real_seqlen in enumerate(seqlens_list):
                 pad_start = cu_seqlens_padded[i] + real_seqlen
                 pad_end = cu_seqlens_padded[i + 1]
@@ -243,13 +266,17 @@ def pack_or_pad_batch(
             packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
             packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
             packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
+            if len(position_ids_list) == len(batch):
+                packed_batch["position_ids"] = torch.concat(position_ids_list, dim=1).unsqueeze(1)
             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
             packed_batch["pixel_values"] = torch.concat(pixel_values_list)
             packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.
-            packed_batch["cu_seqlens"] = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
-            packed_batch["cu_seqlens_padded"] = torch.tensor(
+            packed_batch["cu_seqlens"] = _int_list_to_cuda_tensor(
+                cu_seqlens, dtype=torch.int32, device=device
+            )
+            packed_batch["cu_seqlens_padded"] = _int_list_to_cuda_tensor(
                 cu_seqlens_padded, dtype=torch.int32, device=device
             )
 
@@ -291,26 +318,50 @@ def pack_or_pad_batch(
         # padding_mask for MoE routing (True at collate-padded positions).
         real_seqlens = [s["input_ids"].shape[0] for s in batch]
 
+        input_ids_list, labels_list, loss_mask_list = [], [], []
         for sample in batch:
-            sample["input_ids"] = F.pad(
-                sample["input_ids"], (0, target_seqlens - sample["input_ids"].shape[0]), value=0
+            input_ids_list.append(
+                F.pad(
+                    sample["input_ids"],
+                    (0, target_seqlens - sample["input_ids"].shape[0]),
+                    value=0,
+                )
             )
-            sample["labels"] = F.pad(
-                sample["labels"], (0, target_seqlens - sample["labels"].shape[0]), value=-100
+            labels_list.append(
+                F.pad(
+                    sample["labels"],
+                    (0, target_seqlens - sample["labels"].shape[0]),
+                    value=-100,
+                )
             )
-            sample["loss_mask"] = F.pad(
-                sample["loss_mask"], (0, target_seqlens - sample["loss_mask"].shape[0]), value=0
+            loss_mask_list.append(
+                F.pad(
+                    sample["loss_mask"],
+                    (0, target_seqlens - sample["loss_mask"].shape[0]),
+                    value=0,
+                )
             )
 
-        padded_batch["input_ids"] = torch.concat(
-            [x["input_ids"].unsqueeze(0) for x in batch], dim=0
-        )
-        padded_batch["labels"] = torch.concat([x["labels"].unsqueeze(0) for x in batch], dim=0)
-        padded_batch["loss_mask"] = torch.concat(
-            [x["loss_mask"].unsqueeze(0) for x in batch], dim=0
-        )
-        positions = torch.arange(target_seqlens).unsqueeze(0)
-        padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
+        padded_batch["input_ids"] = torch.stack(input_ids_list, dim=0)
+        padded_batch["labels"] = torch.stack(labels_list, dim=0)
+        padded_batch["loss_mask"] = torch.stack(loss_mask_list, dim=0)
+        if all(x.get("position_ids", None) is not None for x in batch):
+            padded_batch["position_ids"] = torch.stack(
+                [
+                    F.pad(
+                        x["position_ids"],
+                        (0, target_seqlens - x["position_ids"].shape[-1]),
+                        value=1,
+                    )
+                    for x in batch
+                ],
+                dim=1,
+            )
+        positions = torch.arange(target_seqlens, device=device).unsqueeze(0)
+        real_seqlens_t = _int_list_to_cuda_tensor(
+            real_seqlens, dtype=torch.long, device=device
+        ).unsqueeze(1)
+        padded_batch["padding_mask"] = positions >= real_seqlens_t
         padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
@@ -327,23 +378,29 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
     device = "cuda"
     args = get_args()
 
-    if get_tensor_model_parallel_rank() == 0:
-        try:
-            data = next(data_iterator)
-            has_data = torch.tensor([1], dtype=torch.uint8, device=device)
-        except StopIteration:
-            has_data = torch.tensor([0], dtype=torch.uint8, device=device)
-            data = None
+    if (
+        torch.cuda.is_current_stream_capturing()
+        and mpu.get_tensor_model_parallel_world_size() == 1
+    ):
+        data = next(data_iterator)
     else:
-        has_data = torch.empty(1, dtype=torch.uint8, device=device)
-        data = None
+        if get_tensor_model_parallel_rank() == 0:
+            try:
+                data = next(data_iterator)
+                has_data = torch.tensor([1], dtype=torch.uint8, device=device)
+            except StopIteration:
+                has_data = torch.tensor([0], dtype=torch.uint8, device=device)
+                data = None
+        else:
+            has_data = torch.empty(1, dtype=torch.uint8, device=device)
+            data = None
 
-    src = get_tensor_model_parallel_src_rank()
-    group = get_tensor_model_parallel_group()
-    torch.distributed.broadcast(has_data, src, group=group)
+        src = get_tensor_model_parallel_src_rank()
+        group = get_tensor_model_parallel_group()
+        torch.distributed.broadcast(has_data, src, group=group)
 
-    if has_data.item() == 0:
-        return None
+        if has_data.item() == 0:
+            return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
     batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
@@ -390,7 +447,7 @@ def loss_func(loss_mask, output_tensor):
 # -------------------------------------------------------------------
 
 
-def forward_step(data_iterator, model):
+def forward_step(data_iterator, model, return_schedule_plan=False):
     """Forward step for multimodal_dev training."""
     batch = get_batch(data_iterator)
 
@@ -405,8 +462,10 @@ def forward_step(data_iterator, model):
     ):
         pixel_values = pixel_values.bfloat16()
 
+    model_call = model.build_schedule_plan if return_schedule_plan else model
+
     # We don't provide position_ids, now. Let model handle it itself.
-    output_tensor = model(
+    output_tensor = model_call(
         input_ids=batch["input_ids"],
         position_ids=batch.get("position_ids"),
         attention_mask=batch.get("attention_mask", None),

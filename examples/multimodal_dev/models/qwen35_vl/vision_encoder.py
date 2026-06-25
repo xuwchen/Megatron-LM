@@ -313,6 +313,9 @@ class Qwen35VLVisionEncoder(VisionModule):
             max_num_positions, config.hidden_size,
         )
         self.num_grid_per_side = int(max_num_positions ** 0.5)
+        self._last_grid_thw_key = None
+        self._pos_interp_cache = {}
+        self._packed_seq_params_cache = {}
 
         # --- Vision rotary embeddings ---
         head_dim = config.hidden_size // config.num_attention_heads
@@ -343,6 +346,23 @@ class Qwen35VLVisionEncoder(VisionModule):
             spatial_merge_size=spatial_merge_size,
         )
 
+    def _grid_thw_key(self, grid_thw: Tensor):
+        """Return static grid metadata without device-to-host copies during capture."""
+        if torch.cuda.is_current_stream_capturing():
+            if self._last_grid_thw_key is None:
+                raise RuntimeError(
+                    "Qwen3.5-VL vision CUDA graph capture requires grid_thw metadata "
+                    "to be cached by an eager warmup iteration."
+                )
+            return self._last_grid_thw_key
+
+        grid_thw_list = [
+            tuple(int(value) for value in row)
+            for row in grid_thw.detach().cpu().tolist()
+        ]
+        self._last_grid_thw_key = tuple(grid_thw_list)
+        return self._last_grid_thw_key
+
     # ---------------------------------------------------------------
     # Learned position embedding with bilinear interpolation
     # ---------------------------------------------------------------
@@ -361,11 +381,54 @@ class Qwen35VLVisionEncoder(VisionModule):
             ``[total_patches, hidden_size]`` position embeddings in
             block-merge order.
         """
-        grid_thw_list = grid_thw.tolist()
+        grid_thw_list = self._grid_thw_key(grid_thw)
         grid_ts = [int(row[0]) for row in grid_thw_list]
         grid_hs = [int(row[1]) for row in grid_thw_list]
         grid_ws = [int(row[2]) for row in grid_thw_list]
         device = self.pos_embed.weight.device
+        cache_key = (grid_thw_list, str(device), self.pos_embed.weight.dtype)
+        cached = self._pos_interp_cache.get(cache_key)
+        if cached is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Qwen3.5-VL vision CUDA graph capture requires position "
+                    "interpolation metadata cached by an eager warmup iteration."
+                )
+            cached = self._build_pos_interp_cache(
+                grid_thw_list=grid_thw_list,
+                device=device,
+                dtype=self.pos_embed.weight.dtype,
+            )
+            self._pos_interp_cache[cache_key] = cached
+
+        idx_tensor, weight_tensor, split_sizes, grid_ts, grid_hs, grid_ws = cached
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+
+        patch_pos_embeds = patch_pos_embeds.split(split_sizes)
+
+        merge = self.spatial_merge_size
+        result = []
+        for pe, t, h, w in zip(
+            patch_pos_embeds, grid_ts, grid_hs, grid_ws,
+        ):
+            pe = pe.repeat(t, 1)
+            pe = (
+                pe.view(
+                    t, h // merge, merge, w // merge, merge, -1,
+                )
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
+            result.append(pe)
+
+        return torch.cat(result)
+
+    def _build_pos_interp_cache(self, grid_thw_list, device, dtype):
+        """Build static index/weight tensors for learned position interpolation."""
+        grid_ts = [int(row[0]) for row in grid_thw_list]
+        grid_hs = [int(row[1]) for row in grid_thw_list]
+        grid_ws = [int(row[2]) for row in grid_thw_list]
         n = self.num_grid_per_side
 
         idx_list: List[List[int]] = [[] for _ in range(4)]
@@ -409,38 +472,11 @@ class Qwen35VLVisionEncoder(VisionModule):
         )
         weight_tensor = torch.tensor(
             weight_list,
-            dtype=self.pos_embed.weight.dtype,
+            dtype=dtype,
             device=device,
         )
-        pos_embeds = (
-            self.pos_embed(idx_tensor).to(device)
-            * weight_tensor[:, :, None]
-        )
-        patch_pos_embeds = (
-            pos_embeds[0] + pos_embeds[1]
-            + pos_embeds[2] + pos_embeds[3]
-        )
-
-        patch_pos_embeds = patch_pos_embeds.split(
-            [h * w for h, w in zip(grid_hs, grid_ws)]
-        )
-
-        merge = self.spatial_merge_size
-        result = []
-        for pe, t, h, w in zip(
-            patch_pos_embeds, grid_ts, grid_hs, grid_ws,
-        ):
-            pe = pe.repeat(t, 1)
-            pe = (
-                pe.view(
-                    t, h // merge, merge, w // merge, merge, -1,
-                )
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
-            )
-            result.append(pe)
-
-        return torch.cat(result)
+        split_sizes = [h * w for h, w in zip(grid_hs, grid_ws)]
+        return idx_tensor, weight_tensor, split_sizes, grid_ts, grid_hs, grid_ws
 
     # ---------------------------------------------------------------
     # 2D Vision RoPE
@@ -458,7 +494,7 @@ class Qwen35VLVisionEncoder(VisionModule):
             ``[total_patches, head_dim // 2]`` raw RoPE frequencies.
         """
         merge = self.spatial_merge_size
-        grid_thw_list = grid_thw.tolist()
+        grid_thw_list = self._grid_thw_key(grid_thw)
 
         max_hw = max(max(int(h), int(w)) for _, h, w in grid_thw_list)
         freq_table = self.rot_pos_emb(
@@ -518,8 +554,7 @@ class Qwen35VLVisionEncoder(VisionModule):
     # PackedSeqParams for variable-length attention
     # ---------------------------------------------------------------
 
-    @staticmethod
-    def _build_packed_seq_params(grid_thw: Tensor) -> PackedSeqParams:
+    def _build_packed_seq_params(self, grid_thw: Tensor) -> PackedSeqParams:
         """Build ``PackedSeqParams`` from grid dimensions.
 
         Each temporal frame of each image forms a separate sub-sequence
@@ -531,13 +566,27 @@ class Qwen35VLVisionEncoder(VisionModule):
         Returns:
             ``PackedSeqParams`` for ``TransformerBlock``.
         """
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0],
-        ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        max_seqlen = int(
-            (grid_thw[:, 1] * grid_thw[:, 2]).max().item()
-        )
+        grid_thw_list = self._grid_thw_key(grid_thw)
+        cache_key = (grid_thw_list, str(grid_thw.device))
+        cached = self._packed_seq_params_cache.get(cache_key)
+        if cached is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Qwen3.5-VL vision CUDA graph capture requires packed sequence "
+                    "metadata cached by an eager warmup iteration."
+                )
+            seq_lengths = []
+            for t, h, w in grid_thw_list:
+                seq_lengths.extend([int(h) * int(w)] * int(t))
+            cu_seqlens_list = [0]
+            for seq_len in seq_lengths:
+                cu_seqlens_list.append(cu_seqlens_list[-1] + seq_len)
+            cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=grid_thw.device)
+            max_seqlen = max(seq_lengths)
+            cached = (cu_seqlens, max_seqlen)
+            self._packed_seq_params_cache[cache_key] = cached
+        else:
+            cu_seqlens, max_seqlen = cached
 
         return PackedSeqParams(
             qkv_format="thd",

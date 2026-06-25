@@ -68,6 +68,12 @@ _NO_CP_GROUP = _NoCPGroup()
 # Gradients are correct; only the *logged* value drifts.
 
 
+def _is_cuda_graph_capture_active():
+    """Return True while PyTorch is capturing the current CUDA stream."""
+    is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    return is_capturing is not None and is_capturing()
+
+
 def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
     """Per-rank token index for THD + CP via TE's
     ``thd_get_partitioned_indices``.  Cast to int64 so the result can be
@@ -172,8 +178,21 @@ class MultimodalModel(MegatronModule):
 
         combined = text_embeddings.transpose(0, 1).contiguous()
         image_mask = input_ids == self.image_token_id
-        mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(mask_expanded, vision_embeddings)
+
+        if not _is_cuda_graph_capture_active():
+            image_count = int(image_mask.sum().item())
+            assert image_count == vision_embeddings.shape[0], (
+                f"Image token count ({image_count}) must match vision embeddings "
+                f"({vision_embeddings.shape[0]})"
+            )
+
+        if vision_embeddings.shape[0] > 0:
+            flat_image_mask = image_mask.reshape(-1)
+            vision_indices = torch.cumsum(flat_image_mask.to(torch.long), dim=0) - 1
+            vision_indices = vision_indices.clamp_(min=0, max=vision_embeddings.shape[0] - 1)
+            vision_by_token = vision_embeddings.index_select(0, vision_indices).view_as(combined)
+            combined = torch.where(image_mask.unsqueeze(-1), vision_by_token, combined)
+
         combined = combined.transpose(0, 1).contiguous()
 
         if sp:
@@ -304,6 +323,67 @@ class MultimodalModel(MegatronModule):
             if mrope is not None:
                 mrope.cp_group = saved
 
+    def _prepare_language_model_inputs(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        padding_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        decoder_input: Tensor = None,
+        packed_seq_params=None,
+        **kwargs,
+    ):
+        """Prepare language-decoder inputs shared by forward and schedule-plan paths."""
+        if position_ids is None:
+            position_ids = self.compute_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                packed_seq_params=packed_seq_params,
+            )
+
+        vision_embeddings = None
+        if self.vision_model is not None and pixel_values is not None:
+            vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+
+        if decoder_input is None and self.language_model is not None:
+            text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
+
+            if vision_embeddings is not None:
+                decoder_input = self._scatter_vision_embeddings(
+                    input_ids, text_embeddings, vision_embeddings
+                )
+            else:
+                decoder_input = text_embeddings
+
+        (
+            decoder_input, input_ids, labels, loss_mask,
+            attention_mask, position_ids, padding_mask,
+        ) = self._cp_split_for_forward(
+            decoder_input=decoder_input,
+            input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+
+        return {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "decoder_input": decoder_input,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "padding_mask": padding_mask,
+            "packed_seq_params": packed_seq_params,
+        }
+
     def forward(
         self,
         input_ids: Tensor,
@@ -340,49 +420,63 @@ class MultimodalModel(MegatronModule):
         Returns:
             Loss tensor (post_process=True) or hidden states.
         """
-        if position_ids is None:
-            position_ids = self.compute_position_ids(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                packed_seq_params=packed_seq_params,
-            )
-
-        vision_embeddings = None
-        if self.vision_model is not None and pixel_values is not None:
-            vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
-
-        if decoder_input is None and self.language_model is not None:
-            text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
-
-            if vision_embeddings is not None:
-                decoder_input = self._scatter_vision_embeddings(
-                    input_ids, text_embeddings, vision_embeddings
-                )
-            else:
-                decoder_input = text_embeddings
-
-        (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
-        ) = self._cp_split_for_forward(
-            decoder_input=decoder_input,
+        language_inputs = self._prepare_language_model_inputs(
             input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
             labels=labels,
             loss_mask=loss_mask,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            decoder_input=decoder_input,
+            packed_seq_params=packed_seq_params,
         )
 
         with self._thd_mrope_no_cp_override(packed_seq_params):
-            return self.language_model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                decoder_input=decoder_input,
-                labels=labels,
-                loss_mask=loss_mask,
-                padding_mask=padding_mask,
-                packed_seq_params=packed_seq_params,
-            )
+            return self.language_model(**language_inputs)
+
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        padding_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        decoder_input: Tensor = None,
+        packed_seq_params=None,
+        **kwargs,
+    ):
+        """Build a language-decoder schedule plan for HybridEP A2A overlap.
+
+        The multimodal wrapper owns vision encoding and image-token scatter.
+        Once those produce ``decoder_input``, scheduling can delegate to the
+        wrapped GPT language model's fine-grained plan.
+        """
+        language_inputs = self._prepare_language_model_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            decoder_input=decoder_input,
+            packed_seq_params=packed_seq_params,
+        )
+        for key in (
+            "extra_block_kwargs",
+            "runtime_gather_output",
+            "inference_context",
+            "inference_params",
+            "output_processor",
+            "output_processor_context",
+        ):
+            if key in kwargs:
+                language_inputs[key] = kwargs[key]
+
+        return self.language_model.build_schedule_plan(**language_inputs)

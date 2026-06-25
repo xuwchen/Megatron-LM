@@ -1,16 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.import functools
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
 import importlib
@@ -61,6 +49,7 @@ except ImportError:
     from .utils import is_submodule
 
     def is_graph_capturing():
+        """Return whether the current CUDA stream is capturing a CUDA graph."""
         return torch.cuda.is_current_stream_capturing()
 
 
@@ -79,32 +68,56 @@ class TrainingState(Enum):
     IDLE = auto()
 
 
+def _to_orig_param(param):
+    """Return the raw FSDP-managed parameter for distributed optimizer wrappers."""
+    return getattr(param, "orig_param", param)
+
+
+def _to_orig_params(params):
+    """Return raw FSDP-managed parameters for communication table lookup."""
+    return [_to_orig_param(param) for param in params]
+
+
 def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
     """Configure delayed wgrad gradient processing for MoE expert parameters.
 
-    When ``overlap_dispatch_backward_with_experts_wgrad`` is enabled on a TransformerLayer,
-    this function:
-      1. Marks expert parameters so the normal post-accumulate-grad hook is skipped.
-      2. Registers a callback on the MoE layer that invokes FSDP's gradient
-         reduce-scatter after the delayed wgrad computation completes.
+    When delayed wgrad is enabled, TE sets ``skip_backward_post_hook`` on affected
+    weight parameters. The normal AccumulateGrad hook is bypassed, so FSDP must
+    register its grad processing callback on the TE module's delayed-wgrad hook.
+    Modules that do not expose a hook registration API fall back to the historical
+    param-level callback used by MoE's delayed expert-wgrad wrapper.
 
     Args:
-        module: The module being processed in the forward pre-hook. Only
-            ``TransformerLayer`` instances with the delayed wgrad config flag
-            enabled are affected; all other modules are no-ops.
+        module: The module being processed in the forward pre-hook. Only modules
+            with delayed wgrad enabled are affected; all other modules are no-ops.
         process_post_backward_gradients_fn: The FSDP gradient processing function
             (``_process_post_backward_gradients``) to be called after the delayed
             wgrad computation finishes.
     """
     from functools import partial
 
-    need_backward_dw = getattr(module, "need_backward_dw", lambda: False)
-    if not need_backward_dw():
+    delayed_params = [
+        param
+        for param in module.parameters(recurse=False)
+        if param.requires_grad and getattr(param, 'skip_backward_post_hook', False)
+    ]
+    if not delayed_params:
         return
 
-    for param in module.parameters():
-        if getattr(param, 'skip_backward_post_hook', False):
-            param.post_wgrad_grad_acc_hook = partial(grad_acc_func, [param])
+    if hasattr(module, "register_wgrad_accumulation_and_reduce_hooks"):
+        for param in delayed_params:
+            module.register_wgrad_accumulation_and_reduce_hooks(
+                partial(grad_acc_func, [param], from_delayed_wgrad=True)
+            )
+            # Marker consumed by _process_post_backward_gradients so root post-backward
+            # does not process this param before TE backward_dw computes its wgrad.
+            # Keep the value None so MoE's param-level fallback will not double-call it.
+            param.post_wgrad_grad_acc_hook = None
+    else:
+        for param in delayed_params:
+            param.post_wgrad_grad_acc_hook = partial(
+                grad_acc_func, [param], from_delayed_wgrad=True
+            )
 
 
 class MegatronFSDP(torch.nn.Module):
@@ -277,7 +290,6 @@ class MegatronFSDP(torch.nn.Module):
             enable_fine_grained_param_gather_backward_hook
         )
         self.report_nan_in_param_grad = report_nan_in_param_grad
-
         # Params whose fused wgrad is captured inside a CUDA graph. During replay,
         # FSDP must not reallocate or zero their main_grad before reduction.
         self._cuda_graph_fused_wgrad_params = set()
@@ -469,6 +481,7 @@ class MegatronFSDP(torch.nn.Module):
         if self.data_parallel_sharding_strategy == "no_shard":
             return
 
+        params = _to_orig_params(params)
         ag_pipeline = self.all_gather_pipeline
         # Only all-gather HSDP buffer parameters in the beginning of a new optimization
         # step cycle, or on every step if model_auto_sync is enabled, i.e. update
@@ -575,12 +588,13 @@ class MegatronFSDP(torch.nn.Module):
                 - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
                 the FP8 transpose cache associated with the module’s parameters.
             """
-            for param in module.parameters():
+            params = _to_orig_params(module.parameters())
+            for param in params:
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
                 self.all_gather_pipeline.release_bucket(bucket_id, bwd, lazy=lazy)
 
             if not self.ddp_config.keep_fp8_transpose_cache:
-                release_params_fp8_transpose_cache(module.parameters())
+                release_params_fp8_transpose_cache(params)
 
         def release_params_fp8_transpose_cache(params):
             for param in params:
@@ -594,6 +608,7 @@ class MegatronFSDP(torch.nn.Module):
             Utilizes the patched main_grad property of the parameter to allocate
             or fetch the main gradient bucket for the parameter.
             """
+            param = _to_orig_param(param)
             group_id = self.param_and_grad_buffer.param_to_param_group[param]
             group = self.param_and_grad_buffer.parameter_groups[group_id]
             if not group.requires_grad:
@@ -602,8 +617,6 @@ class MegatronFSDP(torch.nn.Module):
             # Sharded Gradient Buffer
             gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
             if gbuf.is_data_distributed:
-                # If TransformerEngine gradient accumulation is fused, then param.get_main_grad()
-                # already holds the wgrad and param.grad_added_to_main_grad=True.
                 if not param.grad_added_to_main_grad:
                     # CUDA graph replay runs fused wgrad GEMMs that already wrote
                     # into the captured main_grad address. Do not reallocate or
@@ -611,9 +624,9 @@ class MegatronFSDP(torch.nn.Module):
                     if id(param) in self._cuda_graph_fused_wgrad_params:
                         param.grad_added_to_main_grad = True
                     else:
-                        # Get `main_grad` will allocate bucket, check that the currently
-                        # used main_grad buffer does not exceed the scope of two FSDP Unit
-                        # Modules, i.e., the buffer limit imposed by double-buffer allocator.
+                        # get_main_grad() allocates the communication bucket. With
+                        # double-buffering, enforce the fixed-pool limit before
+                        # requesting another bucket.
                         if self.ddp_config.fsdp_double_buffer:
                             self.grad_reduce_pipeline._enforce_double_buffer_limit([group_id])
 
@@ -647,6 +660,7 @@ class MegatronFSDP(torch.nn.Module):
             param.grad_added_to_main_grad = False
 
         self._params_require_handle_grad = set()
+        self._params_handled_by_grad_hook = set()
 
         def _post_backward_release_module(module, *unused):
             """
@@ -671,7 +685,7 @@ class MegatronFSDP(torch.nn.Module):
                 sub_module._training_state = TrainingState.IDLE
 
         @torch.compiler.disable
-        def _process_post_backward_gradients(param_list):
+        def _process_post_backward_gradients(param_list, from_delayed_wgrad=False):
             """
             Process gradients for a list of parameters after the backward pass.
 
@@ -711,6 +725,7 @@ class MegatronFSDP(torch.nn.Module):
             # capture itself does not exhaust the double-buffer pool.
             if is_graph_capturing():
                 for param in param_list:
+                    param = _to_orig_param(param)
                     if hasattr(param, 'main_grad') and param.main_grad is not None:
                         self._cuda_graph_fused_wgrad_params.add(id(param))
                     bucket_id = self.param_and_grad_buffer.param_to_param_group.get(param)
@@ -723,14 +738,22 @@ class MegatronFSDP(torch.nn.Module):
                 return
 
             # Filter out shared parameters whose gradients are handled by the root hook.
-            param_list = [p for p in param_list if not getattr(p, "_is_shared", False)]
+            param_list = [
+                _to_orig_param(p) for p in param_list if not getattr(p, "_is_shared", False)
+            ]
 
-            # Make sure for delayed wgrad params, the grad_acc_hooks are registered.
-            for p in param_list:
-                if getattr(p, 'skip_backward_post_hook', False):
-                    assert hasattr(
-                        p, 'post_wgrad_grad_acc_hook'
-                    ), "Missing grad accumulation hook for delayed_wgrad_compute param."
+            if not from_delayed_wgrad:
+                # Delayed wgrad params are processed when TE finishes backward_dw.
+                # Processing them from root/per-param hooks can reduce stale or
+                # missing gradients and can advance bucket state twice.
+                param_list = [
+                    p
+                    for p in param_list
+                    if not (
+                        getattr(p, 'skip_backward_post_hook', False)
+                        and hasattr(p, 'post_wgrad_grad_acc_hook')
+                    )
+                ]
 
             if not param_list:
                 return
@@ -760,11 +783,15 @@ class MegatronFSDP(torch.nn.Module):
 
             # Mark parameters as processed.
             for param in param_list:
+                self._params_handled_by_grad_hook.add(param)
                 self._params_require_handle_grad.discard(param)
 
         @torch.compiler.disable
         def _pre_forward_param_unshard(module: nn.Module, *unused):
             # Unshard the parameters before the forward pass.
+            # Fine-grained schedules can call submodule methods directly and bypass
+            # MegatronFSDP.forward(), so restore raw module parameters here as well.
+            self._replace_param_with_raw_if_needed()
             input_training_state = module._training_state
             fsdp_forward_prefetch = True
             if input_training_state == TrainingState.PRE_BACKWARD:
@@ -864,18 +891,21 @@ class MegatronFSDP(torch.nn.Module):
             # is specified by the user, context manager, or FW before reduction.
             is_last_microbatch = getattr(self, "is_last_microbatch", False)
             if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
+                outer_fsdp_group_grad_reduce = self.dist_index.use_hybrid_fsdp and (
+                    is_last_microbatch or self.model_auto_sync
+                )
                 self.grad_reduce_pipeline.reduce_gradients(
                     ordered_params,
                     suggested_queue_capacity=self.suggested_RS_queue_capacity,
-                    outer_fsdp_group_grad_reduce=(
-                        self.dist_index.use_hybrid_fsdp
-                        and (is_last_microbatch or self.model_auto_sync)
-                    ),
+                    outer_fsdp_group_grad_reduce=outer_fsdp_group_grad_reduce,
                 )
-                self.grad_reduce_pipeline.reset()
+                self.grad_reduce_pipeline.reset(
+                    outer_fsdp_group_grad_reduce=outer_fsdp_group_grad_reduce
+                )
 
             # Reset root_pre_backward_hook_issued flag.
             self._root_pre_backward_hook_issued = False
+            self._params_handled_by_grad_hook.clear()
             self.microbatch_count += 1
 
             # If model_auto_sync is enabled, we automatically synchronize gradients
@@ -941,8 +971,10 @@ class MegatronFSDP(torch.nn.Module):
             for param_group in self.param_and_grad_buffer.parameter_groups:
                 if not param_group.requires_grad:
                     continue
-                self._params_require_handle_grad |= set(param_group.params)
                 for param in param_group.params:
+                    if param in self._params_handled_by_grad_hook:
+                        continue
+                    self._params_require_handle_grad.add(param)
                     param.grad_added_to_main_grad = False
             # Queue the root post-backward hook to reduce leftover gradients after
             # the backward pass.
@@ -1335,7 +1367,9 @@ class MegatronFSDP(torch.nn.Module):
             # Asynchronous reduce-scatter from overlap_grad_reduce=True,
             # i.e. when sharding optimizer and gradients.
             self.grad_reduce_pipeline.wait_for_previous_grad_reduce(0)
-            self.grad_reduce_pipeline.reset()
+            self.grad_reduce_pipeline.reset(
+                outer_fsdp_group_grad_reduce=self.dist_index.use_hybrid_fsdp
+            )
         else:
             # Synchronous gradient all-reduce when sharding optimizer state or not sharding.
             self.start_grad_sync()
@@ -1366,6 +1400,7 @@ class MegatronFSDP(torch.nn.Module):
         # Once the gradients have been reduced and scattered into main_grad_buffer,
         # update the gradients for all buffered weights in optimizer_named_parameters.
         self.attach_grad_to_optimizer_state()
+        self.grad_reduce_pipeline.clear_reduced_grad_tracking()
 
         # Synchronize parameter all-gather operations for all model parameters,
         # which are triggered during the backward pass for FSDP.

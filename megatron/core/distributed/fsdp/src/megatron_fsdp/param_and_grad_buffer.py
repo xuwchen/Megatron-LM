@@ -769,6 +769,10 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                         self.idle_buffer.remove((buf_group_id, bucket_offset))
                         break
 
+            if buffer_name is None and self.fallback_to_persistent_buffer is True:
+                buffer_name = (
+                    f"{self.name}_fixed_pool_exhausted_{bucket_id}_{size}_{dtype}_{device}"
+                )
             assert buffer_name is not None, (
                 f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
                 f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
@@ -2754,6 +2758,12 @@ class ParamAndGradBuffer:
                 # Enables TransformerEngine's fuse_wgrad_accumulation=True feature
                 # which dumps gradients into param.main_grad with zero-copy.
                 p.get_main_grad = main_grad_getter.__get__(p)
+                if not hasattr(p, "grad_added_to_main_grad"):
+                    p.grad_added_to_main_grad = False
+                if not hasattr(p, "__fsdp_param__"):
+                    p.__fsdp_param__ = True
+                if not hasattr(p, "overwrite_main_grad"):
+                    p.overwrite_main_grad = True
 
         # Clean up deallocated memory.
         gc.collect()
@@ -2775,9 +2785,27 @@ class ParamAndGradBuffer:
 
             new_param.requires_grad_(old_param.requires_grad)
 
-            for tp_attr in ["_tensor_parallel_mode"]:
-                if getattr(old_param, tp_attr, None) is not None:
-                    setattr(new_param, tp_attr, getattr(old_param, tp_attr))
+            for attr_name in [
+                "sequence_parallel",
+                "shared",
+                "tensor_model_parallel",
+                "partition_dim",
+                "partition_stride",
+                "is_embedding_or_output_parameter",
+                "is_embedding_parameter",
+                "_tensor_parallel_mode",
+                "allreduce",
+                "grad_added_to_main_grad",
+                "__fsdp_param__",
+                "overwrite_main_grad",
+            ]:
+                if hasattr(old_param, attr_name):
+                    setattr(new_param, attr_name, getattr(old_param, attr_name))
+
+            if not hasattr(new_param, "grad_added_to_main_grad"):
+                new_param.grad_added_to_main_grad = False
+            if not hasattr(new_param, "__fsdp_param__"):
+                new_param.__fsdp_param__ = True
 
             # For FSDP with delayed_wgrad_compute, `skip_backward_post_hook` needs
             # to be reset on new param for correct grad accumulation of wgrad computation.
@@ -3472,6 +3500,7 @@ class GradReducePipeline:
         }
         # Track the number of parameters in each bucket that are ready for gradient reduce-scatter.
         self.bucket_grad_ready_params = [set() for _ in range(self.buffer.num_buckets)]
+        self.bucket_grad_reduced_params = [set() for _ in range(self.buffer.num_buckets)]
         self.rs_stream = rs_stream
         self.check_nans = check_nans
 
@@ -3489,9 +3518,45 @@ class GradReducePipeline:
         """Return the number of buckets."""
         return self.buffer.num_buckets
 
-    def reset(self):
+    def _stage_missing_grad_for_reduction(self, param: torch.Tensor) -> None:
+        """Materialize a zero or pending autograd grad for a bucket-final flush."""
+        if not param.requires_grad:
+            return
+
+        if getattr(param, "main_grad", None) is None:
+            bucket_id = self.buffer.param_to_param_group[param]
+            already_reduced = param in self.bucket_grad_reduced_params[bucket_id]
+            _p_assert(
+                hasattr(param, "get_main_grad"),
+                f"FSDP parameter {self.buffer.param_to_name[param]} is missing get_main_grad.",
+            )
+            _p_assert(
+                param.grad is not None or already_reduced,
+                f"FSDP parameter {self.buffer.param_to_name[param]} has neither "
+                "main_grad nor autograd grad for a partial bucket flush.",
+            )
+            param.main_grad = param.get_main_grad()
+            if param.grad is None:
+                param.main_grad.zero_()
+
+        if param.grad is not None:
+            param.main_grad.copy_(to_local_if_dtensor(param.grad))
+            del param.grad
+
+    def reset(
+        self,
+        flush_partial_grad_ready_buckets: bool = True,
+        outer_fsdp_group_grad_reduce: bool = False,
+    ):
         """Handle the processing tasks and reset the pipeline."""
         self.wait_for_previous_grad_reduce(0)
+        if flush_partial_grad_ready_buckets:
+            self.flush_partial_grad_ready_buckets(
+                self._stage_missing_grad_for_reduction,
+                outer_fsdp_group_grad_reduce=outer_fsdp_group_grad_reduce,
+            )
+            self.wait_for_previous_grad_reduce(0)
+
         for bucket_id, grad_ready_params in enumerate(self.bucket_grad_ready_params):
             param_list = self.buffer.parameter_groups[bucket_id].params
             n_params = len(param_list)
@@ -3508,6 +3573,53 @@ class GradReducePipeline:
             gbuf.free_bucket_storage()
             gbuf.reset_param_main_grad()
             self.bucket_status[bucket_id] = BucketStatus.EMPTY
+
+    def clear_reduced_grad_tracking(self) -> None:
+        """Clear per-step reduced-parameter tracking after optimizer grad sync."""
+        self.bucket_grad_reduced_params = [set() for _ in range(self.buffer.num_buckets)]
+
+    def flush_partial_grad_ready_buckets(
+        self,
+        handle_missing_grad: Callable[[torch.Tensor], None],
+        suggested_queue_capacity: Optional[int] = None,
+        outer_fsdp_group_grad_reduce: bool = False,
+    ) -> None:
+        """Reduce buckets that became partially ready by the end of backward."""
+        for bucket_id, grad_ready_params in enumerate(self.bucket_grad_ready_params):
+            if not grad_ready_params:
+                continue
+
+            param_group = self.buffer.parameter_groups[bucket_id]
+            if len(grad_ready_params) == len(param_group.params):
+                continue
+
+            needs_missing_grad_buffer = any(
+                param not in grad_ready_params
+                and param.requires_grad
+                and getattr(param, "main_grad", None) is None
+                for param in param_group.params
+            )
+            if needs_missing_grad_buffer:
+                self._enforce_double_buffer_limit([bucket_id])
+
+            for param in param_group.params:
+                if param in grad_ready_params:
+                    continue
+                has_buffered_grad = getattr(param, "main_grad", None) is not None
+                if param.requires_grad and not has_buffered_grad:
+                    handle_missing_grad(param)
+                grad_ready_params.add(param)
+
+            bucket_group = self.get_ready_bucket_group_for_reduction(bucket_id)
+            if bucket_group:
+                self.wait_for_previous_grad_reduce(
+                    suggested_queue_capacity=suggested_queue_capacity
+                )
+                self._bucket_group_gradient_reduce(
+                    bucket_group,
+                    async_op=True,
+                    outer_fsdp_group_grad_reduce=outer_fsdp_group_grad_reduce,
+                )
 
     def reduce_gradients(
         self,
@@ -3858,6 +3970,9 @@ class GradReducePipeline:
 
         free_up_grad_bucket_func = {}
         for bucket_id in bucket_group:
+            self.bucket_grad_reduced_params[bucket_id].update(
+                self.buffer.parameter_groups[bucket_id].params
+            )
 
             def get_closure(bucket_id):
                 def free_up_grad_bucket():
@@ -3933,6 +4048,11 @@ class AllGatherPipeline:
             for bwd in [False, True]:
                 self.bucket_can_be_released[self.get_bucket_key(i, bwd)] = False
 
+        # Bucket storage captured by a CUDA graph cannot be returned to the temporary
+        # allocator: graph replay keeps writing to the captured data pointers even
+        # though the Python FSDP hooks do not run on replay.
+        self.cuda_graph_preserved_bucket_keys = set()
+
         # Map each bucket to the bucket group it belongs to by enumerated ID.
         # Made to collect a subset of buckets in the same bucket group.
         self.bucket_to_bucket_group = {}
@@ -3962,6 +4082,22 @@ class AllGatherPipeline:
             self.buffer.parameter_groups[bucket_id].transpose_weight_buffer is not None
         )
         return (bucket_id, has_transpose_buffer and bwd)
+
+    def _cuda_graph_capture_active(self) -> bool:
+        """Return whether the current CUDA stream is capturing a graph."""
+        if not self.buffer.ddp_config.megatron_fsdp_cuda_graph_mode:
+            return False
+        try:
+            return torch.cuda.is_current_stream_capturing()
+        except RuntimeError:
+            return False
+
+    def _preserve_cuda_graph_bucket(self, bucket_key) -> bool:
+        """Preserve storage for buckets whose address is baked into a CUDA graph."""
+        return (
+            self.buffer.ddp_config.megatron_fsdp_cuda_graph_mode
+            and bucket_key in self.cuda_graph_preserved_bucket_keys
+        )
 
     @property
     def num_buckets(self):
@@ -3998,12 +4134,17 @@ class AllGatherPipeline:
                 # storage in place.
                 if preserve_non_fsdp_units and not is_unit_bucket:
                     self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+                elif self._preserve_cuda_graph_bucket(bucket_key):
+                    self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+                    self.bucket_can_be_released[bucket_key] = False
                 else:
                     self.bucket_can_be_released[bucket_key] = True
         self.recycle_unused_buckets()
 
         expected_statuses = (BucketStatus.EMPTY,)
         if preserve_non_fsdp_units:
+            expected_statuses += (BucketStatus.PRESERVED,)
+        elif self.cuda_graph_preserved_bucket_keys:
             expected_statuses += (BucketStatus.PRESERVED,)
 
         assert all(status in expected_statuses for status in self.bucket_status.values()), (
@@ -4264,6 +4405,20 @@ class AllGatherPipeline:
         if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
             return
 
+        preserve_for_cuda_graph = (
+            self._cuda_graph_capture_active() or self._preserve_cuda_graph_bucket(bucket_key)
+        )
+        if preserve_for_cuda_graph:
+            self.cuda_graph_preserved_bucket_keys.add(bucket_key)
+            self.bucket_can_be_released[bucket_key] = False
+            if lazy:
+                return
+
+            self.wait_bucket_ready(bucket_id, bwd, empty_ok=True)
+            if self.bucket_status[bucket_key] != BucketStatus.EMPTY:
+                self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+            return
+
         if lazy:
             # Mark the bucket can be released later.
             self.bucket_can_be_released[bucket_key] = True
@@ -4285,6 +4440,11 @@ class AllGatherPipeline:
         """Recycle the unused buckets."""
         for bucket_key, can_be_released in self.bucket_can_be_released.items():
             if can_be_released:
+                if self._preserve_cuda_graph_bucket(bucket_key):
+                    if self.bucket_status[bucket_key] != BucketStatus.EMPTY:
+                        self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+                    self.bucket_can_be_released[bucket_key] = False
+                    continue
                 bucket_id, is_transpose_weight = bucket_key[0], bucket_key[1]
                 self.release_bucket(bucket_id, is_transpose_weight)
                 self.bucket_can_be_released[bucket_key] = False

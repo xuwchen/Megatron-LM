@@ -6,7 +6,11 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import (
+    FullCudaGraphWrapper,
+    _normalize_static_inputs,
+    clone_tensors_in_struct,
+)
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -16,6 +20,48 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+def test_static_loader_accepts_multimodal_vanilla_collate_batch():
+    """Multimodal vanilla collate emits list[dict] batches."""
+    sample = [{"input_ids": torch.ones(2, dtype=torch.long), "meta": "old"}]
+    assert _normalize_static_inputs(sample) is sample
+
+    static_sample = [{"input_ids": torch.zeros(2, dtype=torch.long), "meta": "old"}]
+    next_sample = [{"input_ids": torch.arange(2, dtype=torch.long), "meta": "new"}]
+    clone_tensors_in_struct(static_sample, next_sample)
+
+    assert torch.equal(static_sample[0]["input_ids"], next_sample[0]["input_ids"])
+    assert static_sample[0]["meta"] == "new"
+
+
+def test_static_loader_rejects_multimodal_batch_structure_changes():
+    static_sample = [{"input_ids": torch.zeros(2, dtype=torch.long)}]
+    next_sample = [
+        {"input_ids": torch.zeros(2, dtype=torch.long)},
+        {"input_ids": torch.zeros(2, dtype=torch.long)},
+    ]
+
+    with pytest.raises(Exception, match="List structure mismatch"):
+        clone_tensors_in_struct(static_sample, next_sample)
+
+
+def test_static_loader_rejects_grid_thw_metadata_changes():
+    static_sample = [
+        {
+            "input_ids": torch.zeros(2, dtype=torch.long),
+            "image_grid_thw": torch.tensor([[1, 8, 8]], dtype=torch.long),
+        }
+    ]
+    next_sample = [
+        {
+            "input_ids": torch.ones(2, dtype=torch.long),
+            "image_grid_thw": torch.tensor([[1, 4, 16]], dtype=torch.long),
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="requires static Qwen3.5-VL vision grid metadata"):
+        clone_tensors_in_struct(static_sample, next_sample)
 
 
 @pytest.mark.skipif(

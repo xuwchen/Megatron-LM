@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -267,9 +268,11 @@ class TEGroupedMLP(MegatronModule):
 
         # Fused implementation with Transformer Engine op fuser API
         if self.config.use_transformer_engine_op_fuser:
-            assert (
-                self._is_fused_impl_supported()
-            ), "Fused GroupedMLP is not supported for this configuration."
+            if not self._is_fused_impl_supported():
+                reason = getattr(self, "_fused_impl_unsupported_reason", "unknown reason")
+                raise AssertionError(
+                    "Fused GroupedMLP is not supported for this configuration: " + reason
+                )
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
@@ -296,6 +299,13 @@ class TEGroupedMLP(MegatronModule):
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
             return intermediate_parallel
+        if isinstance(tokens_per_expert, torch.Tensor):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Full CUDA graph HybridEP with tensor expert counts does not support "
+                    "MoE expert bias because torch.split requires host split sizes."
+                )
+            tokens_per_expert = tokens_per_expert.tolist()
         shape = intermediate_parallel.shape
         return (
             torch.cat(
@@ -321,6 +331,7 @@ class TEGroupedMLP(MegatronModule):
         """
 
         def _unsupported(reason):
+            self._fused_impl_unsupported_reason = reason
             logger.warning("TE fused GroupedMLP not available: %s", reason)
             return False
 
@@ -608,6 +619,10 @@ class TEGroupedMLP(MegatronModule):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
+        permuted_probs = self._align_hybridep_static_budget_probs(
+            permuted_local_hidden_states, permuted_probs
+        )
+
         # Construct fused impl if needed
         # Note: We initialize during the first forward pass in case
         # the params are modified after the constructor.
@@ -616,6 +631,21 @@ class TEGroupedMLP(MegatronModule):
         if self._fused_ops is None:
             self._fused_ops = (self._make_fused_ops(),)
         (ops,) = self._fused_ops
+
+        self._prepare_fused_wgrad_main_grads(ops)
+
+        is_hybridep_full_cg = (
+            self.config.cuda_graph_impl == "full_iteration"
+            and self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+        )
+        if is_hybridep_full_cg:
+            tokens_per_expert = self._pad_hybridep_static_budget_tokens_per_expert(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+            permuted_probs = self._align_hybridep_static_budget_probs(
+                permuted_local_hidden_states, permuted_probs
+            )
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
@@ -670,6 +700,102 @@ class TEGroupedMLP(MegatronModule):
             output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
 
+    def _prepare_fused_wgrad_main_grads(self, ops: torch.nn.Module) -> None:
+        """Ensure TE op-fuser has FSDP main_grad targets before forward."""
+        if not self.linear_fc1.delay_wgrad_compute:
+            return
+
+        for param in ops.parameters():
+            if (
+                not hasattr(param, "get_main_grad")
+                or getattr(param, "main_grad", None) is not None
+            ):
+                continue
+
+            param.main_grad = param.get_main_grad()
+            if getattr(param, "overwrite_main_grad", False):
+                param.main_grad.zero_()
+
+    def _align_hybridep_static_budget_probs(
+        self, permuted_local_hidden_states: torch.Tensor, permuted_probs: torch.Tensor
+    ) -> torch.Tensor:
+        """Trim HybridEP static-budget probability padding to the dispatched token rows."""
+        if (
+            permuted_probs is None
+            or permuted_probs.shape[0] == permuted_local_hidden_states.shape[0]
+        ):
+            return permuted_probs
+        is_hybridep_full_cg = (
+            self.config.cuda_graph_impl == "full_iteration"
+            and self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+        )
+        if (
+            not is_hybridep_full_cg
+            or permuted_probs.shape[0] < permuted_local_hidden_states.shape[0]
+        ):
+            raise RuntimeError(
+                "Mismatched MoE dispatched token/probability rows: "
+                f"hidden={permuted_local_hidden_states.shape[0]}, probs={permuted_probs.shape[0]}"
+            )
+        return permuted_probs[: permuted_local_hidden_states.shape[0]]
+
+    def _pad_hybridep_static_budget_tokens_per_expert(
+        self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> list[int] | torch.Tensor:
+        """Assign HybridEP static-budget padding rows to the final local expert."""
+        is_hybridep_full_cg = (
+            self.config.cuda_graph_impl == "full_iteration"
+            and self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+        )
+        capture_active = torch.cuda.is_current_stream_capturing()
+        if not is_hybridep_full_cg:
+            if self._with_fused_impl and tokens_per_expert.device.type == "cpu":
+                padded_tokens_per_expert = tokens_per_expert.to(dtype=torch.int64)
+                token_padding = (
+                    permuted_local_hidden_states.shape[0] - int(padded_tokens_per_expert.sum())
+                )
+                if token_padding:
+                    padded_tokens_per_expert = padded_tokens_per_expert.clone()
+                    padded_tokens_per_expert[-1] += token_padding
+                return padded_tokens_per_expert
+            return tokens_per_expert.tolist()
+
+        use_tensor_counts = tokens_per_expert.device.type != "cpu" and self._with_fused_impl
+        if self._with_fused_impl and tokens_per_expert.device.type == "cpu":
+            padded_tokens_per_expert = tokens_per_expert.to(dtype=torch.int64)
+            token_padding = (
+                permuted_local_hidden_states.shape[0] - int(padded_tokens_per_expert.sum())
+            )
+            if token_padding:
+                padded_tokens_per_expert = padded_tokens_per_expert.clone()
+                padded_tokens_per_expert[-1] += token_padding
+        elif tokens_per_expert.device.type == "cpu" or not use_tensor_counts:
+            if capture_active and tokens_per_expert.device.type != "cpu":
+                padded_tokens_per_expert = getattr(
+                    self, "_cuda_graph_padded_tokens_per_expert_list", None
+                )
+                if padded_tokens_per_expert is None:
+                    raise RuntimeError(
+                        "Full CUDA graph capture reached unfused MoE experts before padded "
+                        "expert token counts were cached during warmup. Enable "
+                        "use_transformer_engine_op_fuser to keep expert counts in graph."
+                    )
+            else:
+                padded_tokens_per_expert = tokens_per_expert.tolist()
+                token_padding = permuted_local_hidden_states.shape[0] - sum(padded_tokens_per_expert)
+                padded_tokens_per_expert[-1] += token_padding
+                if tokens_per_expert.device.type != "cpu":
+                    self._cuda_graph_padded_tokens_per_expert_list = padded_tokens_per_expert
+        else:
+            padded_tokens_per_expert = tokens_per_expert.to(dtype=torch.int64).clone()
+            padded_tokens_per_expert[-1] = (
+                permuted_local_hidden_states.shape[0] - padded_tokens_per_expert[:-1].sum()
+            )
+
+        return padded_tokens_per_expert
+
     def _tokens_per_expert_to_device(self, tokens_per_expert, device: torch.device) -> torch.Tensor:
         """Move CPU expert counts to GPU using pinned host memory for CUDA graph capture."""
         if self.config.cuda_graph_impl == "none":
@@ -720,7 +846,12 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
-        tokens_per_expert: list[int] = tokens_per_expert.tolist()
+        tokens_per_expert = self._pad_hybridep_static_budget_tokens_per_expert(
+            permuted_local_hidden_states, tokens_per_expert
+        )
+        permuted_probs = self._align_hybridep_static_budget_probs(
+            permuted_local_hidden_states, permuted_probs
+        )
         permuted_probs = permuted_probs.unsqueeze(-1)
         if skip_routed_expert_padding(self.config):
             pass
@@ -755,6 +886,7 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors=[permuted_local_hidden_states],
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
+        permuted_probs = self._align_hybridep_static_budget_probs(fc1_output, permuted_probs)
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
 
