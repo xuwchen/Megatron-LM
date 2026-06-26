@@ -1193,7 +1193,8 @@ class DataParallelBuffer:
         """
         Release the storage of a temporarily-allocated communication bucket.
         """
-        self._record_bucket_free(source="free_bucket_storage")
+        if self._debug_records_free():
+            self._record_bucket_free(source="free_bucket_storage")
         self.temporary_bucket_allocator.free(self.bucket_index.bucket_id)
 
     def reset_param_main_grad(self):
