@@ -194,27 +194,37 @@ class CudaGraphBufferRegistry:
         self.capture_candidates.setdefault(stage, set())
         self.capture_snapshots.setdefault(stage, {})
         self.phase = f"capture:{stage}"
-        self._write_event({"event": "begin_capture", "stage": stage, "phase": self.phase})
+        self.order += 1
+        self._write_event(
+            {"event": "begin_capture", "stage": stage, "phase": self.phase, "order": self.order}
+        )
 
     def finish_capture(self, stage: str) -> None:
         """Freeze captured addresses for allocations observed during capture."""
         if not self.enabled:
             return
-        candidates = self.capture_candidates.get(stage, set())
+        candidates = set(self.capture_candidates.get(stage, set()))
         frozen = self.captured.setdefault(stage, {})
         missing = []
-        capture_snapshots = self.capture_snapshots.get(stage, {})
+        capture_snapshots = dict(self.capture_snapshots.get(stage, {}))
+        for key, snapshot in self.current.items():
+            if snapshot.allocated:
+                candidates.add(key)
+                capture_snapshots.setdefault(key, snapshot)
         for key in sorted(candidates, key=repr):
             snapshot = capture_snapshots.get(key)
             if snapshot is None:
                 missing.append(key)
                 continue
             frozen[key] = snapshot
+        self.order += 1
         self._write_event(
             {
                 "event": "finish_capture",
                 "stage": stage,
+                "order": self.order,
                 "captured": len(frozen),
+                "captured_keys": [key.to_json() for key in sorted(frozen, key=repr)],
                 "missing": [key.to_json() for key in missing],
             }
         )
@@ -232,7 +242,8 @@ class CudaGraphBufferRegistry:
         """Leave capture mode without freezing addresses."""
         if not self.enabled:
             return
-        self._write_event({"event": "abort_capture", "stage": stage})
+        self.order += 1
+        self._write_event({"event": "abort_capture", "stage": stage, "order": self.order})
         self.active_capture_stage = None
         self.phase = "eager"
 
@@ -242,11 +253,17 @@ class CudaGraphBufferRegistry:
             return
         self.active_replay_stage = stage
         self.phase = f"replay:{stage}"
+        self.order += 1
+        self._write_event(
+            {"event": "begin_replay", "stage": stage, "phase": self.phase, "order": self.order}
+        )
 
     def finish_replay(self, stage: str) -> None:
         """Leave replay mode."""
         if not self.enabled:
             return
+        self.order += 1
+        self._write_event({"event": "finish_replay", "stage": stage, "order": self.order})
         if self.active_replay_stage == stage:
             self.active_replay_stage = None
         self.phase = "eager"

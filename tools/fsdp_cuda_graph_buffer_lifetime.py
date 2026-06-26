@@ -30,9 +30,12 @@ class LogicalKey:
 
     @classmethod
     def from_event(cls, event: dict[str, Any]) -> "LogicalKey":
-        key = event["key"]
+        return cls.from_payload(event["key"], rank=int(event.get("rank", 0)))
+
+    @classmethod
+    def from_payload(cls, key: dict[str, Any], *, rank: int) -> "LogicalKey":
         return cls(
-            rank=int(event.get("rank", 0)),
+            rank=rank,
             namespace=str(key.get("namespace", "")),
             kind=str(key.get("kind", "")),
             bucket_id=int(key.get("bucket_id", -1)),
@@ -86,6 +89,18 @@ def _iter_events(paths: Iterable[Path]) -> Iterable[dict[str, Any]]:
                 event["_source_path"] = str(path)
                 event["_source_line"] = line_no
                 yield event
+
+
+def read_captured_keys(paths: Iterable[Path], stage: str) -> set[LogicalKey]:
+    """Return keys frozen at CUDA graph capture finish for ``stage``."""
+    captured: set[LogicalKey] = set()
+    for event in _iter_events(paths):
+        if event.get("event") != "finish_capture" or event.get("stage") != stage:
+            continue
+        rank = int(event.get("rank", 0))
+        for key in event.get("captured_keys", []):
+            captured.add(LogicalKey.from_payload(key, rank=rank))
+    return captured
 
 
 def build_intervals(paths: Iterable[Path]) -> tuple[list[Interval], dict[str, int]]:
@@ -317,12 +332,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("jsonl", nargs="+", type=Path, help="Trace JSONL files")
     parser.add_argument("--pool-size", type=int, default=2, help="Fixed-pool buffer groups")
+    parser.add_argument(
+        "--captured-stage",
+        type=str,
+        default=None,
+        help="Only derive a plan for keys frozen by the named CUDA graph capture stage.",
+    )
     parser.add_argument("--output-plan", type=Path, default=None, help="Write derived plan JSON")
     args = parser.parse_args()
 
     intervals, stats = build_intervals(args.jsonl)
+    if args.captured_stage is not None:
+        captured = read_captured_keys(args.jsonl, args.captured_stage)
+        stats["captured_stage_keys"] = len(captured)
+        intervals = [interval for interval in intervals if interval.key in captured]
+        stats["intervals_after_captured_stage_filter"] = len(intervals)
     plan = derive_plan(intervals, args.pool_size)
     plan["source_files"] = [str(path) for path in args.jsonl]
+    plan["captured_stage"] = args.captured_stage
     _print_summary(plan, stats)
 
     if args.output_plan is not None:
