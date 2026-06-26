@@ -7,14 +7,6 @@ import logging
 
 import torch
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.cuda_graph_buffer_debug import (
-    abort_cuda_graph_buffer_capture,
-    assert_cuda_graph_buffer_addresses,
-    begin_cuda_graph_buffer_capture,
-    begin_cuda_graph_buffer_replay,
-    finish_cuda_graph_buffer_capture,
-    finish_cuda_graph_buffer_replay,
-)
 from megatron.core.tensor_parallel.random import get_all_rng_states
 
 logger = logging.getLogger(__name__)
@@ -222,6 +214,12 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.cuda_graph_buffer_debug import (
+                abort_cuda_graph_buffer_capture,
+                begin_cuda_graph_buffer_capture,
+                finish_cuda_graph_buffer_capture,
+            )
+
             stage = f"full_iteration:{training_str}"
             begin_cuda_graph_buffer_capture(stage)
             try:
@@ -244,6 +242,12 @@ class FullCudaGraphWrapper:
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.cuda_graph_buffer_debug import (
+                assert_cuda_graph_buffer_addresses,
+                begin_cuda_graph_buffer_replay,
+                finish_cuda_graph_buffer_replay,
+            )
+
             stage = f"full_iteration:{training_str}"
             begin_cuda_graph_buffer_replay(stage)
             try:

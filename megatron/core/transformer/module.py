@@ -9,11 +9,6 @@ from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
-from megatron.core.distributed.fsdp.src.megatron_fsdp.cuda_graph_buffer_debug import (
-    assert_cuda_graph_buffer_addresses,
-    begin_cuda_graph_buffer_replay,
-    finish_cuda_graph_buffer_replay,
-)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -332,6 +327,12 @@ class GraphableMegatronModule(MegatronModule):
 
         cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.cuda_graph_buffer_debug import (
+            assert_cuda_graph_buffer_addresses,
+            begin_cuda_graph_buffer_replay,
+            finish_cuda_graph_buffer_replay,
+        )
 
         stage = "transformer_engine"
         begin_cuda_graph_buffer_replay(stage)

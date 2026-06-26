@@ -23,11 +23,6 @@ import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core import parallel_state
-from megatron.core.distributed.fsdp.src.megatron_fsdp.cuda_graph_buffer_debug import (
-    abort_cuda_graph_buffer_capture,
-    begin_cuda_graph_buffer_capture,
-    finish_cuda_graph_buffer_capture,
-)
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -2908,6 +2903,11 @@ class TECudaGraphHelper:
         if FREEZE_GC:
             gc.freeze()
 
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.cuda_graph_buffer_debug import (
+            abort_cuda_graph_buffer_capture,
+            begin_cuda_graph_buffer_capture,
+        )
+
         stage = "transformer_engine"
         begin_cuda_graph_buffer_capture(stage)
         try:
@@ -2944,6 +2944,10 @@ class TECudaGraphHelper:
             f'{time.time() - start_time}s',
         )
         _set_capture_end()
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.cuda_graph_buffer_debug import (
+            finish_cuda_graph_buffer_capture,
+        )
+
         finish_cuda_graph_buffer_capture("transformer_engine")
 
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors

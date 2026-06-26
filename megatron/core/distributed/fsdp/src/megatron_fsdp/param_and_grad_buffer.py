@@ -23,6 +23,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from .cuda_graph_buffer_debug import (
     GraphBufferKey,
     configure_cuda_graph_buffer_debug_from_config,
+    get_cuda_graph_buffer_planned_slot,
     record_cuda_graph_buffer_allocate,
     record_cuda_graph_buffer_free,
 )
@@ -773,7 +774,41 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             # Try to allocate from the buffer pool.
             bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
             buffer_name = None
-            if bucket_id in self.using_buffer:
+            planned_slot = get_cuda_graph_buffer_planned_slot(self.name, bucket_id)
+            if planned_slot is not None:
+                planned_buf_group_id, planned_bucket_offset = planned_slot
+                assert planned_bucket_offset == bucket_offset, (
+                    f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
+                    f"CUDA graph buffer plan bucket_offset mismatch for bucket_id={bucket_id}: "
+                    f"plan={planned_bucket_offset}, actual={bucket_offset}"
+                )
+                if bucket_id in self.using_buffer:
+                    assert self.using_buffer[bucket_id] == planned_slot, (
+                        f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
+                        f"CUDA graph buffer plan slot mismatch for bucket_id={bucket_id}: "
+                        f"plan={planned_slot}, current={self.using_buffer[bucket_id]}"
+                    )
+                    buffer_name = self._get_gbuf_name(planned_buf_group_id, planned_bucket_offset)
+                elif planned_slot in self.idle_buffer:
+                    self.using_buffer[bucket_id] = planned_slot
+                    buffer_name = self._get_gbuf_name(planned_buf_group_id, planned_bucket_offset)
+                    self.idle_buffer.remove(planned_slot)
+                else:
+                    owner = next(
+                        (
+                            live_bucket_id
+                            for live_bucket_id, live_slot in self.using_buffer.items()
+                            if live_slot == planned_slot
+                        ),
+                        None,
+                    )
+                    raise RuntimeError(
+                        f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
+                        f"CUDA graph buffer planned slot {planned_slot} for bucket_id={bucket_id} "
+                        f"is not idle. owner={owner}, using_buffer={self.using_buffer}, "
+                        f"idle_buffer={self.idle_buffer}"
+                    )
+            elif bucket_id in self.using_buffer:
                 # If this bucket is already using a buffer, reuse it.
                 buf_group_id, bucket_offset = self.using_buffer[bucket_id]
                 buffer_name = self._get_gbuf_name(buf_group_id, bucket_offset)

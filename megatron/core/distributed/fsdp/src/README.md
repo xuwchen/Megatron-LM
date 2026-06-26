@@ -166,6 +166,8 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
     - Defaults to `False`. Requires Megatron-FSDP and a non-`none` CUDA graph implementation in Megatron-LM.
 - `cuda_graph_buffer_trace_path` writes JSONL allocate/free trace events for Megatron-FSDP buffers. In Megatron-LM this is exposed as `--cuda-graph-buffer-trace-path`; multi-rank runs append `.rank<N>` unless the path contains `%r`.
     - Defaults to `None`.
+- `cuda_graph_buffer_use_planned_allocator` forces Megatron-FSDP fixed-pool bucket allocations to use slots from `cuda_graph_buffer_plan_path`. In Megatron-LM this is exposed as `--cuda-graph-buffer-use-planned-allocator` plus `--cuda-graph-buffer-plan-path`. The plan can be generated from JSONL traces with `tools/fsdp_cuda_graph_buffer_lifetime.py`.
+    - Defaults to `False`. Requires Megatron-FSDP double buffering and fails fast if the planned slot is not idle when requested.
 - `preproc_state_dict_for_dcp_ckpt` adds `model.state_dict()` and `optimizer.state_dict()` post-hooks that modify the model and optimizer state in preparation for `torch.distributed.checkpoint.{save,load}` ([Torch DCP](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)) checkpointing. Specifically, it adds `__create_write_items__` and `__create_chunk_list__` methods to Tensors utilized by Torch DCP to redistribute parameters when saving and loading model and optimizer checkpoints. Can be deactivated should the user need a custom distributed checkpointing strategy.
     - Defaults to `True`.
 

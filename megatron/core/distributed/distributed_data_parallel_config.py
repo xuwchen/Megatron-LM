@@ -247,6 +247,14 @@ class DistributedDataParallelConfig:
     In multi-rank runs, a `.rank<N>` suffix is added unless the path contains `%r`.
     """
 
+    cuda_graph_buffer_use_planned_allocator: bool = False
+    """If true, force Megatron-FSDP fixed-pool temporary bucket allocations to use
+    the slots specified by `cuda_graph_buffer_plan_path`.
+    """
+
+    cuda_graph_buffer_plan_path: Optional[str] = None
+    """Optional JSON plan path generated from Megatron-FSDP CUDA graph buffer lifetime traces."""
+
     megatron_fsdp_enable_fine_grained_param_gather: bool = False
     """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
       This feature increases the overlap between parameter all-gather and forward computation,

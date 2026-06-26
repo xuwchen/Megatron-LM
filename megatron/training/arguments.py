@@ -1312,6 +1312,24 @@ def validate_args(args, defaults={}):
         assert args.cuda_graph_buffer_trace_path is None, (
             "--cuda-graph-buffer-trace-path requires --use-megatron-fsdp."
         )
+        assert not args.cuda_graph_buffer_use_planned_allocator, (
+            "--cuda-graph-buffer-use-planned-allocator requires --use-megatron-fsdp."
+        )
+        assert args.cuda_graph_buffer_plan_path is None, (
+            "--cuda-graph-buffer-plan-path requires --use-megatron-fsdp."
+        )
+
+    if args.cuda_graph_buffer_use_planned_allocator:
+        assert args.fsdp_double_buffer, (
+            "--cuda-graph-buffer-use-planned-allocator requires --fsdp-double-buffer."
+        )
+        assert args.cuda_graph_buffer_plan_path is not None, (
+            "--cuda-graph-buffer-use-planned-allocator requires --cuda-graph-buffer-plan-path."
+        )
+    if args.cuda_graph_buffer_plan_path is not None:
+        assert args.cuda_graph_buffer_use_planned_allocator, (
+            "--cuda-graph-buffer-plan-path requires --cuda-graph-buffer-use-planned-allocator."
+        )
 
     if args.cuda_graph_assert_buffer_addresses:
         assert args.cuda_graph_impl != "none", (
@@ -2412,6 +2430,19 @@ def _add_inference_args(parser):
         default=None,
         help='Write Megatron-FSDP buffer allocate/free trace events as JSONL. In multi-rank '
         'runs, a .rank<N> suffix is added unless the path contains %r.',
+    )
+    group.add_argument(
+        '--cuda-graph-buffer-use-planned-allocator',
+        action='store_true',
+        default=False,
+        help='Force Megatron-FSDP fixed-pool temporary bucket allocations to use slots from '
+        '--cuda-graph-buffer-plan-path.',
+    )
+    group.add_argument(
+        '--cuda-graph-buffer-plan-path',
+        type=str,
+        default=None,
+        help='Read a Megatron-FSDP CUDA graph buffer plan JSON generated from lifetime traces.',
     )
     group.add_argument(
         '--use-legacy-static-engine',
