@@ -176,6 +176,17 @@ class DistributedDataParallelConfig:
     a casted-copy of the gradient shard that cannot be dereferenced due to replay.
     """
 
+    cuda_graph_assert_buffer_addresses: bool = False
+    """If true, assert that CUDA-graph-captured Megatron-FSDP-backed buffers keep
+    the same data pointer, dtype, shape, and byte size before replay as they had
+    at capture time. Intended as a debug safety net for FSDP double-buffer use.
+    """
+
+    cuda_graph_buffer_trace_path: Optional[str] = None
+    """Optional JSONL path for Megatron-FSDP buffer allocate/free trace events.
+    In multi-rank runs, a `.rank<N>` suffix is added unless the path contains `%r`.
+    """
+
     megatron_fsdp_enable_fine_grained_param_gather: bool = False
     """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
       This feature increases the overlap between parameter all-gather and forward computation,

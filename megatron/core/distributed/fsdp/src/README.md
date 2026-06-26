@@ -162,6 +162,10 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
     - Defaults to `False`.
 - `fsdp_double_buffer` will use persistently allocated double buffers for temporarily-defined memory needed in `MegatronFSDP` communications. Having persistent double buffers may increase peak VRAM utilization, but is required to register NCCL user buffers (`nccl_ub=True`) for `MegatronFSDP`. Currently, this is only supported for simple repetitive model structures such as GPT.
     - Defaults to `False`. Automatically overridden to `True` when `nccl_ub` is enabled.
+- `cuda_graph_assert_buffer_addresses` verifies that CUDA-graph-captured Megatron-FSDP-backed buffers keep the same pointer, dtype, shape, and byte size before replay as they had at capture time. In Megatron-LM this is exposed as `--cuda-graph-assert-buffer-addresses` and is intended to turn double-buffer address drift into a clear failure while developing CUDA graph support.
+    - Defaults to `False`. Requires Megatron-FSDP and a non-`none` CUDA graph implementation in Megatron-LM.
+- `cuda_graph_buffer_trace_path` writes JSONL allocate/free trace events for Megatron-FSDP buffers. In Megatron-LM this is exposed as `--cuda-graph-buffer-trace-path`; multi-rank runs append `.rank<N>` unless the path contains `%r`.
+    - Defaults to `None`.
 - `preproc_state_dict_for_dcp_ckpt` adds `model.state_dict()` and `optimizer.state_dict()` post-hooks that modify the model and optimizer state in preparation for `torch.distributed.checkpoint.{save,load}` ([Torch DCP](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)) checkpointing. Specifically, it adds `__create_write_items__` and `__create_chunk_list__` methods to Tensors utilized by Torch DCP to redistribute parameters when saving and loading model and optimizer checkpoints. Can be deactivated should the user need a custom distributed checkpointing strategy.
     - Defaults to `True`.
 

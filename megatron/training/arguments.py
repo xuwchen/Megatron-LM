@@ -1306,6 +1306,17 @@ def validate_args(args, defaults={}):
         assert not args.fsdp_db_use_persist_buf_on_alloc_fail, (
             "--fsdp-db-use-persist-buf-on-alloc-fail requires " "--use-megatron-fsdp."
         )
+        assert not args.cuda_graph_assert_buffer_addresses, (
+            "--cuda-graph-assert-buffer-addresses requires --use-megatron-fsdp."
+        )
+        assert args.cuda_graph_buffer_trace_path is None, (
+            "--cuda-graph-buffer-trace-path requires --use-megatron-fsdp."
+        )
+
+    if args.cuda_graph_assert_buffer_addresses:
+        assert args.cuda_graph_impl != "none", (
+            "--cuda-graph-assert-buffer-addresses requires --cuda-graph-impl to be set."
+        )
 
     if args.nccl_ub and args.use_megatron_fsdp:
         # In Megatron-LM, required implementation for manual registration is already provided.
@@ -2387,6 +2398,20 @@ def _add_inference_args(parser):
         'it is transformed to an empty list in validate_args. The deprecated values '
         '"full_iteration" and "full_iteration_inference" are also accepted and migrated '
         'to the new API in validate_args.',
+    )
+    group.add_argument(
+        '--cuda-graph-assert-buffer-addresses',
+        action='store_true',
+        default=False,
+        help='Assert that CUDA-graph-captured Megatron-FSDP-backed buffers keep the same '
+        'data pointer, dtype, shape, and byte size before replay as they had at capture time.',
+    )
+    group.add_argument(
+        '--cuda-graph-buffer-trace-path',
+        type=str,
+        default=None,
+        help='Write Megatron-FSDP buffer allocate/free trace events as JSONL. In multi-rank '
+        'runs, a .rank<N> suffix is added unless the path contains %r.',
     )
     group.add_argument(
         '--use-legacy-static-engine',

@@ -20,6 +20,12 @@ import torch
 from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from .cuda_graph_buffer_debug import (
+    GraphBufferKey,
+    configure_cuda_graph_buffer_debug_from_config,
+    record_cuda_graph_buffer_allocate,
+    record_cuda_graph_buffer_free,
+)
 from .mixed_precision import (
     MixedPrecisionPolicy,
     fp8_discard_transpose_cache,
@@ -520,6 +526,14 @@ class TemporaryBucketAllocator:
             _free_storage(self.buckets[bucket_id].data)
             del self.buckets[bucket_id]
 
+    def get_debug_allocation_slot(self, bucket_id: int):
+        """Return allocator-specific slot metadata for debug tracing."""
+        return None
+
+    def debug_records_free(self, bucket_id: int) -> bool:
+        """Return whether `free(bucket_id)` releases the logical allocation."""
+        return True
+
 
 class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
     """
@@ -629,6 +643,9 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
 
     def _get_gbuf_name(self, buffer_id: int):
         return f"{self.name}_{buffer_id}"
+
+    def get_debug_allocation_slot(self, bucket_id: int):
+        return self.using_buffer.get(bucket_id)
 
     def free(self, bucket_id: int):
         """
@@ -810,6 +827,15 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
     def _get_gbuf_name(self, buf_group_id: int, bucket_index: int):
         return f"{self.name}_{buf_group_id}_{bucket_index}"
 
+    def get_debug_allocation_slot(self, bucket_id: int):
+        return self.using_buffer.get(bucket_id)
+
+    def debug_records_free(self, bucket_id: int) -> bool:
+        fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+        if fsdp_unit_id in self.fsdp_double_buffer_units:
+            return bucket_id in self.using_buffer
+        return not self.fallback_to_persistent_buffer
+
     def free(self, bucket_id: int):
         """
         free a temporary bucket.
@@ -859,6 +885,8 @@ class DataParallelBuffer:
         dp_rank: Optional[int] = None,
         temporary_bucket_allocator: Optional[TemporaryBucketAllocator] = None,
         is_transpose_buffer: bool = False,
+        buffer_kind: str = "unknown",
+        buffer_namespace: str = "default",
         gradient_scaling_factor: Optional[float] = None,
         chunk_size_factor: int = 1,
         mem_alloc_context: Optional[Callable] = None,
@@ -887,6 +915,8 @@ class DataParallelBuffer:
             temporary_bucket_allocator if temporary_bucket_allocator else TemporaryBucketAllocator()
         )
         self.is_transpose_buffer = is_transpose_buffer
+        self.buffer_kind = buffer_kind
+        self.buffer_namespace = buffer_namespace
         self.gradient_scaling_factor = gradient_scaling_factor
         self.mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
         self.chunk_size_factor = chunk_size_factor
@@ -941,6 +971,45 @@ class DataParallelBuffer:
         ), f"Data size mismatch: {data.numel()} != {self.data_size}"
         self.data = data
 
+    def _graph_buffer_key(self) -> GraphBufferKey:
+        allocator_name = getattr(
+            self.temporary_bucket_allocator, "name", type(self.temporary_bucket_allocator).__name__
+        )
+        return GraphBufferKey(
+            namespace=self.buffer_namespace,
+            kind=self.buffer_kind,
+            bucket_id=self.bucket_id,
+            is_transpose=self.is_transpose_buffer,
+            allocator_name=allocator_name,
+        )
+
+    def _debug_allocation_slot(self):
+        get_slot = getattr(self.temporary_bucket_allocator, "get_debug_allocation_slot", None)
+        if get_slot is None:
+            return None
+        return get_slot(self.bucket_id)
+
+    def _record_bucket_allocate(self, bucket: Bucket, source: str) -> None:
+        record_cuda_graph_buffer_allocate(
+            self._graph_buffer_key(),
+            bucket.data,
+            allocator_slot=self._debug_allocation_slot(),
+            source=source,
+        )
+
+    def _record_bucket_free(self, source: str) -> None:
+        record_cuda_graph_buffer_free(
+            self._graph_buffer_key(),
+            allocator_slot=self._debug_allocation_slot(),
+            source=source,
+        )
+
+    def _debug_records_free(self) -> bool:
+        records_free = getattr(self.temporary_bucket_allocator, "debug_records_free", None)
+        if records_free is None:
+            return True
+        return records_free(self.bucket_index.bucket_id)
+
     def fetch_bucket(
         self, dtype: Optional[torch.dtype] = None, set_param_data: bool = False
     ) -> Bucket:
@@ -970,6 +1039,7 @@ class DataParallelBuffer:
                     + bucket_index.size
                 ]
             )
+            self._record_bucket_allocate(bucket, source="fetch_bucket")
         else:
             # Sharded or dtype-custom buffers require un-sharded bucket allocation.
             bucket = self.allocate_bucket_storage(dtype=dtype, device=self.device)
@@ -1074,6 +1144,7 @@ class DataParallelBuffer:
             device=device,
             mem_alloc_context=self.mem_alloc_context,
         )
+        self._record_bucket_allocate(bucket, source="allocate_bucket_storage")
         # Copy Tensor values into Bucket data.
         if init_values is not None:
             assert bucket.data.shape == init_values.flatten().shape, (
@@ -1087,6 +1158,7 @@ class DataParallelBuffer:
         """
         Release the storage of a temporarily-allocated communication bucket.
         """
+        self._record_bucket_free(source="free_bucket_storage")
         self.temporary_bucket_allocator.free(self.bucket_index.bucket_id)
 
     def reset_param_main_grad(self):
@@ -1722,6 +1794,8 @@ class ParamAndGradBuffer:
         )
 
         self.ddp_config = ddp_config
+        configure_cuda_graph_buffer_debug_from_config(self.ddp_config)
+        self._cuda_graph_buffer_namespace = f"param_and_grad_buffer:{id(self)}"
         self.use_decoupled_grad = ddp_config.megatron_fsdp_use_decoupled_grad
         self.module = module
         self.bucketing_policy = bucketing_policy
@@ -2339,6 +2413,8 @@ class ParamAndGradBuffer:
                     data_parallel_group=model_wbuf_dp_group,
                     is_transpose_buffer=False,
                     temporary_bucket_allocator=self.weight_alloc,
+                    buffer_kind="weight_bucket",
+                    buffer_namespace=self._cuda_graph_buffer_namespace,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
@@ -2355,6 +2431,8 @@ class ParamAndGradBuffer:
                         data_parallel_group=main_buf_dp_group,
                         is_transpose_buffer=True,
                         temporary_bucket_allocator=self.transpose_weight_alloc,
+                        buffer_kind="fp8_transpose_bucket",
+                        buffer_namespace=self._cuda_graph_buffer_namespace,
                         bucket_id=group_id,
                         chunk_size_factor=group.chunk_size_factor,
                         mem_alloc_context=self.mem_alloc_context,
@@ -2375,6 +2453,8 @@ class ParamAndGradBuffer:
                     dtype=self.mp_policy.main_params_dtype,
                     device=self.device,
                     data_parallel_group=main_buf_dp_group,
+                    buffer_kind="main_weight",
+                    buffer_namespace=self._cuda_graph_buffer_namespace,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
@@ -2400,6 +2480,8 @@ class ParamAndGradBuffer:
                     data_parallel_group=main_buf_dp_group,
                     is_transpose_buffer=False,
                     temporary_bucket_allocator=self.main_grad_alloc,
+                    buffer_kind="main_grad",
+                    buffer_namespace=self._cuda_graph_buffer_namespace,
                     gradient_scaling_factor=gradient_scaling_factor,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
@@ -2471,6 +2553,8 @@ class ParamAndGradBuffer:
                     is_transpose_buffer=False,
                     # Use the HSDP gradient communication allocator!
                     temporary_bucket_allocator=self.hsdp_grad_comm_alloc,
+                    buffer_kind="hsdp_grad_comm",
+                    buffer_namespace=self._cuda_graph_buffer_namespace,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
                     mem_alloc_context=self.mem_alloc_context,
@@ -3434,6 +3518,8 @@ def _create_hfsdp_helper_buffer(
         device=dp_buffer.device,
         data_parallel_group=inner_dp_group,
         is_transpose_buffer=dp_buffer.is_transpose_buffer,
+        buffer_kind=dp_buffer.buffer_kind,
+        buffer_namespace=dp_buffer.buffer_namespace,
         temporary_bucket_allocator=dp_buffer.temporary_bucket_allocator,
         bucket_id=dp_buffer.bucket_id,
         chunk_size_factor=dp_buffer.chunk_size_factor,

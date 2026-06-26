@@ -23,6 +23,11 @@ import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core import parallel_state
+from megatron.core.distributed.fsdp.src.megatron_fsdp.cuda_graph_buffer_debug import (
+    abort_cuda_graph_buffer_capture,
+    begin_cuda_graph_buffer_capture,
+    finish_cuda_graph_buffer_capture,
+)
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -2903,7 +2908,13 @@ class TECudaGraphHelper:
         if FREEZE_GC:
             gc.freeze()
 
-        self._prepare_fsdp_params_for_capture()
+        stage = "transformer_engine"
+        begin_cuda_graph_buffer_capture(stage)
+        try:
+            self._prepare_fsdp_params_for_capture()
+        except Exception:
+            abort_cuda_graph_buffer_capture(stage)
+            raise
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
         return time.time()
@@ -2933,6 +2944,7 @@ class TECudaGraphHelper:
             f'{time.time() - start_time}s',
         )
         _set_capture_end()
+        finish_cuda_graph_buffer_capture("transformer_engine")
 
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (

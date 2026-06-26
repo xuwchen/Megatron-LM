@@ -7,6 +7,14 @@ import logging
 
 import torch
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.cuda_graph_buffer_debug import (
+    abort_cuda_graph_buffer_capture,
+    assert_cuda_graph_buffer_addresses,
+    begin_cuda_graph_buffer_capture,
+    begin_cuda_graph_buffer_replay,
+    finish_cuda_graph_buffer_capture,
+    finish_cuda_graph_buffer_replay,
+)
 from megatron.core.tensor_parallel.random import get_all_rng_states
 
 logger = logging.getLogger(__name__)
@@ -214,22 +222,35 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
-            with torch.cuda.graph(
-                FullCudaGraphWrapper.cuda_graph[training_str],
-                stream=capture_stream,
-                pool=get_graph_pool(self.use_single_mempool),
-                capture_error_mode="thread_local",
-            ):
-                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
-                    *args, **kwargs
-                )
+            stage = f"full_iteration:{training_str}"
+            begin_cuda_graph_buffer_capture(stage)
+            try:
+                with torch.cuda.graph(
+                    FullCudaGraphWrapper.cuda_graph[training_str],
+                    stream=capture_stream,
+                    pool=get_graph_pool(self.use_single_mempool),
+                    capture_error_mode="thread_local",
+                ):
+                    FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
+                        *args, **kwargs
+                    )
+            except Exception:
+                abort_cuda_graph_buffer_capture(stage)
+                raise
+            finish_cuda_graph_buffer_capture(stage)
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
-            FullCudaGraphWrapper.cuda_graph[training_str].replay()
+            stage = f"full_iteration:{training_str}"
+            begin_cuda_graph_buffer_replay(stage)
+            try:
+                assert_cuda_graph_buffer_addresses(stage)
+                FullCudaGraphWrapper.cuda_graph[training_str].replay()
+            finally:
+                finish_cuda_graph_buffer_replay(stage)
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
 
