@@ -3933,6 +3933,11 @@ class AllGatherPipeline:
             for bwd in [False, True]:
                 self.bucket_can_be_released[self.get_bucket_key(i, bwd)] = False
 
+        # Buckets whose storage address is captured by a CUDA graph. These buckets
+        # may be refreshed in place, but their temporary storage must not be freed
+        # while the graph can replay.
+        self.cuda_graph_pinned_bucket_keys = set()
+
         # Map each bucket to the bucket group it belongs to by enumerated ID.
         # Made to collect a subset of buckets in the same bucket group.
         self.bucket_to_bucket_group = {}
@@ -3963,6 +3968,26 @@ class AllGatherPipeline:
         )
         return (bucket_id, has_transpose_buffer and bwd)
 
+    def pin_cuda_graph_bucket(self, bucket_id, bwd):
+        """Keep bucket storage allocated because a CUDA graph captured its address."""
+        bucket_key = self.get_bucket_key(bucket_id, bwd)
+        self.cuda_graph_pinned_bucket_keys.add(bucket_key)
+        self.bucket_can_be_released[bucket_key] = False
+
+    def clear_cuda_graph_pinned_buckets(self):
+        """Remove CUDA graph storage pins after the corresponding graphs are deleted."""
+        self.cuda_graph_pinned_bucket_keys.clear()
+
+    def _preserve_cuda_graph_pinned_bucket(self, bucket_key, wait: bool = False):
+        """Keep pinned bucket storage allocated and mark it as reusable in place."""
+        self.bucket_can_be_released[bucket_key] = False
+        bucket_id, bwd = bucket_key
+        if wait:
+            self.wait_bucket_ready(bucket_id, bwd, empty_ok=True)
+        if self.bucket_status[bucket_key] in (BucketStatus.EMPTY, BucketStatus.COMMUNICATING):
+            return
+        self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+
     @property
     def num_buckets(self):
         """Return the number of buckets."""
@@ -3992,6 +4017,9 @@ class AllGatherPipeline:
             is_unit_bucket = self.buffer.parameter_groups[bucket_id].fsdp_unit_id is not None
             for bwd in [False, True]:
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
+                if bucket_key in self.cuda_graph_pinned_bucket_keys:
+                    self._preserve_cuda_graph_pinned_bucket(bucket_key)
+                    continue
                 # If preserve_non_fsdp_units is set, then do not release buckets
                 # associated with FSDP non-units. Instead, mark the bucket as PRESERVED
                 # (not NEW) so a later all-gather refreshes preserved non-unit bucket
@@ -4003,7 +4031,7 @@ class AllGatherPipeline:
         self.recycle_unused_buckets()
 
         expected_statuses = (BucketStatus.EMPTY,)
-        if preserve_non_fsdp_units:
+        if preserve_non_fsdp_units or self.cuda_graph_pinned_bucket_keys:
             expected_statuses += (BucketStatus.PRESERVED,)
 
         assert all(status in expected_statuses for status in self.bucket_status.values()), (
@@ -4264,6 +4292,13 @@ class AllGatherPipeline:
         if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
             return
 
+        if bucket_key in self.cuda_graph_pinned_bucket_keys:
+            if lazy:
+                self._preserve_cuda_graph_pinned_bucket(bucket_key)
+                return
+            self._preserve_cuda_graph_pinned_bucket(bucket_key, wait=True)
+            return
+
         if lazy:
             # Mark the bucket can be released later.
             self.bucket_can_be_released[bucket_key] = True
@@ -4284,6 +4319,12 @@ class AllGatherPipeline:
     def recycle_unused_buckets(self):
         """Recycle the unused buckets."""
         for bucket_key, can_be_released in self.bucket_can_be_released.items():
+            if bucket_key in self.cuda_graph_pinned_bucket_keys:
+                if can_be_released:
+                    self._preserve_cuda_graph_pinned_bucket(bucket_key)
+                else:
+                    self.bucket_can_be_released[bucket_key] = False
+                continue
             if can_be_released:
                 bucket_id, is_transpose_weight = bucket_key[0], bucket_key[1]
                 self.release_bucket(bucket_id, is_transpose_weight)
