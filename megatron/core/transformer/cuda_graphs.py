@@ -1463,6 +1463,31 @@ _RESTORE_KEYS = frozenset(
 _CUDA_GRAPH_BACKWARD_HANDLER_ATTR = '_cuda_graph_backward_handler'
 # Set on a forward hook: inner handler goes to backward_pre_hooks (pre-backward).
 _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR = '_cuda_graph_backward_pre_handler'
+# Set on a forward hook: restore after capture, but withhold from TE capture.
+_CUDA_GRAPH_FORWARD_RELEASE_ATTR = '_cuda_graph_forward_release_handler'
+
+
+def _withhold_fsdp_forward_release_hooks(hooks_dict):
+    """Keep FSDP bucket-release hooks out of TE capture while preserving restore copies."""
+    forward_hooks = hooks_dict.get('forward_hooks')
+    if not forward_hooks:
+        return
+
+    release_hook_ids = [
+        hook_id
+        for hook_id, hook_fn in forward_hooks.items()
+        if getattr(hook_fn, _CUDA_GRAPH_FORWARD_RELEASE_ATTR, None) is not None
+    ]
+    forward_hooks_with_kwargs = hooks_dict.get('forward_hooks_with_kwargs')
+    for hook_id in release_hook_ids:
+        del forward_hooks[hook_id]
+        if forward_hooks_with_kwargs is not None:
+            forward_hooks_with_kwargs.pop(hook_id, None)
+
+    if not forward_hooks:
+        del hooks_dict['forward_hooks']
+    if not forward_hooks_with_kwargs:
+        hooks_dict.pop('forward_hooks_with_kwargs', None)
 
 
 class CudaGraphManager(torch.nn.Module):
@@ -2406,6 +2431,7 @@ class TECudaGraphHelper:
                     hooks_dict.pop('forward_pre_hooks_with_kwargs', None)
 
             # 2. forward_hooks: hooks tagged with _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR
+            _withhold_fsdp_forward_release_hooks(hooks_dict)
             fh = hooks_dict.get('forward_hooks')
             if fh:
                 to_remove = []

@@ -974,6 +974,11 @@ class MegatronFSDP(torch.nn.Module):
 
             return output
 
+        # Tag for cuda_graphs.py: restore this hook after capture, but do not
+        # execute it while TE captures graph-owned parameter storage.
+        # Attribute name must match _CUDA_GRAPH_FORWARD_RELEASE_ATTR in cuda_graphs.py.
+        _post_forward._cuda_graph_forward_release_handler = release_module_parameters
+
         @torch.compiler.disable
         def _release_module_fp8_transpose_cache(module: nn.Module, *unused):
             release_params_fp8_transpose_cache(module.parameters(recurse=False))

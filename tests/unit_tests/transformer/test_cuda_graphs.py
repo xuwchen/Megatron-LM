@@ -34,8 +34,10 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _CUDA_GRAPH_FORWARD_RELEASE_ATTR,
     _get_model_with_decoder,
     _layer_is_graphable,
+    _withhold_fsdp_forward_release_hooks,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -138,6 +140,26 @@ def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
 
 
 class TestCudaGraphConfigAndArguments:
+    def test_fsdp_forward_release_hook_is_withheld_from_te_capture(self):
+        def normal_hook(*args):
+            pass
+
+        def release_hook(*args):
+            pass
+
+        setattr(release_hook, _CUDA_GRAPH_FORWARD_RELEASE_ATTR, object())
+        hooks = {
+            'forward_hooks': {1: normal_hook, 2: release_hook},
+            'forward_hooks_with_kwargs': {2: True},
+            'forward_hooks_restore': {1: normal_hook, 2: release_hook},
+        }
+
+        _withhold_fsdp_forward_release_hooks(hooks)
+
+        assert hooks['forward_hooks'] == {1: normal_hook}
+        assert 'forward_hooks_with_kwargs' not in hooks
+        assert hooks['forward_hooks_restore'] == {1: normal_hook, 2: release_hook}
+
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
