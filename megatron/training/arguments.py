@@ -2108,15 +2108,6 @@ def validate_args(args, defaults={}):
         args.cpu_offloading = True
 
     # CUDA Graphs
-    if args.cuda_graph_scope == "full" or (
-        isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
-    ):
-        if isinstance(args.cuda_graph_scope, list):
-            assert args.cuda_graph_scope == ["full"], "full scope cannot be used with other scopes."
-        args.cuda_graph_scope = []
-        warn_rank_0(
-            'full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.'
-        )
     if args.cuda_graph_impl != "none":
         if (
             "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
