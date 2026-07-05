@@ -789,6 +789,14 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                         self.idle_buffer.remove((buf_group_id, bucket_offset))
                         break
 
+            if buffer_name is None and self.fallback_to_persistent_buffer is True:
+                # Pool exhausted (e.g. CUDA-graph capture withholds release hooks
+                # while warmup prefetch keeps gathering): spill to a per-bucket
+                # persistent buffer instead of failing. Address is stable, at the
+                # cost of that bucket staying resident.
+                buffer_name = (
+                    f"{self.name}_fixed_pool_exhausted_{bucket_id}_{size}_{dtype}_{device}"
+                )
             assert buffer_name is not None, (
                 f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
                 f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
