@@ -2873,12 +2873,13 @@ class TECudaGraphHelper:
         """
         for fsdp_module in self._get_megatron_fsdp_instances():
             # Drain in-flight gathers and release unit buckets so the plan is
-            # frozen from a clean, fully-released pool state.
-            if hasattr(fsdp_module, 'synchronize_param_gather'):
-                fsdp_module.synchronize_param_gather()
+            # frozen from a clean, fully-released pool state. Do NOT call
+            # synchronize_param_gather() here: it re-exposes DTensor params and
+            # would undo _prepare_fsdp_params_for_capture's raw switch.
             ag_pipeline = getattr(fsdp_module, 'all_gather_pipeline', None)
             if ag_pipeline is not None and hasattr(ag_pipeline, 'reset'):
                 ag_pipeline.reset(preserve_non_fsdp_units=True)
+            fsdp_module._replace_param_with_raw_if_needed()
 
             pgb = fsdp_module.param_and_grad_buffer
             graph_bucket_ids = set()
