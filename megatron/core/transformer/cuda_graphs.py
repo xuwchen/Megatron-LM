@@ -2860,6 +2860,53 @@ class TECudaGraphHelper:
             self._fsdp_capture_param_states.append((fsdp_module, was_distributed))
             fsdp_module._replace_param_with_raw_if_needed()
 
+    def _setup_fsdp_graph_arena(self):
+        """Freeze planned-arena slots for graph-covered FSDP buckets and pre-gather them.
+
+        Per-layer TE graphs bake absolute device pointers of the all-gathered
+        weight buckets (and fused-wgrad main_grad buckets). The double-buffer
+        pool assigns slots by runtime allocate/free order, which is not stable
+        across capture/replay/eval. Freeze a lifetime-colored plan derived from
+        the eager warmup schedule so every graph-covered bucket resolves to an
+        iteration-stable arena slot, then all-gather those buckets so capture
+        records the planned addresses.
+        """
+        for fsdp_module in self._get_megatron_fsdp_instances():
+            # Drain in-flight gathers and release unit buckets so the plan is
+            # frozen from a clean, fully-released pool state.
+            if hasattr(fsdp_module, 'synchronize_param_gather'):
+                fsdp_module.synchronize_param_gather()
+            ag_pipeline = getattr(fsdp_module, 'all_gather_pipeline', None)
+            if ag_pipeline is not None and hasattr(ag_pipeline, 'reset'):
+                ag_pipeline.reset(preserve_non_fsdp_units=True)
+
+            pgb = fsdp_module.param_and_grad_buffer
+            graph_bucket_ids = set()
+            for callable_module in self.flattened_callables:
+                if not isinstance(callable_module, torch.nn.Module):
+                    continue
+                for param in callable_module.parameters():
+                    orig_param = getattr(param, 'orig_param', param)
+                    group_id = pgb.param_to_param_group.get(orig_param)
+                    if group_id is not None:
+                        graph_bucket_ids.add(group_id)
+            if not graph_bucket_ids:
+                continue
+            for alloc in (
+                getattr(pgb, 'weight_alloc', None),
+                getattr(pgb, 'transpose_weight_alloc', None),
+                getattr(pgb, 'main_grad_alloc', None),
+            ):
+                if alloc is not None and hasattr(alloc, 'freeze_graph_arena_plan'):
+                    alloc.freeze_graph_arena_plan(graph_bucket_ids)
+            # Pre-gather graph-covered weight buckets so TE capture bakes the
+            # planned arena addresses.
+            for bucket_id in sorted(graph_bucket_ids):
+                param_group = pgb.parameter_groups[bucket_id]
+                fsdp_module.all_gather_and_wait_parameters_ready(
+                    param_group.params, prefetch=False
+                )
+
     def _restore_fsdp_params_after_capture(self):
         """Restore Megatron-FSDP parameter exposure after CUDA graph capture."""
         for fsdp_module, was_distributed in reversed(self._fsdp_capture_param_states):
@@ -2882,6 +2929,7 @@ class TECudaGraphHelper:
             gc.freeze()
 
         self._prepare_fsdp_params_for_capture()
+        self._setup_fsdp_graph_arena()
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
         return time.time()

@@ -726,6 +726,20 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
         self.backup_allocator = StorageResizeBasedBucketAllocator()
 
+        # --- Planned graph arena (CUDA-graph address stability) ---
+        # Until a plan is frozen, allocate/free order of pool-eligible buckets is
+        # recorded so that graph-covered buckets can be lifetime-colored at CUDA
+        # graph capture time. Once frozen, planned buckets always resolve to
+        # their arena slot (a dedicated persistent global buffer per color),
+        # giving every CUDA-graph-captured bucket an iteration-stable address
+        # while still sharing storage between buckets whose lifetimes never
+        # overlap. Non-planned buckets keep using the rotating fixed pool.
+        self._lifetime_events = []  # [(op, bucket_id)] with op in {'alloc', 'free'}
+        self._recording_lifetimes = True
+        self._graph_arena_plan = None  # {bucket_id: color}
+        self._graph_arena_num_colors = 0
+        self._graph_arena_using = {}  # {(color, bucket_offset): bucket_id}
+
     def _is_two_bucket_group_equal(self, group_a, group_b):
         # Check if two bucket groups are equivalent in dtype and size.
         if len(group_a) != len(group_b):
@@ -752,6 +766,12 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         allocate a temporary bucket.
         """
         fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+        if self._graph_arena_plan is not None and bucket_id in self._graph_arena_plan:
+            return self._allocate_from_graph_arena(
+                bucket_id, size, dtype, device, mem_alloc_context
+            )
+        if self._recording_lifetimes and fsdp_unit_id in self.fsdp_double_buffer_units:
+            self._lifetime_events.append(('alloc', bucket_id))
         if fsdp_unit_id in self.fsdp_double_buffer_units:
             # Try to allocate from the buffer pool.
             bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
@@ -806,11 +826,140 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
     def _get_gbuf_name(self, buf_group_id: int, bucket_index: int):
         return f"{self.name}_{buf_group_id}_{bucket_index}"
 
+    def _bucket_offset(self, bucket_id: int) -> int:
+        fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+        return self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
+
+    def _allocate_from_graph_arena(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> Bucket:
+        """Resolve a planned bucket to its frozen arena slot (stable address)."""
+        color = self._graph_arena_plan[bucket_id]
+        bucket_offset = self._bucket_offset(bucket_id)
+        slot = (color, bucket_offset)
+        occupant = self._graph_arena_using.get(slot)
+        if occupant is not None and occupant != bucket_id:
+            raise RuntimeError(
+                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] graph arena slot "
+                f"conflict: bucket {bucket_id} needs slot {slot} but it is held by bucket "
+                f"{occupant}. The frozen lifetime plan does not cover the current "
+                f"allocation order (e.g. an eval/checkpoint schedule overlapping two "
+                f"same-color buckets). Refusing to fall back silently."
+            )
+        self._graph_arena_using[slot] = bucket_id
+        buffer_name = f"{self.name}_graph_arena_{color}_{bucket_offset}"
+        if mem_alloc_context is not None and mem_alloc_context != nullcontext:
+            if (
+                self.allocation_tracker.get((buffer_name, dtype), None) is None
+                or self.allocation_tracker[(buffer_name, dtype)] < size
+            ):
+                self.allocation_tracker[(buffer_name, dtype)] = size
+                torch.cuda.synchronize()
+        return Bucket(
+            data=get_global_memory_buffer().get_tensor(
+                [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
+            )
+        )
+
+    def freeze_graph_arena_plan(self, graph_bucket_ids) -> None:
+        """Color graph-covered buckets by recorded lifetimes and freeze the plan.
+
+        Buckets sharing a color never had overlapping live ranges in the recorded
+        (warmup) schedule, so they can share one persistent arena buffer while
+        every individual bucket keeps an iteration-stable address for CUDA graph
+        capture/replay. Conflicts at runtime raise instead of falling back.
+        """
+        eligible = sorted(
+            b
+            for b in graph_bucket_ids
+            if self.fsdp_param_groups[b].fsdp_unit_id in self.fsdp_double_buffer_units
+        )
+        if not eligible:
+            self._recording_lifetimes = False
+            return
+        if self._graph_arena_plan is not None:
+            missing = [b for b in eligible if b not in self._graph_arena_plan]
+            assert not missing, (
+                f"[FSDP][{self.name}] graph arena plan already frozen but new graph "
+                f"buckets appeared: {missing}"
+            )
+            return
+
+        # Build per-bucket lifetime intervals from the recorded event order.
+        intervals = defaultdict(list)
+        open_t = {}
+        for t, (op, b) in enumerate(self._lifetime_events):
+            if op == 'alloc':
+                open_t.setdefault(b, t)
+            elif b in open_t:
+                intervals[b].append((open_t.pop(b), t))
+        tail = len(self._lifetime_events)
+        for b, t0 in open_t.items():
+            intervals[b].append((t0, tail))
+
+        # Conflict edges only matter between buckets at the same bucket_offset
+        # (different offsets never share an arena buffer name).
+        plan = {}
+        num_colors = 0
+        by_offset = defaultdict(list)
+        for b in eligible:
+            by_offset[self._bucket_offset(b)].append(b)
+        for offset, buckets in by_offset.items():
+            def overlaps(x, y):
+                for s1, e1 in intervals.get(x, []):
+                    for s2, e2 in intervals.get(y, []):
+                        if s1 < e2 and s2 < e1:
+                            return True
+                return False
+
+            conflicts = {b: set() for b in buckets}
+            for i, x in enumerate(buckets):
+                for y in buckets[i + 1 :]:
+                    # A bucket never observed during warmup conservatively
+                    # conflicts with everything at its offset.
+                    if not intervals.get(x) or not intervals.get(y) or overlaps(x, y):
+                        conflicts[x].add(y)
+                        conflicts[y].add(x)
+            for b in sorted(buckets, key=lambda b: -len(conflicts[b])):
+                used = {plan[n] for n in conflicts[b] if n in plan}
+                color = 0
+                while color in used:
+                    color += 1
+                plan[b] = color
+                num_colors = max(num_colors, color + 1)
+
+        self._graph_arena_plan = plan
+        self._graph_arena_num_colors = num_colors
+        self._recording_lifetimes = False
+        self._lifetime_events = []
+        if torch.distributed.get_rank() == 0:
+            logging.info(
+                f"[FSDP][{self.name}] graph arena plan frozen: {len(plan)} buckets -> "
+                f"{num_colors} arena slot color(s); pool keeps serving "
+                f"{len(self.fsdp_param_groups) - len(plan)} other buckets."
+            )
+
     def free(self, bucket_id: int):
         """
         free a temporary bucket.
         """
         fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+        if self._graph_arena_plan is not None and bucket_id in self._graph_arena_plan:
+            slot = (self._graph_arena_plan[bucket_id], self._bucket_offset(bucket_id))
+            if self._graph_arena_using.get(slot) == bucket_id:
+                del self._graph_arena_using[slot]
+            # Clean up a pre-plan pool assignment, if any.
+            if bucket_id in self.using_buffer:
+                self.idle_buffer.append(self.using_buffer[bucket_id])
+                del self.using_buffer[bucket_id]
+            return
+        if self._recording_lifetimes and fsdp_unit_id in self.fsdp_double_buffer_units:
+            self._lifetime_events.append(('free', bucket_id))
         if fsdp_unit_id in self.fsdp_double_buffer_units:
             if bucket_id not in self.using_buffer:
                 # This bucket is not allocated by fixed pool allocator.
