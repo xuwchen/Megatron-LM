@@ -2887,12 +2887,24 @@ class TECudaGraphHelper:
                 if not isinstance(callable_module, torch.nn.Module):
                     continue
                 for param in callable_module.parameters():
-                    orig_param = getattr(param, 'orig_param', param)
-                    group_id = pgb.param_to_param_group.get(orig_param)
+                    group_id = pgb.param_to_param_group.get(param)
+                    if group_id is None:
+                        group_id = pgb.param_to_param_group.get(
+                            getattr(param, 'orig_param', param)
+                        )
                     if group_id is not None:
                         graph_bucket_ids.add(group_id)
             if not graph_bucket_ids:
+                logger.warning(
+                    'TECudaGraphHelper: no FSDP buckets resolved for graph-covered '
+                    'layers; planned graph arena NOT active. CUDA graph replay may '
+                    'read stale double-buffer addresses.'
+                )
                 continue
+            logger.warning(
+                f'TECudaGraphHelper: planned graph arena covers '
+                f'{len(graph_bucket_ids)} FSDP bucket(s).'
+            )
             for alloc in (
                 getattr(pgb, 'weight_alloc', None),
                 getattr(pgb, 'transpose_weight_alloc', None),

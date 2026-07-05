@@ -938,7 +938,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self._recording_lifetimes = False
         self._lifetime_events = []
         if torch.distributed.get_rank() == 0:
-            logging.info(
+            logging.warning(
                 f"[FSDP][{self.name}] graph arena plan frozen: {len(plan)} buckets -> "
                 f"{num_colors} arena slot color(s); pool keeps serving "
                 f"{len(self.fsdp_param_groups) - len(plan)} other buckets."
