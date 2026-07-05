@@ -460,6 +460,13 @@ class MegatronFSDP(torch.nn.Module):
         if self.data_parallel_sharding_strategy == "no_shard":
             return
 
+        # During CUDA graph capture, release hooks are withheld, so prefetched
+        # neighbor buckets can never be returned to the fixed pool and would
+        # spill to persistent buffers (leaking memory). Gather only what is
+        # explicitly requested.
+        if prefetch and is_graph_capturing():
+            prefetch = False
+
         ag_pipeline = self.all_gather_pipeline
         # Only all-gather HSDP buffer parameters in the beginning of a new optimization
         # step cycle, or on every step if model_auto_sync is enabled, i.e. update

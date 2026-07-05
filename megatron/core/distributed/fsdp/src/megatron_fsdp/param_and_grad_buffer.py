@@ -739,6 +739,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self._graph_arena_plan = None  # {bucket_id: color}
         self._graph_arena_num_colors = 0
         self._graph_arena_using = {}  # {(color, bucket_offset): bucket_id}
+        self._spilled_buffer_names = set()  # pool-exhausted spills (observability)
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
         # Check if two bucket groups are equivalent in dtype and size.
@@ -797,6 +798,18 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 buffer_name = (
                     f"{self.name}_fixed_pool_exhausted_{bucket_id}_{size}_{dtype}_{device}"
                 )
+                if buffer_name not in self._spilled_buffer_names:
+                    # Persistent spills are never reclaimed (GlobalMemoryBuffer only
+                    # grows) — surface each one so memory growth is never silent.
+                    self._spilled_buffer_names.add(buffer_name)
+                    nbytes = size * torch.empty((), dtype=dtype).element_size()
+                    print(
+                        f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
+                        f"fixed pool exhausted: spilling bucket {bucket_id} to a "
+                        f"persistent buffer ({nbytes / (1 << 20):.1f} MiB, "
+                        f"spill #{len(self._spilled_buffer_names)})",
+                        flush=True,
+                    )
             assert buffer_name is not None, (
                 f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
                 f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
@@ -953,10 +966,11 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 f"eligible={eligible}",
                 flush=True,
             )
-            logging.warning(
+            print(
                 f"[FSDP][{self.name}] graph arena plan frozen: {len(plan)} buckets -> "
                 f"{num_colors} arena slot color(s); pool keeps serving "
-                f"{len(self.fsdp_param_groups) - len(plan)} other buckets."
+                f"{len(self.fsdp_param_groups) - len(plan)} other buckets.",
+                flush=True,
             )
 
     def free(self, bucket_id: int):
