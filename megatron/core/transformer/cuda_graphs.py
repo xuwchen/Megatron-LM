@@ -2894,17 +2894,16 @@ class TECudaGraphHelper:
                         )
                     if group_id is not None:
                         graph_bucket_ids.add(group_id)
-            if not graph_bucket_ids:
-                logger.warning(
-                    'TECudaGraphHelper: no FSDP buckets resolved for graph-covered '
-                    'layers; planned graph arena NOT active. CUDA graph replay may '
-                    'read stale double-buffer addresses.'
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f'[TECudaGraphHelper] graph arena setup: '
+                    f'{len(self.flattened_callables)} callables -> '
+                    f'{len(graph_bucket_ids)} FSDP bucket(s): '
+                    f'{sorted(graph_bucket_ids)}',
+                    flush=True,
                 )
+            if not graph_bucket_ids:
                 continue
-            logger.warning(
-                f'TECudaGraphHelper: planned graph arena covers '
-                f'{len(graph_bucket_ids)} FSDP bucket(s).'
-            )
             for alloc in (
                 getattr(pgb, 'weight_alloc', None),
                 getattr(pgb, 'transpose_weight_alloc', None),

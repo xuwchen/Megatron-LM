@@ -794,7 +794,9 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
                 f"bucket_offset: {bucket_offset} \n"
                 f"current using_buffer: {self.using_buffer} \n"
-                f"current idle_buffer: {self.idle_buffer}"
+                f"current idle_buffer: {self.idle_buffer} \n"
+                f"graph_arena_plan: {self._graph_arena_plan} \n"
+                f"graph_arena_using: {self._graph_arena_using}"
             )
         elif self.fallback_to_persistent_buffer is True:
             buffer_name = f"{self.name}_not_fit_in_fixed_pool_{bucket_id}_{size}_{dtype}_{device}"
@@ -938,6 +940,11 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self._recording_lifetimes = False
         self._lifetime_events = []
         if torch.distributed.get_rank() == 0:
+            print(
+                f"[FSDP][{self.name}] graph arena events={len(self._lifetime_events)} "
+                f"eligible={eligible}",
+                flush=True,
+            )
             logging.warning(
                 f"[FSDP][{self.name}] graph arena plan frozen: {len(plan)} buckets -> "
                 f"{num_colors} arena slot color(s); pool keeps serving "
