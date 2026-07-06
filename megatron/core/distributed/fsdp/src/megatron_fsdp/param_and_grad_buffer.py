@@ -725,6 +725,8 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
         self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
         self.backup_allocator = StorageResizeBasedBucketAllocator()
+        # Pool-exhausted spills to persistent buffers (observability).
+        self._spilled_buffer_names = set()
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
         # Check if two bucket groups are equivalent in dtype and size.
@@ -769,6 +771,26 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                         self.idle_buffer.remove((buf_group_id, bucket_offset))
                         break
 
+            if buffer_name is None and self.fallback_to_persistent_buffer is True:
+                # Pool exhausted (e.g. CUDA-graph capture withholds release hooks
+                # while prefetch keeps gathering): spill to a per-bucket persistent
+                # buffer instead of failing, matching the documented semantics of
+                # fsdp_db_use_persist_buf_on_alloc_fail. Address is stable, at the
+                # cost of that bucket staying resident. Persistent spills are never
+                # reclaimed (the global memory buffer only grows), so surface each
+                # first-time spill instead of growing memory silently.
+                buffer_name = (
+                    f"{self.name}_fixed_pool_exhausted_{bucket_id}_{size}_{dtype}_{device}"
+                )
+                if buffer_name not in self._spilled_buffer_names:
+                    self._spilled_buffer_names.add(buffer_name)
+                    nbytes = size * torch.empty((), dtype=dtype).element_size()
+                    logging.warning(
+                        f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
+                        f"fixed pool exhausted: spilling bucket {bucket_id} to a "
+                        f"persistent buffer ({nbytes / (1 << 20):.1f} MiB, "
+                        f"spill #{len(self._spilled_buffer_names)})"
+                    )
             assert buffer_name is not None, (
                 f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
                 f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
