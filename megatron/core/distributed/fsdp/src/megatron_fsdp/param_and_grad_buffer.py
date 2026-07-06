@@ -655,6 +655,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         fsdp_param_groups: List["ParameterGroup"],
         size: int = 2,
         fallback_to_persistent_buffer: bool = False,
+        generalized: bool = False,
     ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
@@ -669,16 +670,30 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             fsdp_unit_buckets[param_group.fsdp_unit_id].append(bucket_id)
         self.fsdp_unit_buckets = fsdp_unit_buckets
 
-        # Identify the largest group of FSDP units that share the same buffer storage.
-        fsdp_units_to_double_buffer = []
-        for fsdp_unit_id, bucket_ids in fsdp_unit_buckets.items():
-            same_storage_fsdp_units = []
-            for i in fsdp_unit_buckets:
-                if self._is_two_bucket_group_equal(fsdp_unit_buckets[i], bucket_ids):
-                    same_storage_fsdp_units.append(i)
-            # Track the largest group of FSDP units sharing the same buffer storage
-            if len(same_storage_fsdp_units) > len(fsdp_units_to_double_buffer):
-                fsdp_units_to_double_buffer = same_storage_fsdp_units
+        if generalized:
+            # Generalized pool: EVERY FSDP unit rotates through the pool. Slot
+            # capacity converges to the largest tenant per (slot, dtype) via
+            # GlobalMemoryBuffer's grow-on-demand (growth changes the slot's
+            # address, which is safe for eager tenants — they re-fetch on every
+            # allocate — and CUDA-graph-covered buckets never live here: the
+            # graph arena claims them). This removes the
+            # largest-homogeneous-group restriction that used to push every
+            # heterogeneous unit (attention layers among GDN, vision towers)
+            # onto per-bucket persistent buffers, whose footprint grows
+            # linearly with layer count. Not used with NCCL user buffers:
+            # UB registration cannot tolerate grow-realloc.
+            fsdp_units_to_double_buffer = sorted(fsdp_unit_buckets.keys())
+        else:
+            # Identify the largest group of FSDP units that share the same buffer storage.
+            fsdp_units_to_double_buffer = []
+            for fsdp_unit_id, bucket_ids in fsdp_unit_buckets.items():
+                same_storage_fsdp_units = []
+                for i in fsdp_unit_buckets:
+                    if self._is_two_bucket_group_equal(fsdp_unit_buckets[i], bucket_ids):
+                        same_storage_fsdp_units.append(i)
+                # Track the largest group of FSDP units sharing the same buffer storage
+                if len(same_storage_fsdp_units) > len(fsdp_units_to_double_buffer):
+                    fsdp_units_to_double_buffer = same_storage_fsdp_units
 
         # --- Fixed Pool Buffering Check ---
         # Ensure there is at least one group of FSDP units eligible for fixed pool buffering.
@@ -717,8 +732,10 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.using_buffer = {}  # Map from bucket_id to (buf_group_id, offset) in use.
 
         # Populate the idle buffer pool with all buffer group and bucket offset combinations.
+        num_bucket = max(
+            len(self.fsdp_unit_buckets[u]) for u in self.fsdp_double_buffer_units
+        )
         for buf_group_id in range(self.size):  # Iterate over each buffer group in the pool.
-            num_bucket = len(self.fsdp_unit_buckets[self.fsdp_double_buffer_units[0]])
             for bucket_offset in range(num_bucket):
                 self.idle_buffer.append((buf_group_id, bucket_offset))
 
@@ -853,6 +870,16 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
         return self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
 
+    def _bucket_family(self, bucket_id: int):
+        """(dtype, unpadded numel) — arena colormates must share a family.
+
+        Arena slots are named global buffers whose storage grows (and therefore
+        MOVES) when a larger tenant arrives; graph-baked addresses cannot
+        tolerate that, so buckets of different sizes never share a color.
+        """
+        pg = self.fsdp_param_groups[bucket_id]
+        return (pg.dtype, sum(p.numel() for p in pg.params))
+
     def _allocate_from_graph_arena(
         self,
         bucket_id: int,
@@ -953,9 +980,12 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             for i, x in enumerate(buckets):
                 for y in buckets[i + 1 :]:
                     # A bucket never observed during warmup conservatively
-                    # conflicts with everything at its offset.
+                    # conflicts with everything at its offset. Different
+                    # size/dtype families never share (slot growth moves the
+                    # storage, invalidating graph-baked addresses).
                     if (
                         capture_resident
+                        or self._bucket_family(x) != self._bucket_family(y)
                         or not intervals.get(x)
                         or not intervals.get(y)
                         or overlaps(x, y)
@@ -2421,12 +2451,14 @@ class ParamAndGradBuffer:
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                generalized=not self.ddp_config.nccl_ub,
             )
             self.transpose_weight_alloc = FixedPoolAllocator(
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                generalized=not self.ddp_config.nccl_ub,
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads",
@@ -2435,6 +2467,7 @@ class ParamAndGradBuffer:
                 fallback_to_persistent_buffer=(
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                 ),
+                generalized=not self.ddp_config.nccl_ub,
             )
             if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
@@ -2448,6 +2481,7 @@ class ParamAndGradBuffer:
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                     ),
+                    generalized=not self.ddp_config.nccl_ub,
                 )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
