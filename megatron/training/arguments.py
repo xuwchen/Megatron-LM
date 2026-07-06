@@ -2124,18 +2124,17 @@ def validate_args(args, defaults={}):
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
         if args.cuda_graph_impl != "full_iteration" and args.use_megatron_fsdp:
-            assert args.fsdp_double_buffer, (
-                "CUDA Graph requires --fsdp-double-buffer when using Megatron-FSDP. "
-                "Without double buffer, FSDP parameter buffers addresses are dynamic across "
-                "iterations, causing numerical errors during graph replay."
-            )
-            assert args.fsdp_db_use_persist_buf_on_alloc_fail, (
-                "CUDA Graph with Megatron-FSDP and MoE requires "
-                "--fsdp-db-use-persist-buf-on-alloc-fail. This is to prevent failed allocation "
-                "goes to a dynamic buffer, causing illegal memory access during graph replay. "
-                "You may disable this assertion if you are sure there is no allocation failure "
-                "in the CUDA graph scope."
-            )
+            # Address stability for graph-covered buckets is provided by the
+            # PlannedBucketAllocator wrapper (active whenever Megatron-FSDP
+            # runs with CUDA graphs), independent of the double-buffer pool
+            # choice. The persistent-spill fallback is only meaningful for the
+            # fixed pool itself.
+            if args.fsdp_double_buffer:
+                assert args.fsdp_db_use_persist_buf_on_alloc_fail, (
+                    "CUDA Graph with Megatron-FSDP and --fsdp-double-buffer requires "
+                    "--fsdp-db-use-persist-buf-on-alloc-fail, so that a pool-exhausted "
+                    "allocation spills to a persistent buffer instead of failing."
+                )
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
