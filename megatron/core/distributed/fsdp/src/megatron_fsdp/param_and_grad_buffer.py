@@ -971,6 +971,29 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 num_colors = max(num_colors, color + 1)
 
         num_events = len(self._lifetime_events)
+        # Per-offset peak-live diagnostics: how many same-offset buckets are
+        # simultaneously live in the recorded schedule. peak << colors points
+        # at a coloring-input problem; peak == colors means the schedule
+        # genuinely holds that many buckets live at once.
+        diag = []
+        for offset, buckets in sorted(by_offset.items()):
+            points = []
+            for b in buckets:
+                for st, en in intervals.get(b, []):
+                    points.append((st, 1))
+                    points.append((en, -1))
+            points.sort()
+            live = peak = 0
+            for _, delta in points:
+                live += delta
+                peak = max(peak, live)
+            colors_here = len({plan[b] for b in buckets})
+            n_intervals = sum(len(intervals.get(b, [])) for b in buckets)
+            n_unobserved = sum(1 for b in buckets if not intervals.get(b))
+            diag.append(
+                f"off{offset}: n={len(buckets)} colors={colors_here} "
+                f"peak_live={peak} intervals={n_intervals} unobserved={n_unobserved}"
+            )
         self._graph_arena_plan = plan
         self._graph_arena_num_colors = num_colors
         self._recording_lifetimes = False
@@ -978,7 +1001,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         if torch.distributed.get_rank() == 0:
             print(
                 f"[FSDP][{self.name}] graph arena events={num_events} "
-                f"eligible={eligible}",
+                f"eligible={eligible} | " + " | ".join(diag),
                 flush=True,
             )
             print(
