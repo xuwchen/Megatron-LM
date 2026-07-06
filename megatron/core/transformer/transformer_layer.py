@@ -1197,10 +1197,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Captured forward needs attention-side static input only when this
         # layer's attention is inside the captured scope.
-        attn_in_graph = not isinstance(self.self_attention, IdentityOp) and (
-            not self.config.cuda_graph_modules
-            or CudaGraphModule.attn in self.config.cuda_graph_modules
-        )
+        attn_in_graph = not isinstance(
+            self.self_attention, IdentityOp
+        ) and self._cuda_graph_captures_attention()
 
         if self._is_thd_cuda_graph():
             if attn_in_graph:
@@ -1275,7 +1274,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return super()._get_submodules_under_cudagraphs()
 
         submodules = []
-        if CudaGraphModule.attn in self.config.cuda_graph_modules:
+        if self._cuda_graph_captures_attention():
             submodules += [
                 self.input_layernorm,
                 self.self_attention,
@@ -1337,6 +1336,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         kwargs['packed_seq_params'] = packed_seq_params
 
+    def _cuda_graph_captures_attention(self) -> bool:
+        """Whether this layer's attention block lies inside its TE CUDA graph region.
+
+        Per-layer refinement of the global ``cuda_graph_modules`` scope: attention
+        modules that cannot replay safely under TE graphs (e.g. GatedDeltaNet's
+        ``supports_te_cuda_graph = False``) are kept eager while the rest of the
+        layer's scoped region (MoE router/preprocess) is still captured.
+        """
+        if self.config.cuda_graph_modules and (
+            CudaGraphModule.attn not in self.config.cuda_graph_modules
+        ):
+            return False
+        return getattr(self.self_attention, 'supports_te_cuda_graph', True)
+
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """
         CUDA Graph capture for this layer using TE interface.
@@ -1361,10 +1374,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states = self.off_interface.backward_record(hidden_states)
                 kwargs["hidden_states"] = hidden_states
         context = None
-        if (
-            not self.config.cuda_graph_modules
-            or CudaGraphModule.attn in self.config.cuda_graph_modules
-        ):
+        if self._cuda_graph_captures_attention():
             hidden_states, context = self._forward_attention(*args, **kwargs)
         else:
             if len(args) > 0:
@@ -1412,10 +1422,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         context = None
         padding_mask = kwargs.get("padding_mask", None)
-        if (
-            self.config.cuda_graph_modules
-            and CudaGraphModule.attn not in self.config.cuda_graph_modules
-        ):
+        if not self._cuda_graph_captures_attention():
             input_ids = kwargs.get("input_ids", None)
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
