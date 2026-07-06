@@ -2914,27 +2914,26 @@ class TECudaGraphHelper:
                 )
             if not graph_bucket_ids:
                 continue
-            # Weight (and fp8-transpose) buckets stay gathered for the whole
-            # capture window (release hooks are withheld; TE captures all
-            # forwards before all backwards), so their plan must give every
-            # bucket its own slot. Grad buckets are freed during capture by
-            # the fused-wgrad protocol and keep pure lifetime coloring.
-            for alloc, capture_resident in (
-                (getattr(pgb, 'weight_alloc', None), True),
-                (getattr(pgb, 'transpose_weight_alloc', None), True),
+            # The capture protocol drives per-callable gather/release through
+            # capture_time hooks (fwd-pre unshard, fwd-post release, rerouted
+            # bwd-pre unshard and bwd-post release), so capture-window residency
+            # matches the steady-state schedule and pure lifetime coloring holds
+            # for all arenas. Each hook-driven gather resolves through the frozen
+            # plan, so TE bakes the planned addresses without any pre-gather.
+            # MEGATRON_CG_ARENA_CAPTURE_RESIDENT=1 restores one-color-per-bucket
+            # weight arenas (and disables slot sharing) as a fallback.
+            capture_resident = (
+                os.environ.get('MEGATRON_CG_ARENA_CAPTURE_RESIDENT', '0') == '1'
+            )
+            for alloc, resident in (
+                (getattr(pgb, 'weight_alloc', None), capture_resident),
+                (getattr(pgb, 'transpose_weight_alloc', None), capture_resident),
                 (getattr(pgb, 'main_grad_alloc', None), False),
             ):
                 if alloc is not None and hasattr(alloc, 'freeze_graph_arena_plan'):
                     alloc.freeze_graph_arena_plan(
-                        graph_bucket_ids, capture_resident=capture_resident
+                        graph_bucket_ids, capture_resident=resident
                     )
-            # Pre-gather graph-covered weight buckets so TE capture bakes the
-            # planned arena addresses.
-            for bucket_id in sorted(graph_bucket_ids):
-                param_group = pgb.parameter_groups[bucket_id]
-                fsdp_module.all_gather_and_wait_parameters_ready(
-                    param_group.params, prefetch=False
-                )
 
     def _restore_fsdp_params_after_capture(self):
         """Restore Megatron-FSDP parameter exposure after CUDA graph capture."""
