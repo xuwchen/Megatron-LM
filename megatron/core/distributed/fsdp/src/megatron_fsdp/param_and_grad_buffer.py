@@ -970,13 +970,14 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 plan[b] = color
                 num_colors = max(num_colors, color + 1)
 
+        num_events = len(self._lifetime_events)
         self._graph_arena_plan = plan
         self._graph_arena_num_colors = num_colors
         self._recording_lifetimes = False
         self._lifetime_events = []
         if torch.distributed.get_rank() == 0:
             print(
-                f"[FSDP][{self.name}] graph arena events={len(self._lifetime_events)} "
+                f"[FSDP][{self.name}] graph arena events={num_events} "
                 f"eligible={eligible}",
                 flush=True,
             )
