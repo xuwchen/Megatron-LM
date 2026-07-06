@@ -38,6 +38,7 @@ try:
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
     )
+    from megatron.core.transformer.cuda_graphs import is_graph_capturing
     from megatron.core.utils import is_submodule
 
     logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
@@ -46,6 +47,9 @@ except ImportError:
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import is_submodule
+
+    def is_graph_capturing():
+        return torch.cuda.is_current_stream_capturing()
 
 
 class TrainingState(Enum):
@@ -451,6 +455,13 @@ class MegatronFSDP(torch.nn.Module):
         """
         if self.data_parallel_sharding_strategy == "no_shard":
             return
+
+        # During CUDA graph capture, release hooks are withheld, so prefetched
+        # neighbor buckets can never be returned to the fixed pool and would
+        # spill to persistent buffers (leaking memory). Gather only what is
+        # explicitly requested.
+        if prefetch and is_graph_capturing():
+            prefetch = False
 
         ag_pipeline = self.all_gather_pipeline
         # Only all-gather HSDP buffer parameters in the beginning of a new optimization
