@@ -756,6 +756,13 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self._graph_arena_plan = None  # {bucket_id: color}
         self._graph_arena_num_colors = 0
         self._graph_arena_using = {}  # {(color, bucket_offset): bucket_id}
+        # Exact allocation sizes/dtypes observed during the recording window.
+        # allocate() receives the padded bucket size, so these are ground truth
+        # (no padding-rule prediction involved).
+        self._observed_alloc_meta = {}  # {bucket_id: (size, dtype)}
+        # Materialized capacity per arena slot; a request beyond capacity would
+        # grow (and MOVE) the named buffer, so it raises instead.
+        self._arena_slot_capacity = {}  # {(color, bucket_offset): numel}
         self._spilled_buffer_names = set()  # pool-exhausted spills (observability)
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
@@ -790,6 +797,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             )
         if self._recording_lifetimes and fsdp_unit_id in self.fsdp_double_buffer_units:
             self._lifetime_events.append(('alloc', bucket_id))
+            self._observed_alloc_meta[bucket_id] = (size, dtype)
         if fsdp_unit_id in self.fsdp_double_buffer_units:
             # Try to allocate from the buffer pool.
             bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
@@ -870,15 +878,13 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
         return self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
 
-    def _bucket_family(self, bucket_id: int):
-        """(dtype, unpadded numel) — arena colormates must share a family.
+    def _observed_dtype(self, bucket_id: int):
+        """dtype observed at allocate time (None if never observed)."""
+        meta = self._observed_alloc_meta.get(bucket_id)
+        return meta[1] if meta else None
 
-        Arena slots are named global buffers whose storage grows (and therefore
-        MOVES) when a larger tenant arrives; graph-baked addresses cannot
-        tolerate that, so buckets of different sizes never share a color.
-        """
-        pg = self.fsdp_param_groups[bucket_id]
-        return (pg.dtype, sum(p.numel() for p in pg.params))
+    def _get_arena_buf_name(self, color: int, bucket_offset: int) -> str:
+        return f"{self.name}_graph_arena_{color}_{bucket_offset}"
 
     def _allocate_from_graph_arena(
         self,
@@ -902,7 +908,18 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 f"same-color buckets). Refusing to fall back silently."
             )
         self._graph_arena_using[slot] = bucket_id
-        buffer_name = f"{self.name}_graph_arena_{color}_{bucket_offset}"
+        capacity = self._arena_slot_capacity.get(slot)
+        if capacity is None:
+            # Lazily-materialized slot (bucket unobserved at freeze time).
+            self._arena_slot_capacity[slot] = size
+        elif size > capacity:
+            raise RuntimeError(
+                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] graph arena "
+                f"slot {slot} materialized at {capacity} elements but bucket "
+                f"{bucket_id} requests {size}. Growing the named buffer would MOVE "
+                f"its storage and invalidate graph-baked addresses. Refusing."
+            )
+        buffer_name = self._get_arena_buf_name(color, bucket_offset)
         if mem_alloc_context is not None and mem_alloc_context != nullcontext:
             if (
                 self.allocation_tracker.get((buffer_name, dtype), None) is None
@@ -980,12 +997,15 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             for i, x in enumerate(buckets):
                 for y in buckets[i + 1 :]:
                     # A bucket never observed during warmup conservatively
-                    # conflicts with everything at its offset. Different
-                    # size/dtype families never share (slot growth moves the
-                    # storage, invalidating graph-baked addresses).
+                    # conflicts with everything at its offset. Colormates must
+                    # share a dtype (GlobalMemoryBuffer keys buffers by
+                    # (name, dtype): cross-dtype sharing is physically two
+                    # buffers, no benefit). Size differences are fine — slots
+                    # are pre-materialized below at the colormates' observed
+                    # maximum, so the named buffer never grows or moves.
                     if (
                         capture_resident
-                        or self._bucket_family(x) != self._bucket_family(y)
+                        or self._observed_dtype(x) != self._observed_dtype(y)
                         or not intervals.get(x)
                         or not intervals.get(y)
                         or overlaps(x, y)
@@ -999,6 +1019,25 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                     color += 1
                 plan[b] = color
                 num_colors = max(num_colors, color + 1)
+
+        # Pre-materialize each arena slot at its colormates' observed maximum
+        # size so the named buffer is allocated exactly once and its address
+        # never changes; later (smaller) requests return [0:size] views of the
+        # same storage.
+        slot_members = defaultdict(list)
+        for b, color in plan.items():
+            slot_members[(color, self._bucket_offset(b))].append(b)
+        for slot, members in slot_members.items():
+            observed = [self._observed_alloc_meta[b] for b in members
+                        if b in self._observed_alloc_meta]
+            if not observed:
+                continue  # lazily materialized on first allocate
+            max_size = max(sz for sz, _ in observed)
+            dtype = observed[0][1]
+            self._arena_slot_capacity[slot] = max_size
+            get_global_memory_buffer().get_tensor(
+                [max_size], dtype=dtype, name=self._get_arena_buf_name(*slot)
+            )
 
         num_events = len(self._lifetime_events)
         # Per-offset peak-live diagnostics: how many same-offset buckets are
