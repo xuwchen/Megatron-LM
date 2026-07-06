@@ -2914,13 +2914,20 @@ class TECudaGraphHelper:
                 )
             if not graph_bucket_ids:
                 continue
-            for alloc in (
-                getattr(pgb, 'weight_alloc', None),
-                getattr(pgb, 'transpose_weight_alloc', None),
-                getattr(pgb, 'main_grad_alloc', None),
+            # Weight (and fp8-transpose) buckets stay gathered for the whole
+            # capture window (release hooks are withheld; TE captures all
+            # forwards before all backwards), so their plan must give every
+            # bucket its own slot. Grad buckets are freed during capture by
+            # the fused-wgrad protocol and keep pure lifetime coloring.
+            for alloc, capture_resident in (
+                (getattr(pgb, 'weight_alloc', None), True),
+                (getattr(pgb, 'transpose_weight_alloc', None), True),
+                (getattr(pgb, 'main_grad_alloc', None), False),
             ):
                 if alloc is not None and hasattr(alloc, 'freeze_graph_arena_plan'):
-                    alloc.freeze_graph_arena_plan(graph_bucket_ids)
+                    alloc.freeze_graph_arena_plan(
+                        graph_bucket_ids, capture_resident=capture_resident
+                    )
             # Pre-gather graph-covered weight buckets so TE capture bakes the
             # planned arena addresses.
             for bucket_id in sorted(graph_bucket_ids):

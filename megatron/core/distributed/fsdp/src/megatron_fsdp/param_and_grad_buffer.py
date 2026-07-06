@@ -889,13 +889,22 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             )
         )
 
-    def freeze_graph_arena_plan(self, graph_bucket_ids) -> None:
+    def freeze_graph_arena_plan(self, graph_bucket_ids, capture_resident=False) -> None:
         """Color graph-covered buckets by recorded lifetimes and freeze the plan.
 
         Buckets sharing a color never had overlapping live ranges in the recorded
         (warmup) schedule, so they can share one persistent arena buffer while
         every individual bucket keeps an iteration-stable address for CUDA graph
         capture/replay. Conflicts at runtime raise instead of falling back.
+
+        capture_resident: the TE capture protocol withholds release hooks and
+        captures all forwards before all backwards, so every graph-covered
+        weight bucket is simultaneously live during the capture window. For
+        such allocators every same-offset pair must conflict (one color per
+        bucket) until the capture protocol releases between callables
+        (v2-style fwd-post reshard / bwd-pre unshard capture hooks). Grad
+        buckets are freed during capture by the fused-wgrad protocol and can
+        keep pure lifetime coloring.
         """
         eligible = sorted(
             b
@@ -945,7 +954,12 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 for y in buckets[i + 1 :]:
                     # A bucket never observed during warmup conservatively
                     # conflicts with everything at its offset.
-                    if not intervals.get(x) or not intervals.get(y) or overlaps(x, y):
+                    if (
+                        capture_resident
+                        or not intervals.get(x)
+                        or not intervals.get(y)
+                        or overlaps(x, y)
+                    ):
                         conflicts[x].add(y)
                         conflicts[y].add(x)
             for b in sorted(buckets, key=lambda b: -len(conflicts[b])):
