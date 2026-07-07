@@ -507,12 +507,47 @@ class GraphableMegatronModule(MegatronModule):
             if name:
                 mod.register_forward_hook(make_hook(name))
 
+    def _cg_register_grad_taps(self, out, kwargs):
+        """Register grad hooks on the layer's output and hidden_states input,
+        printing backward-boundary grad checksums. MEGATRON_CG_TAP_GRAD=<cap>
+        enables (rank 0 only). Works for both eager and replay outputs: the
+        hooks fire in the eager autograd region around the layer/graph."""
+        cap = int(os.environ.get('MEGATRON_CG_TAP_GRAD', '0'))
+        if cap <= 0 or not torch.distributed.is_initialized() or torch.distributed.get_rank() != 0:
+            return
+        n = getattr(self, '_cg_grad_hook_calls', 0)
+        self._cg_grad_hook_calls = n + 1
+        if n >= cap or torch.cuda.is_current_stream_capturing():
+            return
+        layer_no = getattr(self, 'layer_number', '?')
+
+        def mk(tag, call_idx):
+            @torch.compiler.disable
+            def hook(g):
+                d = g.detach().double()
+                print(
+                    f'[BGTAP] layer={layer_no} call={call_idx} {tag} '
+                    f'gsum={d.sum().item():.17e} gabs={d.abs().sum().item():.17e}',
+                    flush=True,
+                )
+            return hook
+
+        t = out[0] if isinstance(out, (tuple, list)) else out
+        if torch.is_tensor(t) and t.requires_grad:
+            t.register_hook(mk('d_out', n))
+        h = kwargs.get('hidden_states')
+        if torch.is_tensor(h) and h.requires_grad:
+            h.register_hook(mk('d_in', n))
+
     def __call__(self, *args, **kwargs):
-        if os.environ.get('MEGATRON_CG_TENSOR_TAP'):
-            self._cg_install_deep_taps()
-            self._cg_tensor_tap('in', args)
+        if os.environ.get('MEGATRON_CG_TENSOR_TAP') or os.environ.get('MEGATRON_CG_TAP_GRAD'):
+            if os.environ.get('MEGATRON_CG_TENSOR_TAP'):
+                self._cg_install_deep_taps()
+                self._cg_tensor_tap('in', args)
             out = self._cg_call_inner(*args, **kwargs)
-            self._cg_tensor_tap('out', args, out=out)
+            if os.environ.get('MEGATRON_CG_TENSOR_TAP'):
+                self._cg_tensor_tap('out', args, out=out)
+            self._cg_register_grad_taps(out, kwargs)
             return out
         return self._cg_call_inner(*args, **kwargs)
 
