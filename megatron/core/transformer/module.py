@@ -500,6 +500,13 @@ class GraphableMegatronModule(MegatronModule):
                     return
                 d = t.detach().double()
                 extra = ''
+                if name.endswith('router') and isinstance(out, (tuple, list)) and len(out) > 1 \
+                        and torch.is_tensor(out[1]):
+                    rmap = out[1].detach()
+                    idx = torch.nonzero(rmap.reshape(rmap.shape[0], -1))
+                    extra += (f' mapsum={rmap.double().sum().item():.0f}'
+                              f' maphash={(idx[:, 0] * 131 + idx[:, 1]).double().sum().item():.17e}'
+                              f' pnorm={d.norm().item():.17e}')
                 if os.environ.get('MEGATRON_CG_TENSOR_TAP_DEEP_IO'):
                     ti = inp
                     while isinstance(ti, (tuple, list)) and ti:
@@ -508,11 +515,13 @@ class GraphableMegatronModule(MegatronModule):
                         di = ti.detach().double()
                         extra += f' insum={di.sum().item():.17e}'
                     wsum = 0.0
+                    wnorm = 0.0
                     for p in mod.parameters(recurse=False):
                         pd = getattr(p.data, '_local_tensor', p.data)
                         if pd.numel() and pd.untyped_storage().size() >= pd.numel() * pd.element_size():
                             wsum += pd.detach().double().sum().item()
-                    extra += f' wsum={wsum:.17e}'
+                            wnorm += pd.detach().double().norm().item() ** 2
+                    extra += f' wsum={wsum:.17e} wnorm={wnorm:.17e}'
                 print(
                     f'[CGTAPD] layer={layer.layer_number} cls={type(layer).__name__} '
                     f'mid={id(layer) % 100000} call={getattr(layer, "_cg_tap_calls", 0)} '
