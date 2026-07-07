@@ -2163,18 +2163,27 @@ class TECudaGraphHelper:
                     rotary_pos_emb = get_rotary_pos_emb(chunk_of_the_layer, hidden_states)
                     if rotary_pos_emb is not None:
                         static_inputs["rotary_pos_emb"] = rotary_pos_emb
-                # Declare every tensor kwarg observed on the layer's eager
-                # pre-capture calls as a static graph input. Config-derived
-                # synthesis above misses model-computed per-microbatch inputs
-                # (e.g. multimodal mrope rotary tensors): a graph captured
-                # without them bakes an attention that silently drops those
-                # kwargs on replay — Qwen3.5-VL graphed attention layers ran
-                # without positional embedding entirely. TE copies runtime
-                # kwargs into the static buffers on every replay, so
-                # data-dependent values stay correct per microbatch.
+                # Declare the rotary tensor kwargs observed on the layer's
+                # eager pre-capture calls as static graph inputs. Config-derived
+                # synthesis above only understands position_embedding_type ==
+                # 'rope'; models that compute positional inputs at the model
+                # level and pass them into layers per microbatch (e.g.
+                # Qwen3.5-VL mrope) captured graphs without them, and TE replay
+                # silently dropped the runtime kwargs — graphed attention ran
+                # with no positional embedding at all. TE copies runtime kwargs
+                # into the static buffers on every replay, so data-dependent
+                # values stay correct per microbatch. Restricted to rotary
+                # inputs: forwarding arbitrary observed kwargs can flip other
+                # modules onto capture-unsafe branches (e.g. the fused MoE aux
+                # loss converting a tensor token count to int during capture).
+                _ROTARY_KWARGS = (
+                    'rotary_pos_emb',
+                    'rotary_pos_cos',
+                    'rotary_pos_sin',
+                    'rotary_pos_cos_sin',
+                )
                 for key, value in getattr(layer, '_cg_observed_tensor_kwargs', {}).items():
-                    # hidden_states is already the positional sample arg.
-                    if key != 'hidden_states' and key not in static_inputs:
+                    if key in _ROTARY_KWARGS and key not in static_inputs:
                         static_inputs[key] = value.detach().clone()
                 _sample_kwargs = static_inputs
             elif contains_self_attn:
