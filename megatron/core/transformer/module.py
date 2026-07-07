@@ -519,7 +519,23 @@ class GraphableMegatronModule(MegatronModule):
     def _cg_call_inner(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
-        elif self._should_call_te_cudagraph(*args, **kwargs):
+        # Record the tensor kwargs of eager pre-capture calls so capture can
+        # declare them as static graph inputs. Predicting them from config
+        # misses model-computed inputs (e.g. multimodal mrope rotary tensors
+        # passed down per microbatch); a graph captured without them bakes an
+        # attention that silently drops those inputs on replay.
+        if (
+            getattr(self.config, 'cuda_graph_impl', None) == "transformer_engine"
+            and self.training
+            and not self.cuda_graphs
+        ):
+            from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+            if not is_graph_capturing():
+                self._cg_observed_tensor_kwargs = {
+                    k: v for k, v in kwargs.items() if isinstance(v, torch.Tensor)
+                }
+        if self._should_call_te_cudagraph(*args, **kwargs):
             # Temporarily replace forward with cuda graph function
             self._original_forward = self.forward
             try:

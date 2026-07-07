@@ -2163,6 +2163,19 @@ class TECudaGraphHelper:
                     rotary_pos_emb = get_rotary_pos_emb(chunk_of_the_layer, hidden_states)
                     if rotary_pos_emb is not None:
                         static_inputs["rotary_pos_emb"] = rotary_pos_emb
+                # Declare every tensor kwarg observed on the layer's eager
+                # pre-capture calls as a static graph input. Config-derived
+                # synthesis above misses model-computed per-microbatch inputs
+                # (e.g. multimodal mrope rotary tensors): a graph captured
+                # without them bakes an attention that silently drops those
+                # kwargs on replay — Qwen3.5-VL graphed attention layers ran
+                # without positional embedding entirely. TE copies runtime
+                # kwargs into the static buffers on every replay, so
+                # data-dependent values stay correct per microbatch.
+                for key, value in getattr(layer, '_cg_observed_tensor_kwargs', {}).items():
+                    # hidden_states is already the positional sample arg.
+                    if key != 'hidden_states' and key not in static_inputs:
+                        static_inputs[key] = value.detach().clone()
                 _sample_kwargs = static_inputs
             elif contains_self_attn:
                 _sample_args = (
