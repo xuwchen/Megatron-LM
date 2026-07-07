@@ -442,8 +442,47 @@ class GraphableMegatronModule(MegatronModule):
             flush=True,
         )
 
+    def _cg_install_deep_taps(self):
+        """Register forward hooks on all submodules of the layers named in
+        MEGATRON_CG_TENSOR_TAP_DEEP (comma-separated layer numbers) that print
+        each submodule's output checksum, subject to the same call cap."""
+        want = os.environ.get('MEGATRON_CG_TENSOR_TAP_DEEP', '')
+        if not want or getattr(self, '_cg_deep_taps_done', False):
+            return
+        self._cg_deep_taps_done = True
+        if str(getattr(self, 'layer_number', None)) not in want.split(','):
+            return
+
+        cap = int(os.environ.get('MEGATRON_CG_TENSOR_TAP', '0'))
+        layer = self
+
+        def make_hook(name):
+            def hook(mod, inp, out):
+                if (not torch.distributed.is_initialized()
+                        or torch.distributed.get_rank() != 0
+                        or torch.cuda.is_current_stream_capturing()
+                        or getattr(layer, '_cg_tap_calls', 0) > cap):
+                    return
+                t = out
+                while isinstance(t, (tuple, list)) and t:
+                    t = t[0]
+                if not torch.is_tensor(t) or not t.is_floating_point():
+                    return
+                d = t.detach().double()
+                print(
+                    f'[CGTAPD] layer={layer.layer_number} call={getattr(layer, "_cg_tap_calls", 0)} '
+                    f'{name} sum={d.sum().item():.17e} abs={d.abs().sum().item():.17e}',
+                    flush=True,
+                )
+            return hook
+
+        for name, mod in self.named_modules():
+            if name:
+                mod.register_forward_hook(make_hook(name))
+
     def __call__(self, *args, **kwargs):
         if os.environ.get('MEGATRON_CG_TENSOR_TAP'):
+            self._cg_install_deep_taps()
             self._cg_tensor_tap('in', args)
             out = self._cg_call_inner(*args, **kwargs)
             self._cg_tensor_tap('out', args, out=out)
