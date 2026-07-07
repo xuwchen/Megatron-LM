@@ -3,6 +3,7 @@
 import functools
 import importlib
 import logging
+import os
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import partial
@@ -1378,6 +1379,27 @@ class MegatronFSDP(torch.nn.Module):
         # Once the gradients have been reduced and scattered into main_grad_buffer,
         # update the gradients for all buffered weights in optimizer_named_parameters.
         self.attach_grad_to_optimizer_state()
+
+        # Debug: per-bucket reduced-gradient shard norms, for localizing which
+        # parameters' gradients diverge between eager and CUDA-graph runs.
+        # MEGATRON_CG_GRAD_TAP=<max_iters> enables it (rank 0 only).
+        cap = int(os.environ.get('MEGATRON_CG_GRAD_TAP', '0'))
+        if cap > 0 and torch.distributed.get_rank() == 0:
+            n = getattr(self, '_cg_grad_tap_iters', 0)
+            self._cg_grad_tap_iters = n + 1
+            if n < cap:
+                for gid, group in enumerate(self.param_and_grad_buffer.parameter_groups):
+                    gbuf = group.main_grad_buffer
+                    if gbuf is None:
+                        continue
+                    data = gbuf.data
+                    if data is None or data.numel() == 0:
+                        continue
+                    print(
+                        f'[GRADTAP] iter={n} bucket={gid} '
+                        f'norm={data.detach().double().norm().item():.17e}',
+                        flush=True,
+                    )
 
         # Synchronize parameter all-gather operations for all model parameters,
         # which are triggered during the backward pass for FSDP.
