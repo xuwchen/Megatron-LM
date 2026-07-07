@@ -943,6 +943,24 @@ class TopKRouter(Router):
             packed_seq_params=packed_seq_params,
         )
 
+        if os.environ.get('MEGATRON_CG_ROUTER_TAP') and torch.distributed.get_rank() == 0:
+            n = getattr(self, '_cg_router_tap_probs', 0)
+            self._cg_router_tap_probs = n + 1
+            if n < int(os.environ['MEGATRON_CG_ROUTER_TAP']) and \
+                    not torch.cuda.is_current_stream_capturing():
+                dl = logits.detach().double()
+                dp = probs.detach().double()
+                rm = routing_map.detach()
+                idx = torch.nonzero(rm.reshape(rm.shape[0], -1))
+                print(
+                    f'[RTRTAP2] layer={self.layer_number} call={n} '
+                    f'lsum={dl.sum().item():.17e} '
+                    f'psum={dp.sum().item():.17e} pnorm={dp.norm().item():.17e} '
+                    f'maphash={(idx[:, 0] * 131 + idx[:, 1]).double().sum().item():.17e} '
+                    f'pmax={dp.max().item():.17e}',
+                    flush=True,
+                )
+
         return probs, routing_map
 
     def _load_from_state_dict(self, *args, **kwargs):
