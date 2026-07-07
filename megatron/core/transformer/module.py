@@ -367,9 +367,13 @@ class GraphableMegatronModule(MegatronModule):
         cap = int(os.environ.get('MEGATRON_CG_REPLAY_CHECK', '0'))
         if cap > 0 and getattr(self, '_cg_replay_checks', 0) < cap:
             self._cg_replay_checks = getattr(self, '_cg_replay_checks', 0) + 1
+            r = out[0] if isinstance(out, (tuple, list)) else out
+            # Clone BEFORE the eager recompute: the scope's TE modules were
+            # graphed and re-running them eagerly may overwrite the graph's
+            # static output storage.
+            r = r.detach().clone() if torch.is_tensor(r) else r
             with torch.no_grad():
                 eager_out = self._original_forward(*args, **kwargs)
-            r = out[0] if isinstance(out, (tuple, list)) else out
             e = eager_out[0] if isinstance(eager_out, (tuple, list)) else eager_out
             if (torch.is_tensor(r) and torch.is_tensor(e)
                     and torch.distributed.get_rank() == 0):
