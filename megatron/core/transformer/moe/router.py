@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
+import os
 import torch
 
 from megatron.core.inference.utils import InferenceMode
@@ -905,6 +906,25 @@ class TopKRouter(Router):
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
+
+        if os.environ.get('MEGATRON_CG_ROUTER_TAP') and torch.distributed.get_rank() == 0:
+            n = getattr(self, '_cg_router_tap_calls', 0)
+            self._cg_router_tap_calls = n + 1
+            if n < int(os.environ['MEGATRON_CG_ROUTER_TAP']) and \
+                    not torch.cuda.is_current_stream_capturing():
+                dl = logits.detach().double()
+                di = input.detach().double()
+                dw = self.weight.detach().double()
+                print(
+                    f'[RTRTAP] layer={self.layer_number} call={n} '
+                    f'lsum={dl.sum().item():.17e} lnorm={dl.norm().item():.17e} '
+                    f'isum={di.sum().item():.17e} inorm={di.norm().item():.17e} '
+                    f'wnorm={dw.norm().item():.17e} '
+                    f'iptr={input.data_ptr()%4096} wptr={self.weight.data_ptr()%4096} '
+                    f'idtype={input.dtype} wdtype={self.weight.dtype} '
+                    f'ishape={tuple(input.shape)}',
+                    flush=True,
+                )
 
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
