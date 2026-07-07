@@ -2856,6 +2856,68 @@ class TECudaGraphHelper:
             self._fsdp_capture_param_states.append((fsdp_module, was_distributed))
             fsdp_module._replace_param_with_raw_if_needed()
 
+    def _setup_fsdp_planned_allocators(self):
+        """Freeze planned slots for graph-covered FSDP buckets.
+
+        Per-layer TE graphs bake absolute device pointers of the all-gathered
+        weight buckets (and fused-wgrad main_grad buckets), while eager
+        allocators assign storage by runtime order, which is not stable across
+        capture/replay/eval. Freeze a lifetime-colored plan derived from the
+        eager warmup schedule so every graph-covered bucket resolves to an
+        iteration-stable pre-materialized slot (PlannedBucketAllocator).
+        """
+        for fsdp_module in self._get_megatron_fsdp_instances():
+            # Drain in-flight gathers and release unit buckets so the plan is
+            # frozen from a clean, fully-released pool state. Do NOT call
+            # synchronize_param_gather() here: it re-exposes DTensor params and
+            # would undo _prepare_fsdp_params_for_capture's raw switch.
+            ag_pipeline = getattr(fsdp_module, 'all_gather_pipeline', None)
+            if ag_pipeline is not None and hasattr(ag_pipeline, 'reset'):
+                ag_pipeline.reset(preserve_non_fsdp_units=True)
+            fsdp_module._replace_param_with_raw_if_needed()
+
+            pgb = fsdp_module.param_and_grad_buffer
+            graph_bucket_ids = set()
+            for callable_module in self.flattened_callables:
+                if not isinstance(callable_module, torch.nn.Module):
+                    continue
+                for param in callable_module.parameters():
+                    group_id = pgb.param_to_param_group.get(param)
+                    if group_id is None:
+                        group_id = pgb.param_to_param_group.get(
+                            getattr(param, 'orig_param', param)
+                        )
+                    if group_id is not None:
+                        graph_bucket_ids.add(group_id)
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f'[TECudaGraphHelper] planned allocator setup: '
+                    f'{len(self.flattened_callables)} callables -> '
+                    f'{len(graph_bucket_ids)} FSDP bucket(s): '
+                    f'{sorted(graph_bucket_ids)}',
+                    flush=True,
+                )
+            if not graph_bucket_ids:
+                continue
+            # The capture protocol drives per-callable gather/release through
+            # capture_time hooks (fwd-pre unshard, fwd-post release, rerouted
+            # bwd-pre unshard and bwd-post release), so capture-window residency
+            # matches the steady-state schedule and pure lifetime coloring holds.
+            # Each hook-driven gather resolves through the frozen plan, so TE
+            # bakes the planned addresses without any pre-gather.
+            # MEGATRON_CG_PLANNED_CAPTURE_RESIDENT=1 restores one-color-per-bucket
+            # weight slots (disables slot sharing) as a fallback.
+            capture_resident = (
+                os.environ.get('MEGATRON_CG_PLANNED_CAPTURE_RESIDENT', '0') == '1'
+            )
+            for alloc, resident in (
+                (getattr(pgb, 'weight_alloc', None), capture_resident),
+                (getattr(pgb, 'transpose_weight_alloc', None), capture_resident),
+                (getattr(pgb, 'main_grad_alloc', None), False),
+            ):
+                if alloc is not None and hasattr(alloc, 'freeze_plan'):
+                    alloc.freeze_plan(graph_bucket_ids, capture_resident=resident)
+
     def _restore_fsdp_params_after_capture(self):
         """Restore Megatron-FSDP parameter exposure after CUDA graph capture."""
         for fsdp_module, was_distributed in reversed(self._fsdp_capture_param_states):
@@ -2878,6 +2940,7 @@ class TECudaGraphHelper:
             gc.freeze()
 
         self._prepare_fsdp_params_for_capture()
+        self._setup_fsdp_planned_allocators()
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
         return time.time()

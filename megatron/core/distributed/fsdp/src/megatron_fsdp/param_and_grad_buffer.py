@@ -655,6 +655,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         fsdp_param_groups: List["ParameterGroup"],
         size: int = 2,
         fallback_to_persistent_buffer: bool = False,
+        generalized: bool = False,
     ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
@@ -669,16 +670,30 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             fsdp_unit_buckets[param_group.fsdp_unit_id].append(bucket_id)
         self.fsdp_unit_buckets = fsdp_unit_buckets
 
-        # Identify the largest group of FSDP units that share the same buffer storage.
-        fsdp_units_to_double_buffer = []
-        for fsdp_unit_id, bucket_ids in fsdp_unit_buckets.items():
-            same_storage_fsdp_units = []
-            for i in fsdp_unit_buckets:
-                if self._is_two_bucket_group_equal(fsdp_unit_buckets[i], bucket_ids):
-                    same_storage_fsdp_units.append(i)
-            # Track the largest group of FSDP units sharing the same buffer storage
-            if len(same_storage_fsdp_units) > len(fsdp_units_to_double_buffer):
-                fsdp_units_to_double_buffer = same_storage_fsdp_units
+        if generalized:
+            # Generalized pool: EVERY FSDP unit rotates through the pool. Slot
+            # capacity converges to the largest tenant per (slot, dtype) via
+            # GlobalMemoryBuffer's grow-on-demand (growth changes the slot's
+            # address, which is safe for eager tenants — they re-fetch on every
+            # allocate — and CUDA-graph-covered buckets never live here: the
+            # graph arena claims them). This removes the
+            # largest-homogeneous-group restriction that used to push every
+            # heterogeneous unit (attention layers among GDN, vision towers)
+            # onto per-bucket persistent buffers, whose footprint grows
+            # linearly with layer count. Not used with NCCL user buffers:
+            # UB registration cannot tolerate grow-realloc.
+            fsdp_units_to_double_buffer = sorted(fsdp_unit_buckets.keys())
+        else:
+            # Identify the largest group of FSDP units that share the same buffer storage.
+            fsdp_units_to_double_buffer = []
+            for fsdp_unit_id, bucket_ids in fsdp_unit_buckets.items():
+                same_storage_fsdp_units = []
+                for i in fsdp_unit_buckets:
+                    if self._is_two_bucket_group_equal(fsdp_unit_buckets[i], bucket_ids):
+                        same_storage_fsdp_units.append(i)
+                # Track the largest group of FSDP units sharing the same buffer storage
+                if len(same_storage_fsdp_units) > len(fsdp_units_to_double_buffer):
+                    fsdp_units_to_double_buffer = same_storage_fsdp_units
 
         # --- Fixed Pool Buffering Check ---
         # Ensure there is at least one group of FSDP units eligible for fixed pool buffering.
@@ -717,14 +732,18 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.using_buffer = {}  # Map from bucket_id to (buf_group_id, offset) in use.
 
         # Populate the idle buffer pool with all buffer group and bucket offset combinations.
+        num_bucket = max(
+            len(self.fsdp_unit_buckets[u]) for u in self.fsdp_double_buffer_units
+        )
         for buf_group_id in range(self.size):  # Iterate over each buffer group in the pool.
-            num_bucket = len(self.fsdp_unit_buckets[self.fsdp_double_buffer_units[0]])
             for bucket_offset in range(num_bucket):
                 self.idle_buffer.append((buf_group_id, bucket_offset))
 
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
         self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
         self.backup_allocator = StorageResizeBasedBucketAllocator()
+
+        self._spilled_buffer_names = set()  # pool-exhausted spills (observability)
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
         # Check if two bucket groups are equivalent in dtype and size.
@@ -769,6 +788,26 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                         self.idle_buffer.remove((buf_group_id, bucket_offset))
                         break
 
+            if buffer_name is None and self.fallback_to_persistent_buffer is True:
+                # Pool exhausted (e.g. CUDA-graph capture withholds release hooks
+                # while warmup prefetch keeps gathering): spill to a per-bucket
+                # persistent buffer instead of failing. Address is stable, at the
+                # cost of that bucket staying resident.
+                buffer_name = (
+                    f"{self.name}_fixed_pool_exhausted_{bucket_id}_{size}_{dtype}_{device}"
+                )
+                if buffer_name not in self._spilled_buffer_names:
+                    # Persistent spills are never reclaimed (GlobalMemoryBuffer only
+                    # grows) — surface each one so memory growth is never silent.
+                    self._spilled_buffer_names.add(buffer_name)
+                    nbytes = size * torch.empty((), dtype=dtype).element_size()
+                    print(
+                        f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
+                        f"fixed pool exhausted: spilling bucket {bucket_id} to a "
+                        f"persistent buffer ({nbytes / (1 << 20):.1f} MiB, "
+                        f"spill #{len(self._spilled_buffer_names)})",
+                        flush=True,
+                    )
             assert buffer_name is not None, (
                 f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
                 f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
@@ -823,6 +862,283 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             # If not managed by fixed pool allocator, delegate to the backup allocator.
             logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
             self.backup_allocator.free(bucket_id)
+
+
+
+class PlannedBucketAllocator(TemporaryBucketAllocator):
+    """Serve buckets from lifetime-planned, address-frozen slots.
+
+    Decorator over any base ``TemporaryBucketAllocator``: buckets covered by a
+    frozen plan (e.g. those whose addresses are baked into CUDA graphs) always
+    resolve to the same pre-materialized named slot, while every other bucket
+    falls through to the wrapped base allocator. This decouples CUDA-graph
+    address stability from the double-buffer pool choice: the base may be a
+    ``FixedPoolAllocator``, a ``StorageResizeBasedBucketAllocator``, or the
+    plain per-bucket ``TemporaryBucketAllocator``.
+
+    Lifecycle:
+      1. Until ``freeze_plan`` is called, allocate/free order and exact
+         (padded) allocation sizes are recorded (bounded observation window).
+      2. ``freeze_plan(graph_bucket_ids)`` colors the recorded lifetimes
+         (colormates never overlap and share a dtype), pre-materializes each
+         slot at its colormates' observed maximum size, and freezes the
+         ``bucket -> (color, offset)`` assignment.
+      3. Planned buckets resolve in O(1) to their frozen slot; a same-color
+         occupancy conflict or an over-capacity request raises — never a
+         silent fallback, since graphs read the baked addresses blindly.
+    """
+
+    _MAX_RECORDED_EVENTS = 200_000
+
+    def __init__(self, name: str, base: TemporaryBucketAllocator, fsdp_param_groups):
+        self.name = name
+        self.base = base
+        self.fsdp_param_groups = fsdp_param_groups
+
+        # bucket ids per FSDP unit (for stable per-unit slot offsets).
+        fsdp_unit_buckets = defaultdict(list)
+        for bucket_id, param_group in enumerate(fsdp_param_groups):
+            if param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None:
+                continue
+            fsdp_unit_buckets[param_group.fsdp_unit_id].append(bucket_id)
+        self.fsdp_unit_buckets = fsdp_unit_buckets
+
+        self._lifetime_events = []  # [(op, bucket_id)] with op in {'alloc', 'free'}
+        self._recording_lifetimes = True
+        self._plan = None  # {bucket_id: color}
+        self._num_colors = 0
+        self._slot_using = {}  # {(color, bucket_offset): bucket_id}
+        # Exact allocation sizes/dtypes observed during the recording window.
+        # allocate() receives the padded bucket size, so these are ground
+        # truth (no padding-rule prediction involved).
+        self._observed_alloc_meta = {}  # {bucket_id: (size, dtype)}
+        # Materialized capacity per slot; a request beyond capacity would
+        # grow (and MOVE) the named buffer, so it raises instead.
+        self._slot_capacity = {}  # {(color, bucket_offset): numel}
+        # Buckets whose pre-plan base-allocator state has been released.
+        self._base_released = set()
+
+    def _bucket_offset(self, bucket_id: int) -> int:
+        fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+        if fsdp_unit_id == -1 or fsdp_unit_id is None:
+            return 0
+        return self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
+
+    def _observed_dtype(self, bucket_id: int):
+        meta = self._observed_alloc_meta.get(bucket_id)
+        return meta[1] if meta else None
+
+    def _get_planned_buf_name(self, color: int, bucket_offset: int) -> str:
+        return f"{self.name}_planned_{color}_{bucket_offset}"
+
+    def allocate(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> Bucket:
+        """Resolve a planned bucket to its frozen slot, else delegate to base."""
+        if self._plan is not None and bucket_id in self._plan:
+            return self._allocate_planned(bucket_id, size, dtype, device, mem_alloc_context)
+        if self._recording_lifetimes:
+            if len(self._lifetime_events) < self._MAX_RECORDED_EVENTS:
+                self._lifetime_events.append(('alloc', bucket_id))
+            self._observed_alloc_meta[bucket_id] = (size, dtype)
+        return self.base.allocate(
+            bucket_id=bucket_id,
+            size=size,
+            dtype=dtype,
+            device=device,
+            mem_alloc_context=mem_alloc_context,
+        )
+
+    def free(self, bucket_id: int):
+        """Release a planned bucket's slot, else delegate to base."""
+        if self._plan is not None and bucket_id in self._plan:
+            slot = (self._plan[bucket_id], self._bucket_offset(bucket_id))
+            if self._slot_using.get(slot) == bucket_id:
+                del self._slot_using[slot]
+            # Release any pre-plan base-allocator state exactly once.
+            if bucket_id not in self._base_released:
+                self._base_released.add(bucket_id)
+                self.base.free(bucket_id)
+            return
+        if self._recording_lifetimes and len(self._lifetime_events) < self._MAX_RECORDED_EVENTS:
+            self._lifetime_events.append(('free', bucket_id))
+        self.base.free(bucket_id)
+
+    def _allocate_planned(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> Bucket:
+        color = self._plan[bucket_id]
+        bucket_offset = self._bucket_offset(bucket_id)
+        slot = (color, bucket_offset)
+        occupant = self._slot_using.get(slot)
+        if occupant is not None and occupant != bucket_id:
+            raise RuntimeError(
+                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] planned slot "
+                f"conflict: bucket {bucket_id} needs slot {slot} but it is held by bucket "
+                f"{occupant}. The frozen lifetime plan does not cover the current "
+                f"allocation order (e.g. an eval/checkpoint schedule overlapping two "
+                f"same-color buckets). Refusing to fall back silently."
+            )
+        self._slot_using[slot] = bucket_id
+        capacity = self._slot_capacity.get(slot)
+        if capacity is None:
+            # Lazily-materialized slot (bucket unobserved at freeze time).
+            self._slot_capacity[slot] = size
+        elif size > capacity:
+            raise RuntimeError(
+                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] planned "
+                f"slot {slot} materialized at {capacity} elements but bucket "
+                f"{bucket_id} requests {size}. Growing the named buffer would MOVE "
+                f"its storage and invalidate graph-baked addresses. Refusing."
+            )
+        buffer_name = self._get_planned_buf_name(color, bucket_offset)
+        return Bucket(
+            data=get_global_memory_buffer().get_tensor(
+                [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
+            )
+        )
+
+    def freeze_plan(self, graph_bucket_ids, capture_resident=False) -> None:
+        """Color graph-covered buckets by recorded lifetimes and freeze the plan.
+
+        Buckets sharing a color never had overlapping live ranges in the
+        recorded (warmup) schedule and share a dtype, so they can share one
+        pre-materialized slot while every bucket keeps an iteration-stable
+        address for CUDA graph capture/replay.
+
+        capture_resident: fallback for capture protocols that hold every
+        graph-covered bucket live for the whole capture window — every
+        same-offset pair conflicts (one color per bucket).
+        """
+        eligible = sorted(graph_bucket_ids)
+        if not eligible:
+            self._recording_lifetimes = False
+            return
+        if self._plan is not None:
+            missing = [b for b in eligible if b not in self._plan]
+            assert not missing, (
+                f"[FSDP][{self.name}] plan already frozen but new graph "
+                f"buckets appeared: {missing}"
+            )
+            return
+
+        # Build per-bucket lifetime intervals from the recorded event order.
+        intervals = defaultdict(list)
+        open_t = {}
+        for t, (op, b) in enumerate(self._lifetime_events):
+            if op == 'alloc':
+                open_t.setdefault(b, t)
+            elif b in open_t:
+                intervals[b].append((open_t.pop(b), t))
+        tail = len(self._lifetime_events)
+        for b, t0 in open_t.items():
+            intervals[b].append((t0, tail))
+
+        # Conflict edges only matter between buckets at the same bucket_offset
+        # (different offsets never share a slot name).
+        plan = {}
+        num_colors = 0
+        by_offset = defaultdict(list)
+        for b in eligible:
+            by_offset[self._bucket_offset(b)].append(b)
+        for offset, buckets in by_offset.items():
+            def overlaps(x, y):
+                for s1, e1 in intervals.get(x, []):
+                    for s2, e2 in intervals.get(y, []):
+                        if s1 < e2 and s2 < e1:
+                            return True
+                return False
+
+            conflicts = {b: set() for b in buckets}
+            for i, x in enumerate(buckets):
+                for y in buckets[i + 1 :]:
+                    # A bucket never observed during recording conservatively
+                    # conflicts with everything at its offset. Colormates must
+                    # share a dtype (GlobalMemoryBuffer keys buffers by
+                    # (name, dtype): cross-dtype sharing is physically two
+                    # buffers, no benefit). Size differences are fine — slots
+                    # are pre-materialized below at the colormates' observed
+                    # maximum, so the named buffer never grows or moves.
+                    if (
+                        capture_resident
+                        or self._observed_dtype(x) != self._observed_dtype(y)
+                        or not intervals.get(x)
+                        or not intervals.get(y)
+                        or overlaps(x, y)
+                    ):
+                        conflicts[x].add(y)
+                        conflicts[y].add(x)
+            for b in sorted(buckets, key=lambda b: -len(conflicts[b])):
+                used = {plan[n] for n in conflicts[b] if n in plan}
+                color = 0
+                while color in used:
+                    color += 1
+                plan[b] = color
+                num_colors = max(num_colors, color + 1)
+
+        # Pre-materialize each slot at its colormates' observed maximum size so
+        # the named buffer is allocated exactly once and its address never
+        # changes; later (smaller) requests return [0:size] views of the same
+        # storage.
+        slot_members = defaultdict(list)
+        for b, color in plan.items():
+            slot_members[(color, self._bucket_offset(b))].append(b)
+        for slot, members in slot_members.items():
+            observed = [
+                self._observed_alloc_meta[b] for b in members if b in self._observed_alloc_meta
+            ]
+            if not observed:
+                continue  # lazily materialized on first allocate
+            max_size = max(sz for sz, _ in observed)
+            dtype = observed[0][1]
+            self._slot_capacity[slot] = max_size
+            get_global_memory_buffer().get_tensor(
+                [max_size], dtype=dtype, name=self._get_planned_buf_name(*slot)
+            )
+
+        # Per-offset peak-live diagnostics: peak << colors points at a
+        # coloring-input problem; peak == colors means the schedule genuinely
+        # holds that many buckets live at once.
+        diag = []
+        for offset, buckets in sorted(by_offset.items()):
+            points = []
+            for b in buckets:
+                for st, en in intervals.get(b, []):
+                    points.append((st, 1))
+                    points.append((en, -1))
+            points.sort()
+            live = peak = 0
+            for _, delta in points:
+                live += delta
+                peak = max(peak, live)
+            colors_here = len({plan[b] for b in buckets})
+            n_intervals = sum(len(intervals.get(b, [])) for b in buckets)
+            n_unobserved = sum(1 for b in buckets if not intervals.get(b))
+            diag.append(
+                f"off{offset}: n={len(buckets)} colors={colors_here} "
+                f"peak_live={peak} intervals={n_intervals} unobserved={n_unobserved}"
+            )
+        num_events = len(self._lifetime_events)
+        self._plan = plan
+        self._num_colors = num_colors
+        self._recording_lifetimes = False
+        self._lifetime_events = []
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[FSDP][{self.name}] planned-slot plan frozen: {len(plan)} buckets "
+                f"(events={num_events}) | " + " | ".join(diag),
+                flush=True,
+            )
 
 
 class DataParallelBuffer:
@@ -2205,12 +2521,14 @@ class ParamAndGradBuffer:
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                generalized=not self.ddp_config.nccl_ub,
             )
             self.transpose_weight_alloc = FixedPoolAllocator(
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+                generalized=not self.ddp_config.nccl_ub,
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads",
@@ -2219,6 +2537,7 @@ class ParamAndGradBuffer:
                 fallback_to_persistent_buffer=(
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                 ),
+                generalized=not self.ddp_config.nccl_ub,
             )
             if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
@@ -2232,6 +2551,7 @@ class ParamAndGradBuffer:
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                     ),
+                    generalized=not self.ddp_config.nccl_ub,
                 )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
@@ -2244,6 +2564,26 @@ class ParamAndGradBuffer:
                 # Otherwise, this allocator will never be used.
                 self.hsdp_grad_comm_alloc = None
             self.double_buf_units = []
+
+        if getattr(self.ddp_config, 'megatron_fsdp_cuda_graph_mode', False):
+            # CUDA graphs bake absolute bucket addresses at capture; wrap every
+            # allocator with the planned decorator so graph-covered buckets can
+            # be frozen onto lifetime-planned, address-stable slots — regardless
+            # of the eager allocation strategy underneath (fixed pool, storage
+            # resize, or plain per-bucket). See PlannedBucketAllocator.
+            self.weight_alloc = PlannedBucketAllocator(
+                "fsdp_params", self.weight_alloc, self.parameter_groups
+            )
+            self.transpose_weight_alloc = PlannedBucketAllocator(
+                "fsdp_fp8_transpose_params", self.transpose_weight_alloc, self.parameter_groups
+            )
+            self.main_grad_alloc = PlannedBucketAllocator(
+                "fsdp_grads",
+                self.main_grad_alloc
+                if self.main_grad_alloc is not None
+                else TemporaryBucketAllocator(),
+                self.parameter_groups,
+            )
 
         self.buffer_all_in_one = True
         buffer_size = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
