@@ -2141,22 +2141,30 @@ def validate_args(args, defaults={}):
         # captured region runs recompute-OFF while an otherwise-identical eager
         # baseline runs recompute-ON. Megatron's checkpoint recompute backward is
         # not bitwise-identical to the plain backward, so the graphed run silently
-        # diverges from eager. Warn when a recompute module can overlap a captured
-        # scope (moe_router captures shared_experts + pre-MLP layernorm; whole /
-        # mlp / moe scopes capture the MLP). See docs on partial CUDA graphs.
+        # diverges from eager. Warn only for recompute modules that genuinely fall
+        # inside the captured region:
+        #   - whole-layer / mlp / moe capture covers the whole MLP+experts, so
+        #     shared_experts, moe_act, mlp, and pre-MLP layernorm all overlap;
+        #   - moe_router capture covers only route (incl. shared_experts) +
+        #     preprocess, so ONLY shared_experts overlaps. pre-MLP layernorm has
+        #     explicit cudagraph-aware recompute support and the experts (moe_act
+        #     / mlp) run eager after the graph, so those are safe.
+        # See docs on partial CUDA graphs.
         if (
             args.cuda_graph_impl != "none"
             and args.recompute_granularity == "selective"
             and args.recompute_modules
         ):
             _cg_scopes = args.cuda_graph_modules or ["<whole-layer>"]
-            _captures_mlp = (not args.cuda_graph_modules) or any(
-                s in ("mlp", "moe", "moe_router") for s in args.cuda_graph_modules
+            _captures_full_mlp = (not args.cuda_graph_modules) or any(
+                s in ("mlp", "moe") for s in args.cuda_graph_modules
             )
+            _captures_router = "moe_router" in _cg_scopes
             _overlap = [
                 m for m in args.recompute_modules
-                if (m in ("shared_experts", "moe_act", "mlp") and _captures_mlp)
-                or (m == "layernorm" and (_captures_mlp or "moe_preprocess" in _cg_scopes))
+                if (m in ("shared_experts", "moe_act", "mlp", "layernorm")
+                    and _captures_full_mlp)
+                or (m == "shared_experts" and _captures_router)
             ]
             if _overlap:
                 warn_rank_0(
