@@ -446,6 +446,8 @@ class GraphableMegatronModule(MegatronModule):
         if n >= cap:
             return
         t = out if out is not None else (args[0] if args else None)
+        if t is None and tag == 'in':
+            t = getattr(self, '_cg_tap_in_kwarg', None)
         if isinstance(t, (tuple, list)):
             t = t[0] if t and torch.is_tensor(t[0]) else None
         if t is None or not torch.is_tensor(t):
@@ -463,7 +465,8 @@ class GraphableMegatronModule(MegatronModule):
                         ptrs.append(pd.data_ptr() % 4096)
             extra = f' wsum={wsum:.17e} align={ptrs}'
         print(
-            f'[CGTAP] layer={getattr(self, "layer_number", "?")} call={n} {tag} '
+            f'[CGTAP] layer={getattr(self, "layer_number", "?")} '
+            f'cls={type(self).__name__} mid={id(self) % 100000} call={n} {tag} '
             f'sum={d.sum().item():.17e} abs={d.abs().sum().item():.17e}{extra}',
             flush=True,
         )
@@ -511,7 +514,8 @@ class GraphableMegatronModule(MegatronModule):
                             wsum += pd.detach().double().sum().item()
                     extra += f' wsum={wsum:.17e}'
                 print(
-                    f'[CGTAPD] layer={layer.layer_number} call={getattr(layer, "_cg_tap_calls", 0)} '
+                    f'[CGTAPD] layer={layer.layer_number} cls={type(layer).__name__} '
+                    f'mid={id(layer) % 100000} call={getattr(layer, "_cg_tap_calls", 0)} '
                     f'{name} sum={d.sum().item():.17e} abs={d.abs().sum().item():.17e}{extra}',
                     flush=True,
                 )
@@ -557,6 +561,7 @@ class GraphableMegatronModule(MegatronModule):
         if os.environ.get('MEGATRON_CG_TENSOR_TAP') or os.environ.get('MEGATRON_CG_TAP_GRAD'):
             if os.environ.get('MEGATRON_CG_TENSOR_TAP'):
                 self._cg_install_deep_taps()
+                self._cg_tap_in_kwarg = kwargs.get('hidden_states')
                 self._cg_tensor_tap('in', args)
             out = self._cg_call_inner(*args, **kwargs)
             if os.environ.get('MEGATRON_CG_TENSOR_TAP'):
