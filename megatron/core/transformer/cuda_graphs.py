@@ -1790,9 +1790,12 @@ def _layer_is_graphable(layer, config):
     if not isinstance(layer, GraphableMegatronModule):
         return False
 
-    # If cuda_graph_modules is not set, every layer is graphed.
+    # If cuda_graph_modules is not set, every layer is graphed (whole-layer
+    # capture includes attention, so it requires a TE-graph-safe attention).
     if not config.cuda_graph_modules:
-        return True
+        return getattr(
+            getattr(layer, 'self_attention', None), 'supports_te_cuda_graph', True
+        )
 
     # import modules here to avoid a circular import
     from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
@@ -1823,9 +1826,13 @@ def _layer_is_graphable(layer, config):
                 # attn-only scope on an MoE inner: the (identity) attention prefix has
                 # nothing graph-worthy, so leave eager.
                 return False
-            if CudaGraphModule.attn in config.cuda_graph_modules and not (
-                isinstance(inner.self_attention, IdentityOp)
-                and isinstance(inner.cross_attention, IdentityOp)
+            if (
+                CudaGraphModule.attn in config.cuda_graph_modules
+                and getattr(inner.self_attention, 'supports_te_cuda_graph', True)
+                and not (
+                    isinstance(inner.self_attention, IdentityOp)
+                    and isinstance(inner.cross_attention, IdentityOp)
+                )
             ):
                 return True
             if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(inner.mlp, MLP):
@@ -1836,11 +1843,18 @@ def _layer_is_graphable(layer, config):
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if CudaGraphModule.attn in config.cuda_graph_modules and not (
-            isinstance(layer.self_attention, IdentityOp)
-            and isinstance(layer.cross_attention, IdentityOp)
+        if (
+            CudaGraphModule.attn in config.cuda_graph_modules
+            and getattr(layer.self_attention, 'supports_te_cuda_graph', True)
+            and not (
+                isinstance(layer.self_attention, IdentityOp)
+                and isinstance(layer.cross_attention, IdentityOp)
+            )
         ):
-            # attn layer.
+            # attn layer. Layers whose attention cannot replay safely under TE
+            # graphs (e.g. GatedDeltaNet) fall through: they are still graphable
+            # via the MoE scopes below, with attention kept eager per
+            # TransformerLayer._cuda_graph_captures_attention().
             return True
         if (
             CudaGraphModule.moe in config.cuda_graph_modules
