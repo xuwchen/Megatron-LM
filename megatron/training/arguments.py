@@ -2135,6 +2135,37 @@ def validate_args(args, defaults={}):
                     "--fsdp-db-use-persist-buf-on-alloc-fail, so that a pool-exhausted "
                     "allocation spills to a persistent buffer instead of failing."
                 )
+        # Activation recompute inside a captured scope is a silent numerical
+        # trap: tensor_parallel.checkpoint / CheckpointWithoutOutput pass through
+        # during graph capture (recompute cannot run inside a graph), so the
+        # captured region runs recompute-OFF while an otherwise-identical eager
+        # baseline runs recompute-ON. Megatron's checkpoint recompute backward is
+        # not bitwise-identical to the plain backward, so the graphed run silently
+        # diverges from eager. Warn when a recompute module can overlap a captured
+        # scope (moe_router captures shared_experts + pre-MLP layernorm; whole /
+        # mlp / moe scopes capture the MLP). See docs on partial CUDA graphs.
+        if (
+            args.cuda_graph_impl != "none"
+            and args.recompute_granularity == "selective"
+            and args.recompute_modules
+        ):
+            _cg_scopes = args.cuda_graph_modules or ["<whole-layer>"]
+            _captures_mlp = (not args.cuda_graph_modules) or any(
+                s in ("mlp", "moe", "moe_router") for s in args.cuda_graph_modules
+            )
+            _overlap = [
+                m for m in args.recompute_modules
+                if (m in ("shared_experts", "moe_act", "mlp") and _captures_mlp)
+                or (m == "layernorm" and (_captures_mlp or "moe_preprocess" in _cg_scopes))
+            ]
+            if _overlap:
+                warn_rank_0(
+                    f"--recompute-modules {_overlap} overlaps the CUDA graph scope "
+                    f"{_cg_scopes}: the captured region runs recompute-off while eager "
+                    "runs recompute-on, which breaks bitwise CUDA-graph/eager alignment "
+                    "(Megatron checkpoint recompute backward differs from the plain "
+                    "backward). Remove these from --recompute-modules for bitwise runs."
+                )
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
