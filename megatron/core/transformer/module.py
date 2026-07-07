@@ -359,7 +359,29 @@ class GraphableMegatronModule(MegatronModule):
 
         for hook, hook_args in self.cuda_graph_manual_hooks:
             hook(*hook_args)
-        return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+        out = self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+
+        # Debug: recompute the same scope eagerly on identical inputs and diff
+        # against the replay output, localizing divergence to inside/outside the
+        # graph. MEGATRON_CG_REPLAY_CHECK=<max_checks> enables it (rank 0 only).
+        cap = int(os.environ.get('MEGATRON_CG_REPLAY_CHECK', '0'))
+        if cap > 0 and getattr(self, '_cg_replay_checks', 0) < cap:
+            self._cg_replay_checks = getattr(self, '_cg_replay_checks', 0) + 1
+            with torch.no_grad():
+                eager_out = self._original_forward(*args, **kwargs)
+            r = out[0] if isinstance(out, (tuple, list)) else out
+            e = eager_out[0] if isinstance(eager_out, (tuple, list)) else eager_out
+            if (torch.is_tensor(r) and torch.is_tensor(e)
+                    and torch.distributed.get_rank() == 0):
+                md = (r.double() - e.double()).abs().max().item()
+                print(
+                    f'[CGREPLAYCHK] layer={getattr(self, "layer_number", "?")} '
+                    f'check={self._cg_replay_checks} bitwise={torch.equal(r, e)} '
+                    f'maxdiff={md:.3e} rsum={r.double().sum().item():.17e} '
+                    f'esum={e.double().sum().item():.17e}',
+                    flush=True,
+                )
+        return out
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         """Helper function to get tensor arguments for TE CUDA graph."""
