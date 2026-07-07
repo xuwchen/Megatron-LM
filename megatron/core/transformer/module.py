@@ -514,6 +514,14 @@ class GraphableMegatronModule(MegatronModule):
                     if torch.is_tensor(ti) and ti.is_floating_point():
                         di = ti.detach().double()
                         extra += f' insum={di.sum().item():.17e}'
+                    if isinstance(inp, (tuple, list)) and len(inp) > 1:
+                        sums = []
+                        for k, t2 in enumerate(inp[1:], 1):
+                            if torch.is_tensor(t2):
+                                sums.append(f'a{k}={t2.detach().double().sum().item():.10e}')
+                            else:
+                                sums.append(f'a{k}={type(t2).__name__}')
+                        extra += ' args[' + ','.join(sums) + ']'
                     wsum = 0.0
                     wnorm = 0.0
                     for p in mod.parameters(recurse=False):
