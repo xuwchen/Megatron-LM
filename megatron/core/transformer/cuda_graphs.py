@@ -2182,9 +2182,16 @@ class TECudaGraphHelper:
                     'rotary_pos_sin',
                     'rotary_pos_cos_sin',
                 )
-                for key, value in getattr(layer, '_cg_observed_tensor_kwargs', {}).items():
-                    if key in _ROTARY_KWARGS and key not in static_inputs:
-                        static_inputs[key] = value.detach().clone()
+                # Only when attention itself is captured: layers that keep
+                # attention eager (scope-split replay) consume rotary outside
+                # the graph and must not declare it as a graph input.
+                attn_in_graph = contains_self_attn and getattr(
+                    layer, '_cuda_graph_captures_attention', lambda: True
+                )()
+                if attn_in_graph:
+                    for key, value in getattr(layer, '_cg_observed_tensor_kwargs', {}).items():
+                        if key in _ROTARY_KWARGS and key not in static_inputs:
+                            static_inputs[key] = value.detach().clone()
                 _sample_kwargs = static_inputs
             elif contains_self_attn:
                 _sample_args = (
