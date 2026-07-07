@@ -459,7 +459,7 @@ class GraphableMegatronModule(MegatronModule):
             ptrs = []
             for p in self.parameters():
                 pd = getattr(p.data, '_local_tensor', p.data)
-                if pd.numel():
+                if pd.numel() and pd.untyped_storage().size() >= pd.numel() * pd.element_size():
                     wsum += pd.detach().double().sum().item()
                     if len(ptrs) < 3:
                         ptrs.append(pd.data_ptr() % 4096)
@@ -510,7 +510,7 @@ class GraphableMegatronModule(MegatronModule):
                     wsum = 0.0
                     for p in mod.parameters(recurse=False):
                         pd = getattr(p.data, '_local_tensor', p.data)
-                        if pd.numel():
+                        if pd.numel() and pd.untyped_storage().size() >= pd.numel() * pd.element_size():
                             wsum += pd.detach().double().sum().item()
                     extra += f' wsum={wsum:.17e}'
                 print(
