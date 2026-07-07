@@ -457,6 +457,7 @@ class GraphableMegatronModule(MegatronModule):
         layer = self
 
         def make_hook(name):
+            @torch.compiler.disable
             def hook(mod, inp, out):
                 if (not torch.distributed.is_initialized()
                         or torch.distributed.get_rank() != 0
