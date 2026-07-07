@@ -1400,6 +1400,30 @@ class MegatronFSDP(torch.nn.Module):
                         f'norm={data.detach().double().norm().item():.17e}',
                         flush=True,
                     )
+                # Per-parameter shard grad norms, filtered by substring list in
+                # MEGATRON_CG_GRAD_TAP_FILTER (comma-separated; empty = skip).
+                filters = [
+                    f
+                    for f in os.environ.get('MEGATRON_CG_GRAD_TAP_FILTER', '').split(',')
+                    if f
+                ]
+                if filters:
+                    for name, param in self.param_and_grad_buffer.optimizer_named_parameters:
+                        if not any(f in name for f in filters):
+                            continue
+                        g = getattr(param, 'decoupled_grad', None)
+                        if g is None:
+                            g = param.grad
+                        if g is None:
+                            continue
+                        g = getattr(g, '_local_tensor', g)
+                        if g is None or g.numel() == 0:
+                            continue
+                        print(
+                            f'[GRADTAPP] iter={n} {name} '
+                            f'norm={g.detach().double().norm().item():.17e}',
+                            flush=True,
+                        )
 
         # Synchronize parameter all-gather operations for all model parameters,
         # which are triggered during the backward pass for FSDP.
