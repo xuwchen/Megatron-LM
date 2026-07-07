@@ -2,6 +2,7 @@
 
 import dataclasses
 import gc
+import random
 import inspect
 import logging
 import math
@@ -17,6 +18,7 @@ from itertools import chain, zip_longest
 from math import ceil
 from typing import Any, Dict, List
 
+import numpy as np
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
@@ -1745,6 +1747,39 @@ class CudaGraphManager(torch.nn.Module):
         return out
 
 
+def _clone_rng_state(state):
+    """Clone a Tensor or graph-safe CUDA Generator state for later restoration."""
+    if hasattr(state, "clone_state"):
+        return state.clone_state()
+    if torch.is_tensor(state):
+        return state.clone()
+    return deepcopy(state)
+
+
+def _snapshot_training_rng_state():
+    """Capture RNG states that CUDA graph warmup must not expose to training."""
+    tracker = get_cuda_rng_tracker()
+    tracker_states = {}
+    for name, state in tracker.get_states().items():
+        tracker_states[name] = _clone_rng_state(state)
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": [state.clone() for state in torch.cuda.get_rng_state_all()],
+        "tracker": tracker_states,
+    }
+
+
+def _restore_training_rng_state(snapshot):
+    """Restore RNG states after CUDA graph capture/warmup."""
+    random.setstate(snapshot["python"])
+    np.random.set_state(snapshot["numpy"])
+    torch.set_rng_state(snapshot["torch_cpu"])
+    torch.cuda.set_rng_state_all(snapshot["torch_cuda"])
+    get_cuda_rng_tracker().set_states(snapshot["tracker"])
+
+
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
 def _layer_is_graphable(layer, config):
     """
@@ -1820,6 +1855,29 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _get_model_with_decoder(model_chunk):
+    """Return the decoder-bearing model for a training model chunk.
+
+    Standard GPT chunks expose ``decoder`` directly (possibly through a
+    ``.module`` wrapper). Multimodal models keep the GPT model under
+    ``language_model``, so resolve that nested module as a fallback.
+    """
+    try:
+        return get_attr_wrapped_model(
+            model_chunk, 'decoder', allow_none=False, return_model_obj=True
+        )
+    except RuntimeError as direct_error:
+        try:
+            language_model = get_attr_wrapped_model(
+                model_chunk, 'language_model', allow_none=False
+            )
+            return get_attr_wrapped_model(
+                language_model, 'decoder', allow_none=False, return_model_obj=True
+            )
+        except RuntimeError:
+            raise direct_error
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -1891,9 +1949,7 @@ class TECudaGraphHelper:
         self.flattened_callables_is_mtp = []
         for chunk_number, model_chunk in enumerate(self.model):
             try:
-                chunk_with_decoder = get_attr_wrapped_model(
-                    model_chunk, 'decoder', allow_none=False, return_model_obj=True
-                )
+                chunk_with_decoder = _get_model_with_decoder(model_chunk)
             except RuntimeError:
                 num_graphable_layers = 0
                 log_on_each_pipeline_stage(
@@ -2900,10 +2956,14 @@ class TECudaGraphHelper:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context:
-                graphs = make_graphed_callables(
-                    tuple(self.flattened_callables), sample_args, **kwargs
-                )
+            rng_snapshot = _snapshot_training_rng_state()
+            try:
+                with rng_context:
+                    graphs = make_graphed_callables(
+                        tuple(self.flattened_callables), sample_args, **kwargs
+                    )
+            finally:
+                _restore_training_rng_state(rng_snapshot)
 
             # Restore original hooks to callables after CUDA Graph capture.
             # restore_hooks contains only the hooks cleared before capture; _with_kwargs flag dicts

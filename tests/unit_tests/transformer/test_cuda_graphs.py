@@ -34,6 +34,7 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _get_model_with_decoder,
     _layer_is_graphable,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
@@ -57,6 +58,48 @@ from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, _ = check_fp8_support()
+
+
+class TestCudaGraphModelDiscovery:
+    def test_direct_decoder_model(self):
+        class Model:
+            pass
+
+        model = Model()
+        model.decoder = object()
+
+        assert _get_model_with_decoder(model) is model
+
+    def test_nested_multimodal_language_model(self):
+        class Model:
+            pass
+
+        language_model = Model()
+        language_model.decoder = object()
+        multimodal_model = Model()
+        multimodal_model.language_model = language_model
+
+        assert _get_model_with_decoder(multimodal_model) is language_model
+
+    def test_wrapped_nested_multimodal_language_model(self):
+        class Model:
+            pass
+
+        language_model = Model()
+        language_model.decoder = object()
+        multimodal_model = Model()
+        multimodal_model.language_model = language_model
+        wrapper = Model()
+        wrapper.module = multimodal_model
+
+        assert _get_model_with_decoder(wrapper) is language_model
+
+    def test_missing_decoder_raises(self):
+        class Model:
+            pass
+
+        with pytest.raises(RuntimeError, match="couldn't find attribute decoder"):
+            _get_model_with_decoder(Model())
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
