@@ -496,9 +496,23 @@ class GraphableMegatronModule(MegatronModule):
                 if not torch.is_tensor(t) or not t.is_floating_point():
                     return
                 d = t.detach().double()
+                extra = ''
+                if os.environ.get('MEGATRON_CG_TENSOR_TAP_DEEP_IO'):
+                    ti = inp
+                    while isinstance(ti, (tuple, list)) and ti:
+                        ti = ti[0]
+                    if torch.is_tensor(ti) and ti.is_floating_point():
+                        di = ti.detach().double()
+                        extra += f' insum={di.sum().item():.17e}'
+                    wsum = 0.0
+                    for p in mod.parameters(recurse=False):
+                        pd = getattr(p.data, '_local_tensor', p.data)
+                        if pd.numel():
+                            wsum += pd.detach().double().sum().item()
+                    extra += f' wsum={wsum:.17e}'
                 print(
                     f'[CGTAPD] layer={layer.layer_number} call={getattr(layer, "_cg_tap_calls", 0)} '
-                    f'{name} sum={d.sum().item():.17e} abs={d.abs().sum().item():.17e}',
+                    f'{name} sum={d.sum().item():.17e} abs={d.abs().sum().item():.17e}{extra}',
                     flush=True,
                 )
             return hook
