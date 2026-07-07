@@ -425,9 +425,20 @@ class GraphableMegatronModule(MegatronModule):
         if t is None or not torch.is_tensor(t):
             return
         d = t.detach().double()
+        extra = ''
+        if tag == 'in' or os.environ.get('MEGATRON_CG_TENSOR_TAP_WEIGHTS'):
+            wsum = 0.0
+            ptrs = []
+            for p in self.parameters():
+                pd = getattr(p.data, '_local_tensor', p.data)
+                if pd.numel():
+                    wsum += pd.detach().double().sum().item()
+                    if len(ptrs) < 3:
+                        ptrs.append(pd.data_ptr() % 4096)
+            extra = f' wsum={wsum:.17e} align={ptrs}'
         print(
             f'[CGTAP] layer={getattr(self, "layer_number", "?")} call={n} {tag} '
-            f'sum={d.sum().item():.17e} abs={d.abs().sum().item():.17e}',
+            f'sum={d.sum().item():.17e} abs={d.abs().sum().item():.17e}{extra}',
             flush=True,
         )
 

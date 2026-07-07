@@ -9,6 +9,7 @@ import gc
 import inspect
 import logging
 import math
+import os
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
@@ -836,11 +837,18 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 # Requires synchronization for new buffer allocation
                 self.allocation_tracker[(buffer_name, dtype)] = size
                 torch.cuda.synchronize()
-        return Bucket(
+        bucket = Bucket(
             data=get_global_memory_buffer().get_tensor(
                 [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
             )
         )
+        if os.environ.get('MEGATRON_CG_ALLOC_TRACE') and torch.distributed.get_rank() == 0:
+            print(
+                f'[ALLOCTRACE] {self.name} bucket={bucket_id} name={buffer_name} '
+                f'ptr={bucket.data.data_ptr():#x} align={bucket.data.data_ptr() % 4096}',
+                flush=True,
+            )
+        return bucket
 
     def _get_gbuf_name(self, buf_group_id: int, bucket_index: int):
         return f"{self.name}_{buf_group_id}_{bucket_index}"
@@ -1002,11 +1010,18 @@ class PlannedBucketAllocator(TemporaryBucketAllocator):
                 f"its storage and invalidate graph-baked addresses. Refusing."
             )
         buffer_name = self._get_planned_buf_name(color, bucket_offset)
-        return Bucket(
+        bucket = Bucket(
             data=get_global_memory_buffer().get_tensor(
                 [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
             )
         )
+        if os.environ.get('MEGATRON_CG_ALLOC_TRACE') and torch.distributed.get_rank() == 0:
+            print(
+                f'[ALLOCTRACE] {self.name} bucket={bucket_id} name={buffer_name} '
+                f'ptr={bucket.data.data_ptr():#x} align={bucket.data.data_ptr() % 4096}',
+                flush=True,
+            )
+        return bucket
 
     def freeze_plan(self, graph_bucket_ids, capture_resident=False) -> None:
         """Color graph-covered buckets by recorded lifetimes and freeze the plan.
