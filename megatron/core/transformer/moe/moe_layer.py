@@ -765,6 +765,34 @@ class MoELayer(BaseMoELayer):
                     hidden_states, probs = intermediate_tensors
 
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
+
+                import os as _os
+                if _os.environ.get('MEGATRON_CG_ROUTER_TAP') and \
+                        torch.distributed.get_rank() == 0 and \
+                        getattr(self, 'layer_number', None) == 1 and \
+                        not torch.cuda.is_current_stream_capturing():
+                    n = getattr(self, '_cg_dispatch_tap', 0)
+                    self._cg_dispatch_tap = n + 1
+                    if n < int(_os.environ['MEGATRON_CG_ROUTER_TAP']):
+                        dd = dispatched_input.detach().double()
+                        td = self.token_dispatcher
+                        def _v(name):
+                            t = td.get_cudagraph_attr(name)
+                            if torch.is_tensor(t):
+                                return f'{t.detach().double().sum().item():.10e}'
+                            return str(t)
+                        print(
+                            f'[DSPTAP] layer=1 call={n} '
+                            f'hkey={hidden_states.detach().double().sum().item():.17e} '
+                            f'dsum={dd.sum().item():.17e} dnorm={dd.norm().item():.17e} '
+                            f'dshape={tuple(dispatched_input.shape)} '
+                            f'tpe={_v("tokens_per_expert")} isp={_v("input_splits")} '
+                            f'osp={_v("output_splits")} nout={_v("num_out_tokens")} '
+                            f'rperm={_v("reversed_local_input_permutation_mapping")} '
+                            f'cfc1={_v("shared_experts.cached_fc1_input")}',
+                            flush=True,
+                        )
+
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None
