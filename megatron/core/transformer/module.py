@@ -404,7 +404,42 @@ class GraphableMegatronModule(MegatronModule):
             and (is_graph_capturing() or self.cuda_graphs)
         )
 
+    def _cg_tensor_tap(self, tag, args, out=None):
+        """Env-gated numerical tap: print double-precision checksums of layer
+        boundary tensors so an eager and a CG run can be diffed call-by-call.
+        MEGATRON_CG_TENSOR_TAP=<max_calls_per_layer> enables it (rank 0 only)."""
+        cap = int(os.environ.get('MEGATRON_CG_TENSOR_TAP', '0'))
+        if cap <= 0 or not torch.distributed.is_initialized() or torch.distributed.get_rank() != 0:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            # .item() below is a D2H sync — illegal inside stream capture.
+            return
+        n = getattr(self, '_cg_tap_calls', 0)
+        if tag == 'in':
+            self._cg_tap_calls = n + 1
+        if n >= cap:
+            return
+        t = out if out is not None else (args[0] if args else None)
+        if isinstance(t, (tuple, list)):
+            t = t[0] if t and torch.is_tensor(t[0]) else None
+        if t is None or not torch.is_tensor(t):
+            return
+        d = t.detach().double()
+        print(
+            f'[CGTAP] layer={getattr(self, "layer_number", "?")} call={n} {tag} '
+            f'sum={d.sum().item():.17e} abs={d.abs().sum().item():.17e}',
+            flush=True,
+        )
+
     def __call__(self, *args, **kwargs):
+        if os.environ.get('MEGATRON_CG_TENSOR_TAP'):
+            self._cg_tensor_tap('in', args)
+            out = self._cg_call_inner(*args, **kwargs)
+            self._cg_tensor_tap('out', args, out=out)
+            return out
+        return self._cg_call_inner(*args, **kwargs)
+
+    def _cg_call_inner(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
         elif self._should_call_te_cudagraph(*args, **kwargs):
