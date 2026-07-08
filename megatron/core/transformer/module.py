@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module."""
+import os
 from functools import partial
 from typing import Optional, Tuple
 
@@ -20,6 +21,15 @@ from megatron.core.transformer.utils import (
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
+
+# Tensor kwargs that carry rotary-position data into a transformer layer. TE
+# CUDA graphs must declare these as static inputs so replay copies each
+# microbatch's runtime values into the captured buffers. Keep this allowlist
+# narrow: observing arbitrary tensor kwargs can change capture-time control
+# flow in unrelated modules (for example, the fused MoE auxiliary loss).
+_TE_CUDA_GRAPH_ROTARY_KWARGS = frozenset(
+    {'rotary_pos_emb', 'rotary_pos_cos', 'rotary_pos_sin', 'rotary_pos_cos_sin'}
+)
 
 
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
@@ -176,6 +186,7 @@ class GraphableMegatronModule(MegatronModule):
 
                 self.cudagraph_manager = CudaGraphManager(config)
         elif config.cuda_graph_impl == "transformer_engine":
+            self._cg_rotary_observation_enabled = True
             # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
             # the number of microbatches. Multiple CUDA graphs per layer is required to support
             # pipelining which requires running FWD graph of multiple microbatches before BWD
@@ -326,6 +337,33 @@ class GraphableMegatronModule(MegatronModule):
                 v, torch.Tensor
             ), "CUDA graph accepts only Tensor inputs."
 
+        # Address-invariant safety net: the graph replays kernels against the
+        # absolute parameter addresses recorded at capture. If the FSDP
+        # allocator hands this layer's buckets a different address (slot
+        # re-assignment after eval/checkpoint/schedule perturbation), fail loudly
+        # instead of silently reading another bucket's weights.
+        snapshot = getattr(self, '_cg_param_ptr_snapshot', None)
+        if (
+            snapshot is not None
+            and os.environ.get('MEGATRON_CG_SKIP_BUFFER_ADDRESS_CHECK', '0') != '1'
+        ):
+            for name, param in self.named_parameters():
+                expected = snapshot.get(name)
+                if expected is None:
+                    continue
+                data = getattr(param.data, '_local_tensor', param.data)
+                actual = (data.data_ptr(), data.numel(), data.dtype)
+                if actual != expected:
+                    raise RuntimeError(
+                        f"CUDA graph buffer address changed between capture and "
+                        f"replay for parameter '{name}' of {type(self).__name__}: "
+                        f"captured (ptr={expected[0]:#x}, numel={expected[1]}, "
+                        f"dtype={expected[2]}) vs current (ptr={actual[0]:#x}, "
+                        f"numel={actual[1]}, dtype={actual[2]}). FSDP double-buffer "
+                        f"slot re-assignment would silently corrupt training. Set "
+                        f"MEGATRON_CG_SKIP_BUFFER_ADDRESS_CHECK=1 to bypass."
+                    )
+
         cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
 
@@ -379,7 +417,26 @@ class GraphableMegatronModule(MegatronModule):
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
-        elif self._should_call_te_cudagraph(*args, **kwargs):
+        # Record the tensor kwargs of eager pre-capture calls so capture can
+        # declare them as static graph inputs. Predicting them from config
+        # misses model-computed inputs (e.g. multimodal mrope rotary tensors
+        # passed down per microbatch); a graph captured without them bakes an
+        # attention that silently drops those inputs on replay.
+        if (
+            getattr(self.config, 'cuda_graph_impl', None) == "transformer_engine"
+            and self.training
+            and not self.cuda_graphs
+            and getattr(self, '_cg_rotary_observation_enabled', True)
+        ):
+            from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+            if not is_graph_capturing():
+                self._cg_observed_tensor_kwargs = {
+                    k: v.detach()
+                    for k, v in kwargs.items()
+                    if k in _TE_CUDA_GRAPH_ROTARY_KWARGS and isinstance(v, torch.Tensor)
+                }
+        if self._should_call_te_cudagraph(*args, **kwargs):
             # Temporarily replace forward with cuda graph function
             self._original_forward = self.forward
             try:
