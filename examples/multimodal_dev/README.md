@@ -136,7 +136,11 @@ alignment semantics to the final global packed tail before model-side CP. With
 ordinary dummy THD sequence. It adds only token rows, zero loss, and
 `padding_mask=true`; it never adds pixels, grid rows, or IMG placeholders.
 `--max-seqlen-per-dp-cp-rank` is also required by argument validation and is
-the CP-local cap (for example, 128K / CP8 = 16384).
+the CP-local cap (for example, 128K / CP8 = 16384). The multimodal argument
+provider exposes the requested positive
+`--pad-packed-seq-by-appending-dummy-seq` compatibility alias; the value is
+already true by default, and core's `--no-pad-packed-seq-by-appending-dummy-seq`
+can still disable it (which this local packed path rejects when padding is on).
 
 ## Checkpoint Conversion (HF → Megatron-FSDP DTensor)
 
