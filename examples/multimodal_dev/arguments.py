@@ -25,7 +25,7 @@ def add_multimodal_args(parser):
         "--dataset-provider",
         type=str,
         default="mock",
-        help="Dataset provider: mock",
+        help="Dataset provider: mock, mock_varlen, or cord_v2",
     )
     group.add_argument(
         "--image-token-id",
@@ -38,6 +38,17 @@ def add_multimodal_args(parser):
         type=int,
         default=224,
         help="Image size (height and width) for mock data",
+    )
+    group.add_argument(
+        "--mock-image-size-config-json",
+        type=str,
+        default=None,
+        help=(
+            "Dynamic processed-image resolution config for mock_varlen. Accepts "
+            "inline JSON or a JSON-file path with schema "
+            '{"mode":"buckets","resolutions":[[224,224],[224,448],[448,224]]}. '
+            "When omitted, --image-size remains the fixed square resolution."
+        ),
     )
     group.add_argument(
         "--total-seq-length",

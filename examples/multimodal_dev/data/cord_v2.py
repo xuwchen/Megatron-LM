@@ -128,12 +128,12 @@ class CordV2VLMDataset(Dataset):
         target_length: Virtual dataset length (repeats examples if needed).
 
     NOTE:
-        For the Qwen3.5-VL processor, the temporal patch dimension is
-        always 2 (the processor duplicates a single frame so the 3D conv
-        behaves like a 2D conv on one image) — ``image_grid_thw`` therefore
-        has shape ``[num_images, 3]`` with ``T=2`` per image.
-        ``pixel_values`` has shape ``[total_patches, 3 * T * P * P]`` where
-        ``P`` is the processor's patch size.
+        For a still image, the Qwen3.5-VL processor reports
+        ``image_grid_thw=[1, H, W]``. Its ``temporal_patch_size=2`` is
+        folded into each flattened pixel row after duplicating the frame; it
+        is not the grid's temporal-group count. ``pixel_values`` therefore
+        has shape ``[total_patches, 3 * temporal_patch_size * P * P]``, where
+        ``P`` is the processor's spatial patch size.
     """
 
     def __init__(

@@ -10,8 +10,11 @@ multimodal_dev/
 ├── pretrain_multimodal.py   # Training entry point (model-agnostic)
 ├── forward_step.py          # Forward step, TP broadcast, loss computation
 ├── arguments.py             # Multimodal CLI arguments
+├── VARLEN_MOCK_DATASET.md   # Text and multimodal varlen design guide
 ├── data/
-│   └── mock.py              # Mock dataset for end-to-end testing
+│   ├── mock.py              # Fixed-length mock data for end-to-end testing
+│   ├── mock_varlen.py       # Variable-length mock image-text data
+│   └── cord_v2.py           # CORD-V2 receipt-OCR data provider
 ├── models/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
 │   ├── base.py              # MultimodalModel base class (vision encoder + GPTModel)
@@ -33,6 +36,107 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
     --dataset-provider mock \
     ... # other Megatron args (--num-layers, --hidden-size, etc.)
 ```
+
+## Variable-Length Mock Data
+
+For the text-only baseline introduced by
+[NVIDIA/Megatron-LM#4832](https://github.com/NVIDIA/Megatron-LM/pull/4832), and the
+multimodal extension described here, see
+[Mock Variable-Length Datasets: Text and Multimodal](VARLEN_MOCK_DATASET.md).
+The guide covers the contracts, packing diagrams, and supported scope.
+
+`mock_varlen` generates one complete, unpadded Qwen3.5-VL image-text
+sequence per dataset item. Use the identity collator because token lengths
+differ and the token and vision payloads must remain associated per sample.
+Add `--use-packed-sequence` when the intended decoder layout is packed THD:
+
+```bash
+torchrun --nproc_per_node=8 examples/multimodal_dev/pretrain_multimodal.py \
+    --model-arch qwen35_vl \
+    --dataset-provider mock_varlen \
+    --seq-length 32768 \
+    --total-seq-length 32768 \
+    --use-vanilla-collate-fn \
+    --use-packed-sequence \
+    --linear-cp-mode chunkwise \
+    --max-seqlen-per-dp-cp-rank 32768 \
+    --pad-packed-seq-alignment 128 \
+    --pad-packed-seq-by-appending-dummy-seq \
+    --varlen-mock-dataset-config-json \
+      '{"mode":"distribution","type":"lognormal","min_seq_len":1024,"max_seq_len":32768,"mean_seq_len":8192,"lognormal_sigma":1.1}' \
+    --mock-image-size-config-json \
+      '{"mode":"buckets","resolutions":[[224,224],[224,448],[448,224],[448,448]]}' \
+    ... # other Megatron model and training arguments
+```
+
+The provider reuses `--varlen-mock-dataset-config-json`. It accepts either
+the lognormal `distribution` form above or a headerless CSV containing one or
+more integer sequence lengths:
+
+```bash
+--varlen-mock-dataset-config-json \
+  '{"mode":"file","path":"/path/to/sequence_lengths.csv"}'
+```
+
+Dynamic image resolutions are optional. `--mock-image-size-config-json`
+accepts inline JSON or a JSON-file path with processed `[height, width]`
+buckets. Each dimension must be divisible by
+`patch_size * spatial_merge_size`. The sampler deterministically cycles
+through the buckets that fit the sampled `L_i`; without this option,
+`--image-size` remains the fixed square fallback.
+
+`--use-vanilla-collate-fn` is required for `mock_varlen`.
+`--use-packed-sequence` selects the multimodal THD packer; without it,
+`pack_or_pad_batch` produces a padded BSHD batch instead. Do **not** add
+`--use-varlen-dataset` or `--sequence-packing-scheduler`: those options
+select the text-only core scheduler, whose sample schema and communication path
+do not carry the ragged vision tensors. `--sft` is not required to select
+`mock_varlen`; an existing SFT recipe may retain it for its loss-reporting
+semantics as long as the text-only `--use-varlen-dataset` flag is absent.
+
+```text
+MockQwen35VLVarlenDataset
+    |  one unpadded five-field sample
+    v
+identity collate (--use-vanilla-collate-fn)
+    |  list[dict[str, Tensor]]
+    v
+pack_or_pad_batch
+    |-- padded BSHD (default)
+    `-- packed THD + PackedSeqParams (--use-packed-sequence)
+             |  optional final-tail alignment + dummy THD sequence
+             v
+Qwen3.5-VL: MRoPE -> vision encode -> masked scatter
+             |
+             v
+context-parallel split -> language decoder
+```
+
+Each dataset item has exactly these fields:
+
+| Field | Per-sample shape | Meaning |
+|-------|------------------|---------|
+| `input_ids` | `[L_i]` | Text tokens plus one complete image-placeholder block |
+| `labels` | `[L_i]` | Shifted next-token labels; ignored targets are `-100` |
+| `loss_mask` | `[L_i]` | Float mask aligned with `labels` |
+| `pixel_values` | `[P_i, D]` | Flattened raw image patches for the vision encoder |
+| `image_grid_thw` | `[1, 3]` | The synthetic image's `(T, H, W)` patch grid |
+
+Here `L_i` is the unpadded multimodal token length, `P_i = T * H * W`, and
+`D = 3 * temporal_patch_size * patch_size * patch_size`. For a still image,
+`T=1`; `temporal_patch_size` is already folded into `D`. Dynamic buckets
+make `H`, `W`, `P_i`, and the merged placeholder count vary per sample
+while `D` stays constant, so vision embeddings and placeholder positions
+remain one-to-one.
+
+When `--pad-packed-seq-alignment` is set, the multimodal packer first keeps
+each real sample aligned for static CP/SP, then applies the same CP-local
+alignment semantics to the final global packed tail before model-side CP. With
+`--pad-packed-seq-by-appending-dummy-seq`, the tail is represented as an
+ordinary dummy THD sequence. It adds only token rows, zero loss, and
+`padding_mask=true`; it never adds pixels, grid rows, or IMG placeholders.
+`--max-seqlen-per-dp-cp-rank` is also required by argument validation and is
+the CP-local cap (for example, 128K / CP8 = 16384).
 
 ## Checkpoint Conversion (HF → Megatron-FSDP DTensor)
 
