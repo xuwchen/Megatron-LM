@@ -566,7 +566,8 @@ length arrays are not interchangeable.
 - Builds shifted labels and target-aligned loss masks.
 - Adds train/validation/test providers with independent seeds.
 - Fails fast for invalid geometry, core scheduler flags, missing identity
-  collate, or unequal sequence-length arguments.
+  collate, unequal sequence-length arguments, or packed HybridEP without
+  group-wide variable-token padding.
 
 ### examples/multimodal_dev/arguments.py
 
@@ -607,6 +608,7 @@ Minimal packed-THD selection with dynamic processed resolutions:
 --max-seqlen-per-dp-cp-rank 32768 \
 --pad-packed-seq-alignment 128 \
 --pad-packed-seq-by-appending-dummy-seq \
+--moe-hybridep-pad-variable-tokens \
 --varlen-mock-dataset-config-json \
   '{"mode":"distribution","type":"lognormal","min_seq_len":1024,"max_seq_len":32768,"mean_seq_len":8192,"lognormal_sigma":1.1}' \
 --mock-image-size-config-json \
@@ -617,6 +619,13 @@ The image-size config accepts an inline JSON object or a path to a JSON file.
 Bucket dimensions are post-processor pixel sizes and must be aligned to
 <code>patch_size * spatial_merge_size</code>. Omitting it preserves the fixed
 square <code>--image-size</code> path.
+
+The HybridEP flag is required only with
+<code>--moe-token-dispatcher-type flex</code> and
+<code>--moe-flex-dispatcher-backend hybridep</code>. Local THD packing can
+produce different token counts across the HybridEP group; this option pads to
+the group maximum before dispatch and trims after combine. The provider
+rejects that HybridEP combination when the flag is absent.
 
 Do not combine this provider with:
 

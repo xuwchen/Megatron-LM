@@ -2,10 +2,16 @@
 
 """CPU-only tests for the variable-length Qwen3.5-VL mock dataset."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from examples.multimodal_dev.data.mock_varlen import MockQwen35VLVarlenDataset
+import megatron.training
+from examples.multimodal_dev.data.mock_varlen import (
+    MockQwen35VLVarlenDataset,
+    train_valid_test_varlen_datasets_provider,
+)
 
 _IMAGE_TOKEN_ID = 97
 _VIDEO_TOKEN_ID = 98
@@ -52,6 +58,21 @@ def _assert_samples_equal(lhs, rhs):
     assert lhs.keys() == rhs.keys()
     for key in lhs:
         assert torch.equal(lhs[key], rhs[key]), key
+
+
+def test_provider_rejects_packed_hybridep_without_variable_token_padding(monkeypatch):
+    args = SimpleNamespace(
+        use_varlen_dataset=False,
+        sequence_packing_scheduler=None,
+        use_packed_sequence=True,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_hybridep_pad_variable_tokens=False,
+    )
+    monkeypatch.setattr(megatron.training, "get_args", lambda: args)
+
+    with pytest.raises(ValueError, match="--moe-hybridep-pad-variable-tokens"):
+        train_valid_test_varlen_datasets_provider((1, 1, 1))
 
 
 def test_file_lengths_are_exact_and_repeat(tmp_path):

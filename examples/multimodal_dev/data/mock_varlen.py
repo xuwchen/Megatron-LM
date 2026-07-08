@@ -453,6 +453,17 @@ def train_valid_test_varlen_datasets_provider(
             "--sequence-packing-scheduler; vision payloads are packed by "
             "multimodal_dev.forward_step instead."
         )
+    uses_hybridep = (
+        getattr(args, "use_packed_sequence", False)
+        and getattr(args, "moe_token_dispatcher_type", None) == "flex"
+        and getattr(args, "moe_flex_dispatcher_backend", None) == "hybridep"
+    )
+    if uses_hybridep and not getattr(args, "moe_hybridep_pad_variable_tokens", False):
+        raise ValueError(
+            "The multimodal mock_varlen provider requires "
+            "--moe-hybridep-pad-variable-tokens with packed THD + HybridEP; "
+            "locally packed token counts can differ across the HybridEP group."
+        )
     if not getattr(args, "use_vanilla_collate_fn", False):
         raise ValueError(
             "The multimodal mock_varlen provider requires --use-vanilla-collate-fn "
