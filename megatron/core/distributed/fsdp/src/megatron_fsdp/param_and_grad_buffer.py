@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import gc
 import inspect
+import itertools
 import logging
 import math
 import traceback
@@ -45,6 +46,23 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Standalone users do not have Megatron-LM's model-chunk wiring available. A
+# process-local sequence still keeps their GlobalMemoryBuffer names disjoint.
+# Distributed standalone callers must construct ParamAndGradBuffer instances in
+# the same order on every rank, which is already required for matching FSDP
+# collective order.
+_PARAM_AND_GRAD_BUFFER_INSTANCE_IDS = itertools.count()
+
+
+def _get_allocator_namespace(module: torch.nn.Module) -> str:
+    """Return the process-local namespace for one parameter-and-gradient buffer."""
+    instance_id = next(_PARAM_AND_GRAD_BUFFER_INSTANCE_IDS)
+    namespace = getattr(module, '_megatron_fsdp_buffer_namespace', None)
+    if namespace is not None:
+        return f"{namespace}_param_and_grad_buffer_{instance_id}"
+    return f"param_and_grad_buffer_{instance_id}"
 
 
 def _same_tensor_view(a: Optional[torch.Tensor], b: torch.Tensor) -> bool:
@@ -2079,6 +2097,7 @@ class ParamAndGradBuffer:
         self.ddp_config = ddp_config
         self.use_decoupled_grad = ddp_config.megatron_fsdp_use_decoupled_grad
         self.module = module
+        self._allocator_namespace = _get_allocator_namespace(module)
         self.bucketing_policy = bucketing_policy
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
         self.mp_policy = mixed_precision_policy
@@ -2560,19 +2579,19 @@ class ParamAndGradBuffer:
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             UB_BUFFER_NUM = 2
             self.weight_alloc = FixedPoolAllocator(
-                name="fsdp_params",
+                name=f"{self._allocator_namespace}_fsdp_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.transpose_weight_alloc = FixedPoolAllocator(
-                name="fsdp_fp8_transpose_params",
+                name=f"{self._allocator_namespace}_fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.main_grad_alloc = FixedPoolAllocator(
-                name="fsdp_grads",
+                name=f"{self._allocator_namespace}_fsdp_grads",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=(
@@ -2585,7 +2604,7 @@ class ParamAndGradBuffer:
                 # low-precision gradient communication over DP-Outer for H(F)SDP.
                 # Otherwise, this allocator will never be used.
                 self.hsdp_grad_comm_alloc = FixedPoolAllocator(
-                    name="hsdp_grad_comm",
+                    name=f"{self._allocator_namespace}_hsdp_grad_comm",
                     fsdp_param_groups=self.parameter_groups,
                     size=UB_BUFFER_NUM,
                     fallback_to_persistent_buffer=(
