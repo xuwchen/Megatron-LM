@@ -1888,6 +1888,29 @@ def _layer_is_graphable(layer, config, *, use_megatron_fsdp=False):
     return False
 
 
+def _get_model_with_decoder(model_chunk):
+    """Return the decoder-bearing model for a training model chunk.
+
+    Standard GPT chunks expose ``decoder`` directly (possibly through a
+    ``.module`` wrapper). Multimodal models keep the GPT model under
+    ``language_model``, so resolve that nested module as a fallback.
+    """
+    try:
+        return get_attr_wrapped_model(
+            model_chunk, 'decoder', allow_none=False, return_model_obj=True
+        )
+    except RuntimeError as direct_error:
+        try:
+            language_model = get_attr_wrapped_model(
+                model_chunk, 'language_model', allow_none=False
+            )
+            return get_attr_wrapped_model(
+                language_model, 'decoder', allow_none=False, return_model_obj=True
+            )
+        except RuntimeError:
+            raise direct_error
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -1967,9 +1990,7 @@ class TECudaGraphHelper:
 
         for chunk_number, model_chunk in enumerate(self.model):
             try:
-                chunk_with_decoder = get_attr_wrapped_model(
-                    model_chunk, 'decoder', allow_none=False, return_model_obj=True
-                )
+                chunk_with_decoder = _get_model_with_decoder(model_chunk)
             except RuntimeError:
                 num_graphable_layers = 0
                 log_on_each_pipeline_stage(
