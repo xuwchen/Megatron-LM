@@ -3214,6 +3214,18 @@ class TECudaGraphHelper:
             finally:
                 _restore_training_rng_state(rng_snapshot)
 
+            # Address-invariant safety net: freeze each graphed layer's parameter
+            # storage addresses as of capture. _te_cuda_graph_replay re-verifies
+            # them before every replay, turning any FSDP buffer re-slotting into
+            # an immediate hard error instead of silent numerical corruption.
+            for callable_module in self.flattened_callables:
+                if not isinstance(callable_module, torch.nn.Module):
+                    continue
+                snapshot = {}
+                for name, param in callable_module.named_parameters():
+                    data = getattr(param.data, '_local_tensor', param.data)
+                    snapshot[name] = (data.data_ptr(), data.numel(), data.dtype)
+                callable_module._cg_param_ptr_snapshot = snapshot
 
             # Restore original hooks to callables after CUDA Graph capture.
             # restore_hooks contains only the hooks cleared before capture; _with_kwargs flag dicts
