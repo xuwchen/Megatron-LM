@@ -86,7 +86,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
     mirroring ``HyperConnectionTransformerLayer`` on the GPT path. Without this, the TE
     graph discovery (``_layer_is_graphable``) only inspects the top-level layer type and
     silently skips every wrapped layer, so an mHC-enabled HybridStack would run entirely
-    eager. Two capture modes:
+    eager. Megatron-FSDP is an explicit exception: its parameter lifecycle hooks currently
+    live on the inner layer, so graph discovery keeps this wrapper eager until those hooks
+    can be safely lifted to the wrapper boundary. Otherwise, two capture modes are available:
 
     * Non-MoE inner layers (attention variants, Mamba): the whole wrapper forward
       (mHC aggregate + inner layer + n-stream BDA) is captured as one graph. The inner
