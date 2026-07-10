@@ -2055,6 +2055,8 @@ class TECudaGraphHelper:
     parameters that are covered by cudagraphs.
     """
 
+    configures_language_fsdp_double_buffer = True
+
     def __init__(
         self,
         model,
@@ -2102,6 +2104,7 @@ class TECudaGraphHelper:
 
         self._rotary_observation_roots = []
         self._discover_layers()
+        self._configure_fsdp_planned_double_buffers()
 
         # Flags to track CUDA Graph state:
         # - _capture_finished: Whether create_cudagraphs() has been called (used by training loop)
@@ -3118,6 +3121,109 @@ class TECudaGraphHelper:
                 fsdp_instances.append(obj)
         return fsdp_instances
 
+    def _iter_language_decoder_layers(self):
+        """Yield language decoder and MTP FSDP-unit modules discovered on this rank."""
+        for chunk_with_decoder in self.chunks_with_decoder:
+            if chunk_with_decoder is None:
+                continue
+            yield from chunk_with_decoder.decoder.layers
+            if hasattr(chunk_with_decoder, 'mtp'):
+                for mtp_layer in chunk_with_decoder.mtp.layers:
+                    yield mtp_layer.mtp_model_layer
+
+    def _configure_fsdp_planned_double_buffers(self):
+        """Configure only language decoder units before the first eager warmup."""
+        planned_fsdp_modules = []
+        for fsdp_module in self._get_megatron_fsdp_instances():
+            pgb = fsdp_module.param_and_grad_buffer
+            if getattr(
+                pgb.ddp_config, 'megatron_fsdp_use_planned_double_buffer', False
+            ):
+                planned_fsdp_modules.append(fsdp_module)
+
+        if not self.configures_language_fsdp_double_buffer:
+            if planned_fsdp_modules:
+                raise RuntimeError(
+                    "Vision Transformer Engine CUDA graph capture is not supported "
+                    "with Megatron-FSDP planned double buffering. Keep the Vision "
+                    "encoder eager."
+                )
+            return
+
+        decoder_layers = tuple(self._iter_language_decoder_layers())
+        configurations = []
+        mapped_param_ids = set()
+        for fsdp_module in planned_fsdp_modules:
+            pgb = fsdp_module.param_and_grad_buffer
+            decoder_bucket_ids = set()
+            for layer in decoder_layers:
+                for param in layer.parameters():
+                    bucket_id = pgb.param_to_param_group.get(param)
+                    if bucket_id is None:
+                        bucket_id = pgb.param_to_param_group.get(
+                            getattr(param, 'orig_param', param)
+                        )
+                    if bucket_id is not None:
+                        decoder_bucket_ids.add(bucket_id)
+                        mapped_param_ids.add(id(param))
+            configurations.append((pgb, decoder_bucket_ids))
+
+        unmapped_graph_params = [
+            param
+            for callable_module in self.flattened_callables
+            if isinstance(callable_module, torch.nn.Module)
+            for param in callable_module.parameters()
+            if id(param) not in mapped_param_ids
+        ]
+        if planned_fsdp_modules and unmapped_graph_params:
+            raise RuntimeError(
+                "Every Transformer Engine graph callable parameter must map to a "
+                "Megatron-FSDP planned decoder unit before warmup; "
+                f"{len(unmapped_graph_params)} parameter(s) were not mapped."
+            )
+
+        for pgb, decoder_bucket_ids in configurations:
+            pgb.configure_planned_double_buffer(decoder_bucket_ids)
+
+    def _graph_bucket_ids_for_fsdp_module(self, fsdp_module):
+        """Collect graph buckets and validate captured FSDP hook boundaries."""
+        pgb = fsdp_module.param_and_grad_buffer
+        graph_bucket_ids = set()
+        missing_unit_hook_buckets = set()
+        for callable_module in self.flattened_callables:
+            if not isinstance(callable_module, torch.nn.Module):
+                continue
+            owns_fsdp_pre_backward_boundary = any(
+                getattr(hook, _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR, None) is not None
+                for hook in getattr(callable_module, '_forward_hooks', {}).values()
+            )
+            for param in callable_module.parameters():
+                bucket_id = pgb.param_to_param_group.get(param)
+                if bucket_id is None:
+                    bucket_id = pgb.param_to_param_group.get(
+                        getattr(param, 'orig_param', param)
+                    )
+                if bucket_id is None:
+                    continue
+                graph_bucket_ids.add(bucket_id)
+                group = pgb.parameter_groups[bucket_id]
+                distributed_storage = any(
+                    getattr(getattr(group, attr, None), 'is_data_distributed', False)
+                    for attr in (
+                        'model_weight_buffer',
+                        'transpose_weight_buffer',
+                        'main_grad_buffer',
+                        'hfsdp_helper_wbuf',
+                        'hfsdp_helper_gbuf',
+                    )
+                )
+                if distributed_storage and (
+                    group.fsdp_unit_id in (None, -1)
+                    or not owns_fsdp_pre_backward_boundary
+                ):
+                    missing_unit_hook_buckets.add(bucket_id)
+        return graph_bucket_ids, missing_unit_hook_buckets
+
     def _prepare_fsdp_params_for_capture(self):
         """
         Switch Megatron-FSDP modules to raw parameters before TE capture.
@@ -3134,6 +3240,42 @@ class TECudaGraphHelper:
             was_distributed = getattr(fsdp_module, 'is_param_fsdp_distributed', False)
             self._fsdp_capture_param_states.append((fsdp_module, was_distributed))
             fsdp_module._replace_param_with_raw_if_needed()
+
+    def _freeze_fsdp_planned_double_buffers(self):
+        """Drain dynamic storage and freeze decoder banks before TE capture."""
+        for fsdp_module in self._get_megatron_fsdp_instances():
+            pgb = fsdp_module.param_and_grad_buffer
+            if not getattr(
+                pgb.ddp_config, 'megatron_fsdp_use_planned_double_buffer', False
+            ):
+                continue
+
+            # Capture-time hooks will gather each callable again. Start from a
+            # fully released dynamic allocator state without re-exposing DTensors.
+            ag_pipeline = getattr(fsdp_module, 'all_gather_pipeline', None)
+            if ag_pipeline is not None and hasattr(ag_pipeline, 'reset'):
+                ag_pipeline.reset(preserve_non_fsdp_units=True)
+            grad_pipeline = getattr(fsdp_module, 'grad_reduce_pipeline', None)
+            if grad_pipeline is not None and hasattr(grad_pipeline, 'reset'):
+                grad_pipeline.reset()
+            fsdp_module._replace_param_with_raw_if_needed()
+
+            graph_bucket_ids, missing_hook_buckets = self._graph_bucket_ids_for_fsdp_module(
+                fsdp_module
+            )
+            if missing_hook_buckets:
+                raise RuntimeError(
+                    "TE CUDA graph callables with distributed weights or gradients must own "
+                    "the Megatron-FSDP unit pre-backward hook at the captured module boundary, "
+                    "so replay runs all-gather and fused-main-grad claims. Missing hook-boundary "
+                    f"coverage for bucket(s) {sorted(missing_hook_buckets)}."
+                )
+            if pgb.double_buf_units and not graph_bucket_ids:
+                raise RuntimeError(
+                    "Language decoder FSDP units were configured for planned double buffering, "
+                    "but no graph-covered buckets were found in the same Megatron-FSDP module."
+                )
+            pgb.freeze_planned_double_buffer(graph_bucket_ids)
 
     def _restore_fsdp_params_after_capture(self):
         """Restore Megatron-FSDP parameter exposure after CUDA graph capture."""
@@ -3187,6 +3329,7 @@ class TECudaGraphHelper:
             self._capture_gc_frozen = True
 
         self._prepare_fsdp_params_for_capture()
+        self._freeze_fsdp_planned_double_buffers()
         _set_capture_start()
         self._capture_flag_owned = True
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
@@ -3519,22 +3662,19 @@ def set_current_microbatch(model, microbatch_id):
     correct graph index.  This helper is called from the pipeline-parallel
     schedule before each forward step.
     """
-    decoder_exists = True
-    model_with_decoder = None
     try:
-        model_with_decoder = get_attr_wrapped_model(
-            model, "decoder", allow_none=False, return_model_obj=True
-        )
+        model_with_decoder = _get_model_with_decoder(model)
     except RuntimeError:
-        decoder_exists = False
-    if decoder_exists and model_with_decoder is not None:
+        model_with_decoder = None
+
+    if model_with_decoder is not None:
         for layer in model_with_decoder.decoder.layers:
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
             for layer in model_with_decoder.mtp.layers:
-                assert hasattr(
-                    layer, 'mtp_model_layer'
-                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+                assert hasattr(layer, 'mtp_model_layer'), (
+                    f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+                )
                 layer.mtp_model_layer.current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
@@ -3645,6 +3785,8 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
             since the vision encoder always uses batch-dim = 1).
         num_microbatches: Number of microbatches per step.
     """
+
+    configures_language_fsdp_double_buffer = False
 
     def __init__(
         self,

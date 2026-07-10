@@ -2357,6 +2357,10 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
             # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
             # operations (such as pointer dereferencing) that can break CUDA graph replay.
             kwargs["megatron_fsdp_cuda_graph_mode"] = True
+            if args.cuda_graph_impl == "transformer_engine":
+                # TE per-layer capture uses a statically colored decoder-only
+                # double buffer so graph-baked FSDP bucket addresses remain stable.
+                kwargs["megatron_fsdp_use_planned_double_buffer"] = True
             if args.cuda_graph_impl == "full_iteration":
                 # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
                 # during start_param_sync(), which is called during the DistOpt.step(). This
