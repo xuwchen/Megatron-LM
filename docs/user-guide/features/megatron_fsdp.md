@@ -409,6 +409,35 @@ Visualization of double buffering in Megatron-FSDP. Even- and odd-indexed FSDP u
 
 With double-buffering, Megatron-FSDP does not need to allocate memory after initialization, which can reduce memory fragmentation and improve performance. However, double-buffering requires _depth-wise model symmetry_, where even- and odd-indexed FSDP units have identical size during runtime. If double-buffering is utilized, Megatron-FSDP computes the **_mode_** of FSDP unit sizes as the symmetrical double-buffer size, and any FSDP units not symmetrical to the computed size will default to the `_resize_(bytes)`-based allocator (or persistently allocated for extremely large and asymmetrical layers that affect performance significantly like `torch.nn.Embedding` when the low-level argument `fsdp_db_use_persist_buf_on_alloc_fail` is set).
 
+##### Planned double buffering for Transformer Engine CUDA graphs
+
+Megatron-FSDP uses a stricter planned variant of double buffering with Transformer Engine partial
+CUDA graphs. The plan contains language-decoder FSDP units only; vision encoder buckets continue
+to use the dynamic allocator. Vision encoder TE capture is unsupported in this mode, so Vision
+computation remains eager. During warmup, Megatron-FSDP observes complete unit lifetimes,
+builds their overlap graph, and colors it into two static banks. All buckets belonging to one unit
+receive the same color. All-gather prefetch and reduce-scatter queuing are throttled to at most two
+planned decoder units, preserving the two-bank lifetime invariant.
+
+For each parameter, transposed-parameter, or main-gradient storage kind and dtype, one bank's arena
+is sized to the maximum aggregate bucket size of the largest decoder FSDP unit. These stable
+addresses are frozen before capture. Fused weight-gradient replay additionally claims and checks
+the planned `main_grad` bank before the graph can write to it, preventing an occupied, undersized,
+wrong-dtype, or moved slot from being used.
+
+The planned mode requires `optim_grads_params` sharding, `fsdp_double_buffer=True`, at least one
+CUDA graph warmup step, and `fsdp_db_use_persist_buf_on_alloc_fail=False`. It currently rejects
+NCCL user buffers because the planned banks are materialized after the existing manual
+registration point. Fine-grained parameter gather is also unsupported, whether enabled explicitly
+with `--megatron-fsdp-enable-fine-grained-param-gather` or selected by the `mxfp8` recipe combined
+with `--fp8-param-gather`; `--overlap-moe-expert-parallel-comm` is unsupported because it enables
+the same fine-grained FSDP hooks internally. Under Megatron-FSDP, mHC-wrapped layers stay eager. For
+the supported MoE partial-capture setup, use `--cuda-graph-modules attn moe_router moe_preprocess`; GDN capture under
+the `attn` scope is experimental and requires `MEGATRON_GDN_TE_CUDA_GRAPH=1`.
+
+See [CUDA Graph](cuda_graph.md#megatron-fsdp-planned-double-buffering) for the complete CLI example
+and current compatibility requirements.
+
 ### Data-Parallel Sharding Strategies
 
 | Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
