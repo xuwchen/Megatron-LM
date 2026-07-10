@@ -59,6 +59,78 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
+def _validate_cuda_graph_config(config, ddp_config):
+    """Reject unsafe CUDA graph combinations for programmatic callers."""
+    cuda_graph_impl = config.cuda_graph_impl
+    uses_planned_double_buffer = ddp_config.megatron_fsdp_use_planned_double_buffer
+
+    if uses_planned_double_buffer and cuda_graph_impl != "transformer_engine":
+        raise ValueError(
+            "megatron_fsdp_use_planned_double_buffer is supported only with "
+            "cuda_graph_impl='transformer_engine'."
+        )
+
+    if cuda_graph_impl in ("local", "transformer_engine", "full_iteration"):
+        if not ddp_config.megatron_fsdp_cuda_graph_mode:
+            raise ValueError(
+                f"Megatron-FSDP with cuda_graph_impl='{cuda_graph_impl}' requires "
+                "megatron_fsdp_cuda_graph_mode=True so graph-owned gradient references "
+                "remain valid across zero_grad()."
+            )
+
+
+    if cuda_graph_impl == "local":
+        if not (ddp_config.fsdp_double_buffer or ddp_config.nccl_ub):
+            raise ValueError(
+                "Megatron-FSDP with cuda_graph_impl='local' requires "
+                "fsdp_double_buffer=True unless nccl_ub enables it during buffer setup."
+            )
+        if not ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
+            raise ValueError(
+                "Megatron-FSDP with cuda_graph_impl='local' requires "
+                "fsdp_db_use_persist_buf_on_alloc_fail=True."
+            )
+        return
+    if cuda_graph_impl != "transformer_engine":
+        return
+    if not uses_planned_double_buffer:
+        raise ValueError(
+            "Megatron-FSDP with cuda_graph_impl='transformer_engine' requires "
+            "megatron_fsdp_use_planned_double_buffer=True."
+        )
+    if not ddp_config.fsdp_double_buffer:
+        raise ValueError(
+            "Megatron-FSDP planned double buffering requires fsdp_double_buffer=True."
+        )
+    if ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
+        raise ValueError(
+            "Megatron-FSDP planned double buffering does not support "
+            "fsdp_db_use_persist_buf_on_alloc_fail=True."
+        )
+    if ddp_config.nccl_ub:
+        raise ValueError(
+            "Megatron-FSDP planned double buffering does not yet support NCCL user buffers."
+        )
+    if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
+        raise ValueError(
+            "Megatron-FSDP planned double buffering requires "
+            "data_parallel_sharding_strategy='optim_grads_params'."
+        )
+    uses_fine_grained_param_gather = (
+        (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
+        or ddp_config.megatron_fsdp_enable_fine_grained_param_gather
+        or getattr(config, "overlap_moe_expert_parallel_comm", False)
+    )
+    if uses_fine_grained_param_gather:
+        raise ValueError(
+            "Megatron-FSDP planned double buffering with "
+            "cuda_graph_impl='transformer_engine' does not support fine-grained parameter "
+            "gather hooks. Disable megatron_fsdp_enable_fine_grained_param_gather and do "
+            "not combine fp8_recipe='mxfp8' with fp8_param_gather=True or enable "
+            "overlap_moe_expert_parallel_comm."
+        )
+
+
 class FullyShardedDataParallel(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
@@ -110,6 +182,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.num_moe_experts = getattr(config, "num_moe_experts", None)
 
         self.ddp_config = ddp_config
+        _validate_cuda_graph_config(config, ddp_config)
         log_single_rank(
             logger,
             logging.INFO,

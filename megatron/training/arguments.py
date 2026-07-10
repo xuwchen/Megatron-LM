@@ -313,6 +313,104 @@ def _normalize_cuda_graph_modules_args(args):
     args.cuda_graph_modules = normalized_scopes
 
 
+def _get_cuda_graph_recompute_overlap(
+    cuda_graph_modules,
+    recompute_modules,
+    router_captures_shared_experts=True,
+    captures_gdn_attention=False,
+):
+    """Return selectively recomputed modules that overlap a CUDA graph capture scope."""
+    if not cuda_graph_modules:
+        overlapping_modules = {"shared_experts", "moe_act", "mlp", "layernorm", "moe"}
+        if captures_gdn_attention:
+            overlapping_modules.add("gdn")
+    else:
+        overlapping_modules = set()
+        if CudaGraphModule.mlp in cuda_graph_modules:
+            overlapping_modules.update(("mlp", "layernorm"))
+        if CudaGraphModule.attn in cuda_graph_modules and captures_gdn_attention:
+            overlapping_modules.add("gdn")
+        if CudaGraphModule.moe in cuda_graph_modules:
+            overlapping_modules.update(("shared_experts", "moe_act", "layernorm", "moe"))
+        if CudaGraphModule.moe_router in cuda_graph_modules:
+            overlapping_modules.add("moe")
+            if router_captures_shared_experts:
+                overlapping_modules.add("shared_experts")
+
+    return [module for module in recompute_modules if module in overlapping_modules]
+
+
+def _validate_megatron_fsdp_cuda_graph_buffers(args):
+    """Validate temporary-buffer requirements for Megatron-FSDP CUDA graphs."""
+    if args.cuda_graph_impl in ("none", "full_iteration") or not args.use_megatron_fsdp:
+        return
+
+    if args.cuda_graph_impl == "local":
+        # NCCL-UB enables the existing FSDP double buffer during PGB construction.
+        if not (args.fsdp_double_buffer or getattr(args, "nccl_ub", False)):
+            raise ValueError(
+                "Megatron-FSDP with --cuda-graph-impl=local requires "
+                "--fsdp-double-buffer so graph-baked temporary-buffer addresses remain stable."
+            )
+        if not getattr(args, "fsdp_db_use_persist_buf_on_alloc_fail", False):
+            raise ValueError(
+                "Megatron-FSDP with --cuda-graph-impl=local requires "
+                "--fsdp-db-use-persist-buf-on-alloc-fail so an exhausted double buffer "
+                "does not fall back to a graph-unsafe dynamic allocation."
+            )
+        return
+
+    if getattr(args, "cuda_graph_warmup_steps", 0) < 1:
+        raise ValueError(
+            "Megatron-FSDP planned double buffering with "
+            "--cuda-graph-impl=transformer_engine requires "
+            "--cuda-graph-warmup-steps >= 1 to observe eager decoder-unit bucket lifetimes."
+        )
+    uses_fine_grained_param_gather = (
+        (
+            getattr(args, "fp8_recipe", None) == "mxfp8"
+            and getattr(args, "fp8_param_gather", False)
+        )
+        or getattr(args, "megatron_fsdp_enable_fine_grained_param_gather", False)
+        or getattr(args, "overlap_moe_expert_parallel_comm", False)
+    )
+    if uses_fine_grained_param_gather:
+        raise ValueError(
+            "Megatron-FSDP planned double buffering with "
+            "--cuda-graph-impl=transformer_engine does not support fine-grained parameter "
+            "gather hooks. Disable --megatron-fsdp-enable-fine-grained-param-gather and do "
+            "not combine --fp8-recipe=mxfp8 with --fp8-param-gather or enable "
+            "--overlap-moe-expert-parallel-comm."
+        )
+    if getattr(args, "nccl_ub", False):
+        raise ValueError(
+            "Megatron-FSDP with --cuda-graph-impl=transformer_engine does not yet support "
+            "--use-nccl-ub. Planned double-buffer slots are materialized after the current "
+            "manual NCCL user-buffer registration point."
+        )
+    if (
+        getattr(args, "data_parallel_sharding_strategy", "optim_grads_params")
+        != "optim_grads_params"
+    ):
+        raise ValueError(
+            "Megatron-FSDP planned double buffering with "
+            "--cuda-graph-impl=transformer_engine requires "
+            "--data-parallel-sharding-strategy=optim_grads_params."
+        )
+    if not args.fsdp_double_buffer:
+        raise ValueError(
+            "Megatron-FSDP with --cuda-graph-impl=transformer_engine requires "
+            "--fsdp-double-buffer to enable decoder-unit planned double buffering."
+        )
+    if getattr(args, "fsdp_db_use_persist_buf_on_alloc_fail", False):
+        raise ValueError(
+            "Megatron-FSDP planned double buffering with "
+            "--cuda-graph-impl=transformer_engine does not support "
+            "--fsdp-db-use-persist-buf-on-alloc-fail. Planned graph buckets must remain "
+            "inside the two statically colored banks."
+        )
+
+
 def _normalize_inference_cuda_graph_scope_arg(args):
     """Normalize inference_cuda_graph_scope and apply the impl-derived default."""
     args.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
@@ -2107,16 +2205,8 @@ def validate_args(args, defaults={}):
     if args.cpu_offloading_num_layers > 0:
         args.cpu_offloading = True
 
-    # CUDA Graphs
-    if args.cuda_graph_scope == "full" or (
-        isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
-    ):
-        if isinstance(args.cuda_graph_scope, list):
-            assert args.cuda_graph_scope == ["full"], "full scope cannot be used with other scopes."
-        args.cuda_graph_scope = []
-        warn_rank_0(
-            'full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.'
-        )
+    # CUDA Graphs. Deprecated scope spellings were already normalized into
+    # ``args.cuda_graph_modules`` near the start of validation.
     if args.cuda_graph_impl != "none":
         if (
             "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
@@ -2132,19 +2222,31 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
-        if args.cuda_graph_impl != "full_iteration" and args.use_megatron_fsdp:
-            assert args.fsdp_double_buffer, (
-                "CUDA Graph requires --fsdp-double-buffer when using Megatron-FSDP. "
-                "Without double buffer, FSDP parameter buffers addresses are dynamic across "
-                "iterations, causing numerical errors during graph replay."
+        _validate_megatron_fsdp_cuda_graph_buffers(args)
+        if args.recompute_granularity == "selective" and args.recompute_modules:
+            cuda_graph_scopes = [scope.name for scope in args.cuda_graph_modules] or [
+                "<whole-layer>"
+            ]
+            recompute_overlap = _get_cuda_graph_recompute_overlap(
+                args.cuda_graph_modules,
+                args.recompute_modules,
+                router_captures_shared_experts=(
+                    args.moe_shared_expert_intermediate_size is not None
+                    and not args.moe_shared_expert_overlap
+                ),
+                captures_gdn_attention=(
+                    args.experimental_attention_variant == "gated_delta_net"
+                    and os.environ.get("MEGATRON_GDN_TE_CUDA_GRAPH", "0") == "1"
+                ),
             )
-            assert args.fsdp_db_use_persist_buf_on_alloc_fail, (
-                "CUDA Graph with Megatron-FSDP and MoE requires "
-                "--fsdp-db-use-persist-buf-on-alloc-fail. This is to prevent failed allocation "
-                "goes to a dynamic buffer, causing illegal memory access during graph replay. "
-                "You may disable this assertion if you are sure there is no allocation failure "
-                "in the CUDA graph scope."
-            )
+            if recompute_overlap:
+                warn_rank_0(
+                    f"--recompute-modules {recompute_overlap} overlaps the CUDA graph scope "
+                    f"{cuda_graph_scopes}: the captured region runs recompute-off while eager "
+                    "runs recompute-on, which breaks bitwise CUDA-graph/eager alignment "
+                    "(Megatron checkpoint recompute backward differs from the plain backward). "
+                    "Remove these from --recompute-modules for bitwise runs."
+                )
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
