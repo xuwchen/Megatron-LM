@@ -438,6 +438,67 @@ class MegatronFSDP(torch.nn.Module):
                 self.module.parameters(), self.all_gather_pipeline
             )
 
+    def _claim_cuda_graph_fused_wgrad_buckets(self, params: List[torch.nn.Parameter]) -> None:
+        """Record warmup boundaries or claim grad banks before graph writes."""
+        pgb = self.param_and_grad_buffer
+        main_grad_alloc = getattr(pgb, 'main_grad_alloc', None)
+        record_graph_bucket_claim = getattr(
+            main_grad_alloc, 'record_graph_bucket_claim', None
+        )
+        claim_graph_bucket = getattr(main_grad_alloc, 'claim_graph_bucket', None)
+        if record_graph_bucket_claim is None and claim_graph_bucket is None:
+            return
+
+        record_claims = {}
+        replay_claims = {}
+        for param in params:
+            orig_param = getattr(param, 'orig_param', param)
+            bucket_id = pgb.param_to_param_group.get(param)
+            if bucket_id is None:
+                bucket_id = pgb.param_to_param_group.get(orig_param)
+            if bucket_id is None:
+                continue
+
+            group = pgb.parameter_groups[bucket_id]
+            grad_buffer = getattr(group, 'hfsdp_helper_gbuf', None) or getattr(
+                group, 'main_grad_buffer', None
+            )
+            if (
+                grad_buffer is None
+                or not grad_buffer.is_data_distributed
+                or grad_buffer.temporary_bucket_allocator is not main_grad_alloc
+            ):
+                continue
+
+            effective_dtype = (
+                pgb.mp_policy.grad_comm_dtype or grad_buffer.dtype
+            )
+            claim = (grad_buffer.bucket_index.size, effective_dtype)
+            record_claims[bucket_id] = claim
+            if (
+                id(param) in self._cuda_graph_fused_wgrad_params
+                or id(orig_param) in self._cuda_graph_fused_wgrad_params
+            ):
+                replay_claims[bucket_id] = claim
+
+        if record_claims:
+            # Match replay ordering during eager lifetime observation: release
+            # a prior unit before opening this unit's planned main-grad lifetime.
+            # The same wait also orders graph writes after the prior reduction.
+            self.grad_reduce_pipeline._enforce_double_buffer_limit(
+                sorted(record_claims)
+            )
+
+        if record_graph_bucket_claim is not None:
+            for bucket_id in sorted(record_claims):
+                size, dtype = record_claims[bucket_id]
+                record_graph_bucket_claim(bucket_id, size, dtype)
+
+        if replay_claims and claim_graph_bucket is not None:
+            for bucket_id in sorted(replay_claims):
+                size, dtype = replay_claims[bucket_id]
+                claim_graph_bucket(bucket_id, size, dtype)
+
     def _import_class_from_path(self, class_path: str):
         """Helper function to import classes from string paths."""
         module_path, class_name = class_path.rsplit(".", 1)
@@ -912,6 +973,8 @@ class MegatronFSDP(torch.nn.Module):
                 self.all_gather_and_wait_parameters_ready(
                     param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
                 )
+
+            self._claim_cuda_graph_fused_wgrad_buckets(param_list)
 
         self._root_pre_backward_hook_issued = False
 
