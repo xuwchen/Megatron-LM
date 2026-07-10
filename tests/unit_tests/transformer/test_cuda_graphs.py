@@ -42,6 +42,9 @@ from megatron.core.transformer.cuda_graphs import (
     _merge_observed_rotary_kwargs,
     _validate_mrope_capture_inputs,
 )
+from megatron.core.transformer.cuda_graphs import (
+    set_current_microbatch as set_cuda_graph_current_microbatch,
+)
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -106,6 +109,45 @@ class TestCudaGraphModelDiscovery:
 
         with pytest.raises(RuntimeError, match="couldn't find attribute decoder"):
             _get_model_with_decoder(Model())
+
+    def test_set_current_microbatch_finds_nested_language_decoder_and_mtp(self):
+        class Model:
+            pass
+
+        decoder_layer = Model()
+        decoder_layer.current_microbatch = None
+        mtp_model_layer = Model()
+        mtp_model_layer.current_microbatch = None
+        language_model = Model()
+        language_model.decoder = Model()
+        language_model.decoder.layers = [decoder_layer]
+        language_model.mtp = Model()
+        language_model.mtp.layers = [SimpleNamespace(mtp_model_layer=mtp_model_layer)]
+        multimodal_model = Model()
+        multimodal_model.language_model = language_model
+        wrapper = Model()
+        wrapper.module = multimodal_model
+
+        set_cuda_graph_current_microbatch(wrapper, 7)
+
+        assert decoder_layer.current_microbatch == 7
+        assert mtp_model_layer.current_microbatch == 7
+
+    def test_set_current_microbatch_updates_vision_only_model_without_decoder(self):
+        class Model:
+            pass
+
+        vision_layer = Model()
+        vision_layer.current_microbatch = None
+        vision_encoder = Model()
+        vision_encoder.decoder = Model()
+        vision_encoder.decoder.layers = [vision_layer]
+        vision_only_model = Model()
+        vision_only_model.vision_model = vision_encoder
+
+        set_cuda_graph_current_microbatch(vision_only_model, 11)
+
+        assert vision_layer.current_microbatch == 11
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
@@ -606,11 +648,100 @@ class TestTECudaGraphCaptureFailClean:
             active.create_cudagraphs()
         assert not active._capture_failed
 
+
+class TestFSDPPlannedDoubleBufferCapture:
+    def test_configure_collects_nested_language_decoder_and_mtp_but_not_vision(
+        self, monkeypatch
+    ):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine', use_cpu_initialization=True
+        )
+        decoder_layer = _ObservedKwargLayer(config)
+        mtp_layer = _ObservedKwargLayer(config)
+        vision_layer = _ObservedKwargLayer(config)
+
+        language_model = torch.nn.Module()
+        language_model.decoder = torch.nn.Module()
+        language_model.decoder.layers = torch.nn.ModuleList([decoder_layer])
+        language_model.mtp = torch.nn.Module()
+        mtp_wrapper = torch.nn.Module()
+        mtp_wrapper.mtp_model_layer = mtp_layer
+        language_model.mtp.layers = torch.nn.ModuleList([mtp_wrapper])
+
+        multimodal_model = torch.nn.Module()
+        multimodal_model.language_model = language_model
+        multimodal_model.vision_model = torch.nn.Module()
+        multimodal_model.vision_model.decoder = torch.nn.Module()
+        multimodal_model.vision_model.decoder.layers = torch.nn.ModuleList([vision_layer])
+
+        fsdp_module = torch.nn.Module()
+        fsdp_module.module = multimodal_model
+        configure_calls = []
+        fsdp_module.param_and_grad_buffer = SimpleNamespace(
+            ddp_config=SimpleNamespace(megatron_fsdp_use_planned_double_buffer=True),
+            param_to_param_group={
+                decoder_layer.weight: 2,
+                mtp_layer.weight: 5,
+                vision_layer.weight: 9,
+            },
+            configure_planned_double_buffer=lambda bucket_ids: configure_calls.append(
+                set(bucket_ids)
+            ),
+        )
+
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.log_on_each_pipeline_stage",
+            lambda **unused: None,
+        )
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.model = [fsdp_module]
+        helper.config = config
+        helper.tp_group = None
+        helper.dp_cp_group = None
+        helper._uses_megatron_fsdp = True
+        helper._rotary_observation_roots = []
+        helper._get_megatron_fsdp_instances = lambda: [fsdp_module]
+
+        helper._discover_layers()
+        helper._configure_fsdp_planned_double_buffers()
+
+        assert helper.chunks_with_decoder == [language_model]
+        assert helper.flattened_callables == [decoder_layer, mtp_layer]
+        assert configure_calls == [{2, 5}]
+        assert 9 not in configure_calls[0]
+
+    def test_configure_rejects_graph_callable_parameter_missing_from_planned_pgb(self):
+        layer = torch.nn.Linear(2, 2)
+        configure_calls = []
+        pgb = SimpleNamespace(
+            ddp_config=SimpleNamespace(megatron_fsdp_use_planned_double_buffer=True),
+            # Deliberately map only weight; one graph callable parameter remains absent.
+            param_to_param_group={layer.weight: 0},
+            configure_planned_double_buffer=lambda bucket_ids: configure_calls.append(
+                set(bucket_ids)
+            ),
+        )
+        fsdp_module = SimpleNamespace(param_and_grad_buffer=pgb)
+        chunk_with_decoder = SimpleNamespace(
+            decoder=SimpleNamespace(layers=[layer])
+        )
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.chunks_with_decoder = [chunk_with_decoder]
+        helper.flattened_callables = [layer]
+        helper._get_megatron_fsdp_instances = lambda: [fsdp_module]
+
+        with pytest.raises(RuntimeError, match=r"1 parameter\(s\) were not mapped"):
+            helper._configure_fsdp_planned_double_buffers()
+
+        # Configuration is transactional with respect to coverage validation.
+        assert configure_calls == []
+
     @pytest.mark.parametrize(
         "fsdp_unit_id",
         [pytest.param(-1, id="non-unit"), pytest.param(0, id="wrapper-around-inner-unit")],
     )
-    def test_planned_allocator_requires_hook_at_callable_boundary(self, fsdp_unit_id):
+    def test_freeze_requires_hook_at_captured_callable_boundary(self, fsdp_unit_id):
         layer = torch.nn.Linear(2, 2)
         parameter_group = SimpleNamespace(
             fsdp_unit_id=fsdp_unit_id,
@@ -620,22 +751,39 @@ class TestTECudaGraphCaptureFailClean:
             hfsdp_helper_wbuf=None,
             hfsdp_helper_gbuf=None,
         )
+        events = []
         param_and_grad_buffer = SimpleNamespace(
+            ddp_config=SimpleNamespace(megatron_fsdp_use_planned_double_buffer=True),
             param_to_param_group={parameter: 0 for parameter in layer.parameters()},
             parameter_groups=[parameter_group],
+            double_buf_units={fsdp_unit_id},
+            freeze_planned_double_buffer=lambda bucket_ids: events.append(
+                ("freeze", set(bucket_ids))
+            ),
         )
         fsdp_module = SimpleNamespace(
-            all_gather_pipeline=None,
+            all_gather_pipeline=SimpleNamespace(
+                reset=lambda **kwargs: events.append(("ag-reset", kwargs))
+            ),
+            grad_reduce_pipeline=SimpleNamespace(
+                reset=lambda: events.append(("grad-reset", None))
+            ),
             param_and_grad_buffer=param_and_grad_buffer,
-            _replace_param_with_raw_if_needed=lambda: None,
+            _replace_param_with_raw_if_needed=lambda: events.append(("raw-params", None)),
         )
         helper = _bare_capture_lifecycle_helper(layer)
         helper._get_megatron_fsdp_instances = lambda: [fsdp_module]
 
         with pytest.raises(RuntimeError, match="must own.*pre-backward hook"):
-            helper._setup_fsdp_planned_allocators()
+            helper._freeze_fsdp_planned_double_buffers()
 
-    def test_planned_allocator_accepts_exact_fsdp_unit_hook_boundary(self, monkeypatch):
+        assert events == [
+            ("ag-reset", {"preserve_non_fsdp_units": True}),
+            ("grad-reset", None),
+            ("raw-params", None),
+        ]
+
+    def test_freeze_resets_pipelines_and_accepts_exact_unit_hook_boundary(self):
         layer = torch.nn.Linear(2, 2)
 
         def tagged_pre_backward_hook(*unused):
@@ -652,36 +800,67 @@ class TestTECudaGraphCaptureFailClean:
             hfsdp_helper_wbuf=None,
             hfsdp_helper_gbuf=None,
         )
-        freeze_calls = []
-
-        def recording_allocator(name):
-            return SimpleNamespace(
-                freeze_plan=lambda bucket_ids: freeze_calls.append((name, set(bucket_ids)))
-            )
-
+        events = []
         param_and_grad_buffer = SimpleNamespace(
+            ddp_config=SimpleNamespace(megatron_fsdp_use_planned_double_buffer=True),
             param_to_param_group={parameter: 0 for parameter in layer.parameters()},
             parameter_groups=[parameter_group],
-            weight_alloc=recording_allocator("weight"),
-            transpose_weight_alloc=recording_allocator("transpose"),
-            main_grad_alloc=recording_allocator("main-grad"),
+            double_buf_units={0},
+            freeze_planned_double_buffer=lambda bucket_ids: events.append(
+                ("freeze", set(bucket_ids))
+            ),
         )
         fsdp_module = SimpleNamespace(
-            all_gather_pipeline=None,
+            all_gather_pipeline=SimpleNamespace(
+                reset=lambda **kwargs: events.append(("ag-reset", kwargs))
+            ),
+            grad_reduce_pipeline=SimpleNamespace(
+                reset=lambda: events.append(("grad-reset", None))
+            ),
             param_and_grad_buffer=param_and_grad_buffer,
-            _replace_param_with_raw_if_needed=lambda: None,
+            _replace_param_with_raw_if_needed=lambda: events.append(("raw-params", None)),
         )
         helper = _bare_capture_lifecycle_helper(layer)
         helper._get_megatron_fsdp_instances = lambda: [fsdp_module]
-        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
 
-        helper._setup_fsdp_planned_allocators()
+        helper._freeze_fsdp_planned_double_buffers()
 
-        assert freeze_calls == [
-            ("weight", {0}),
-            ("transpose", {0}),
-            ("main-grad", {0}),
+        assert events == [
+            ("ag-reset", {"preserve_non_fsdp_units": True}),
+            ("grad-reset", None),
+            ("raw-params", None),
+            ("freeze", {0}),
         ]
+
+    def test_vision_helper_returns_without_planned_fsdp(self):
+        assert TECudaGraphHelper.configures_language_fsdp_double_buffer
+        assert not VisionTECudaGraphHelper.configures_language_fsdp_double_buffer
+
+        helper = VisionTECudaGraphHelper.__new__(VisionTECudaGraphHelper)
+        helper._get_megatron_fsdp_instances = lambda: [
+            SimpleNamespace(
+                param_and_grad_buffer=SimpleNamespace(
+                    ddp_config=SimpleNamespace(
+                        megatron_fsdp_use_planned_double_buffer=False
+                    )
+                )
+            )
+        ]
+
+        helper._configure_fsdp_planned_double_buffers()
+
+    def test_vision_helper_rejects_planned_fsdp_capture(self):
+        helper = VisionTECudaGraphHelper.__new__(VisionTECudaGraphHelper)
+        helper._get_megatron_fsdp_instances = lambda: [
+            SimpleNamespace(
+                param_and_grad_buffer=SimpleNamespace(
+                    ddp_config=SimpleNamespace(megatron_fsdp_use_planned_double_buffer=True)
+                )
+            )
+        ]
+
+        with pytest.raises(RuntimeError, match="Keep the Vision encoder eager"):
+            helper._configure_fsdp_planned_double_buffers()
 
 
 def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
