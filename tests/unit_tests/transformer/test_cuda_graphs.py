@@ -42,6 +42,9 @@ from megatron.core.transformer.cuda_graphs import (
     _merge_observed_rotary_kwargs,
     _validate_mrope_capture_inputs,
 )
+from megatron.core.transformer.cuda_graphs import (
+    set_current_microbatch as set_cuda_graph_current_microbatch,
+)
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -106,6 +109,45 @@ class TestCudaGraphModelDiscovery:
 
         with pytest.raises(RuntimeError, match="couldn't find attribute decoder"):
             _get_model_with_decoder(Model())
+
+    def test_set_current_microbatch_finds_nested_language_decoder_and_mtp(self):
+        class Model:
+            pass
+
+        decoder_layer = Model()
+        decoder_layer.current_microbatch = None
+        mtp_model_layer = Model()
+        mtp_model_layer.current_microbatch = None
+        language_model = Model()
+        language_model.decoder = Model()
+        language_model.decoder.layers = [decoder_layer]
+        language_model.mtp = Model()
+        language_model.mtp.layers = [SimpleNamespace(mtp_model_layer=mtp_model_layer)]
+        multimodal_model = Model()
+        multimodal_model.language_model = language_model
+        wrapper = Model()
+        wrapper.module = multimodal_model
+
+        set_cuda_graph_current_microbatch(wrapper, 7)
+
+        assert decoder_layer.current_microbatch == 7
+        assert mtp_model_layer.current_microbatch == 7
+
+    def test_set_current_microbatch_updates_vision_only_model_without_decoder(self):
+        class Model:
+            pass
+
+        vision_layer = Model()
+        vision_layer.current_microbatch = None
+        vision_encoder = Model()
+        vision_encoder.decoder = Model()
+        vision_encoder.decoder.layers = [vision_layer]
+        vision_only_model = Model()
+        vision_only_model.vision_model = vision_encoder
+
+        set_cuda_graph_current_microbatch(vision_only_model, 11)
+
+        assert vision_layer.current_microbatch == 11
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
