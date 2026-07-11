@@ -242,6 +242,12 @@ class DistributedDataParallelConfig:
     a casted-copy of the gradient shard that cannot be dereferenced due to replay.
     """
 
+    megatron_fsdp_use_planned_double_buffer: bool = False
+    """Use a decoder-only, statically colored two-bank allocator for Megatron-FSDP
+    temporary parameter and gradient buckets captured by per-layer TE CUDA graphs.
+    This is an internal integration flag derived from the CUDA graph configuration.
+    """
+
     megatron_fsdp_enable_fine_grained_param_gather: bool = False
     """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
       This feature increases the overlap between parameter all-gather and forward computation,

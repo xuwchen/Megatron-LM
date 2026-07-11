@@ -842,6 +842,444 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             self.backup_allocator.free(bucket_id)
 
 
+class PlannedUnitDoubleBufferAllocator(TemporaryBucketAllocator):
+    """Serve selected FSDP units from two statically colored address-stable banks.
+
+    Decoder units are configured before eager CUDA-graph warmup. Their real
+    allocate/free sequence is recorded and frozen into a unit-level two-color
+    plan before Transformer Engine captures per-layer graphs. Every bucket in
+    one FSDP unit uses the same bank. Buckets of one dtype are packed into
+    non-overlapping slices of a typed unit arena. Buckets outside the configured
+    decoder units, such as vision encoder buckets, always use the wrapped
+    dynamic allocator.
+
+    The two banks have identical arena capacities. For each dtype, capacity is
+    the largest aggregate size used by any configured decoder unit, rather than
+    an independent maximum per bucket offset. Once frozen, occupancy, capacity,
+    dtype, and data-pointer changes fail loudly instead of falling back to
+    dynamic storage, because CUDA graphs may have baked those addresses.
+    """
+
+    NUM_BANKS = 2
+
+    def __init__(
+        self,
+        name: str,
+        base: TemporaryBucketAllocator,
+        fsdp_param_groups: List["ParameterGroup"],
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> None:
+        self.name = name
+        self.base = base
+        self.fsdp_param_groups = fsdp_param_groups
+        self.mem_alloc_context = mem_alloc_context
+
+        unit_bucket_counts = defaultdict(int)
+        bucket_offsets = {}
+        for bucket_id, param_group in enumerate(fsdp_param_groups):
+            unit_id = param_group.fsdp_unit_id
+            if unit_id in (None, -1):
+                bucket_offsets[bucket_id] = 0
+                continue
+            bucket_offsets[bucket_id] = unit_bucket_counts[unit_id]
+            unit_bucket_counts[unit_id] += 1
+        self._bucket_offsets = bucket_offsets
+
+        self._configured_bucket_meta = {}
+        self._configured_units = set()
+        self._lifetime_events = []
+        self._recording_lifetimes = False
+        self._observed_alloc_meta = defaultdict(dict)
+
+        self._unit_plan = None
+        self._frozen_graph_bucket_ids = set()
+        self._arena_capacities = {}
+        self._bucket_layout = {}
+        self._slot_materialization = {}
+        self._bank_using = {}
+        self._unit_live_buckets = defaultdict(set)
+
+    @staticmethod
+    def _rank() -> int:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+        return 0
+
+    @property
+    def configured_units(self):
+        """Return the FSDP unit IDs managed by the planned double buffer."""
+        return frozenset(self._configured_units)
+
+    @property
+    def configured_bucket_ids(self):
+        """Return the bucket IDs managed by the planned double buffer."""
+        return frozenset(self._configured_bucket_meta)
+
+    @property
+    def unit_plan(self):
+        """Return a copy of the frozen unit-to-bank assignment."""
+        return None if self._unit_plan is None else dict(self._unit_plan)
+
+    @property
+    def materialized_bytes(self) -> int:
+        """Return physical bytes materialized across both planned banks."""
+        return sum(
+            capacity * torch.empty((), dtype=dtype).element_size()
+            for (_, dtype), (_, capacity, _) in self._slot_materialization.items()
+        )
+
+    def configure_units(self, bucket_meta: Dict[int, Tuple[int, torch.dtype]]) -> None:
+        """Configure exact decoder buckets before eager graph warmup.
+
+        Args:
+            bucket_meta: Mapping from bucket ID to its padded allocation size
+                and allocation dtype for this allocator.
+        """
+        if self._unit_plan is not None:
+            raise RuntimeError(f"[FSDP][{self.name}] cannot configure units after plan freeze.")
+        if self._recording_lifetimes or self._configured_bucket_meta:
+            if bucket_meta == self._configured_bucket_meta:
+                return
+            raise RuntimeError(f"[FSDP][{self.name}] decoder units were already configured.")
+
+        for bucket_id, (size, dtype) in sorted(bucket_meta.items()):
+            if bucket_id < 0 or bucket_id >= len(self.fsdp_param_groups):
+                raise RuntimeError(f"[FSDP][{self.name}] invalid decoder bucket {bucket_id}.")
+            unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+            if unit_id in (None, -1):
+                raise RuntimeError(
+                    f"[FSDP][{self.name}] decoder bucket {bucket_id} has no FSDP unit ID."
+                )
+            if size <= 0:
+                raise RuntimeError(
+                    f"[FSDP][{self.name}] decoder bucket {bucket_id} has invalid size {size}."
+                )
+            self._configured_bucket_meta[bucket_id] = (size, dtype)
+            self._configured_units.add(unit_id)
+            self._observed_alloc_meta[bucket_id][dtype] = size
+
+        self._recording_lifetimes = bool(self._configured_bucket_meta)
+
+    def _is_configured(self, bucket_id: int) -> bool:
+        return bucket_id in self._configured_bucket_meta
+
+    def _unit_id(self, bucket_id: int) -> int:
+        return self.fsdp_param_groups[bucket_id].fsdp_unit_id
+
+    def _bucket_offset(self, bucket_id: int) -> int:
+        return self._bucket_offsets[bucket_id]
+
+    def _effective_mem_alloc_context(
+        self, mem_alloc_context: Optional[Callable] = None
+    ) -> Optional[Callable]:
+        return mem_alloc_context if mem_alloc_context is not None else self.mem_alloc_context
+
+    def _record_lifetime_start(
+        self, op: str, bucket_id: int, size: int, dtype: torch.dtype
+    ) -> None:
+        if not self._recording_lifetimes or not self._is_configured(bucket_id):
+            return
+        self._lifetime_events.append((op, bucket_id))
+        previous = self._observed_alloc_meta[bucket_id].get(dtype, 0)
+        self._observed_alloc_meta[bucket_id][dtype] = max(previous, size)
+
+    def record_graph_bucket_claim(
+        self, bucket_id: int, size: int, dtype: torch.dtype
+    ) -> None:
+        """Record the replay-time pre-write boundary during eager warmup."""
+        self._record_lifetime_start("claim", bucket_id, size, dtype)
+
+    def allocate(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> Bucket:
+        """Allocate from a frozen decoder bank or delegate to dynamic storage."""
+        unit_id = self._unit_id(bucket_id)
+        if self._unit_plan is not None and unit_id in self._unit_plan:
+            return self._allocate_planned(bucket_id, size, dtype, mem_alloc_context)
+        self._record_lifetime_start("alloc", bucket_id, size, dtype)
+        return self.base.allocate(
+            bucket_id=bucket_id,
+            size=size,
+            dtype=dtype,
+            device=device,
+            mem_alloc_context=mem_alloc_context,
+        )
+
+    def free(self, bucket_id: int):
+        """Release a planned unit only after all of its live lanes are free."""
+        unit_id = self._unit_id(bucket_id)
+        if self._unit_plan is not None and unit_id in self._unit_plan:
+            live_buckets = self._unit_live_buckets[unit_id]
+            live_buckets.discard(bucket_id)
+            if not live_buckets:
+                bank = self._unit_plan[unit_id]
+                if self._bank_using.get(bank) == unit_id:
+                    del self._bank_using[bank]
+            return
+        if self._recording_lifetimes and self._is_configured(bucket_id):
+            self._lifetime_events.append(("free", bucket_id))
+        self.base.free(bucket_id)
+
+    def stop_recording(self) -> None:
+        """Stop observing warmup lifetimes and release event metadata."""
+        self._recording_lifetimes = False
+        self._lifetime_events.clear()
+        self._observed_alloc_meta.clear()
+
+    def _buffer_name(self, bank: int) -> str:
+        return f"{self.name}_planned_db_{bank}"
+
+    def _materialize_arena(
+        self,
+        bank: int,
+        dtype: torch.dtype,
+        mem_alloc_context: Optional[Callable] = None,
+        allow_new: bool = False,
+    ) -> torch.Tensor:
+        slot = (bank, dtype)
+        materialization = self._slot_materialization.get(slot)
+        if materialization is None and not allow_new:
+            raise RuntimeError(
+                f"[FSDP][Rank {self._rank()}][{self.name}] bank arena {slot} was not "
+                "materialized before CUDA graph capture."
+            )
+        capacity = self._arena_capacities.get(dtype)
+        if capacity is None:
+            raise RuntimeError(
+                f"[FSDP][Rank {self._rank()}][{self.name}] dtype {dtype} has no "
+                "frozen decoder-unit arena."
+            )
+
+        data = get_global_memory_buffer().get_tensor(
+            [capacity],
+            dtype=dtype,
+            name=self._buffer_name(bank),
+            mem_alloc_context=self._effective_mem_alloc_context(mem_alloc_context),
+        )
+        data_ptr = data.data_ptr()
+        if materialization is None:
+            self._slot_materialization[slot] = (dtype, capacity, data_ptr)
+        else:
+            _, frozen_capacity, frozen_data_ptr = materialization
+            if capacity != frozen_capacity:
+                raise RuntimeError(
+                    f"[FSDP][Rank {self._rank()}][{self.name}] bank arena {slot} "
+                    f"changed capacity from {frozen_capacity} to {capacity}."
+                )
+            if data_ptr != frozen_data_ptr:
+                raise RuntimeError(
+                    f"[FSDP][Rank {self._rank()}][{self.name}] bank arena {slot} moved "
+                    f"from address {frozen_data_ptr:#x} to {data_ptr:#x}. CUDA graphs "
+                    "may have baked the old address."
+                )
+        return data
+
+    def _get_bucket_view(
+        self,
+        bank: int,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        mem_alloc_context: Optional[Callable],
+    ) -> torch.Tensor:
+        layout = self._bucket_layout.get((bucket_id, dtype))
+        if layout is None:
+            raise RuntimeError(
+                f"[FSDP][Rank {self._rank()}][{self.name}] bucket {bucket_id} "
+                f"has no frozen {dtype} arena slice."
+            )
+        offset, reserved_size = layout
+        if size != reserved_size:
+            raise RuntimeError(
+                f"[FSDP][Rank {self._rank()}][{self.name}] bucket {bucket_id} "
+                f"reserved {reserved_size} elements in its unit arena but now "
+                f"requests {size}. CUDA graph bucket sizes must remain exact."
+            )
+        arena = self._materialize_arena(
+            bank, dtype, mem_alloc_context=mem_alloc_context
+        )
+        return arena[offset : offset + size]
+
+    def _validate_and_claim(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> torch.Tensor:
+        if self._unit_plan is None or not self._is_configured(bucket_id):
+            raise RuntimeError(
+                f"[FSDP][Rank {self._rank()}][{self.name}] graph bucket {bucket_id} "
+                "is not covered by the frozen planned double buffer."
+            )
+        unit_id = self._unit_id(bucket_id)
+        if unit_id not in self._unit_plan:
+            raise RuntimeError(
+                f"[FSDP][Rank {self._rank()}][{self.name}] FSDP unit {unit_id} has "
+                "no frozen bank assignment."
+            )
+        bank = self._unit_plan[unit_id]
+        occupant = self._bank_using.get(bank)
+        if occupant is not None and occupant != unit_id:
+            raise RuntimeError(
+                f"[FSDP][Rank {self._rank()}][{self.name}] planned bank {bank} is "
+                f"held by FSDP unit {occupant}, but unit {unit_id} needs it. The "
+                "runtime topology exceeds the frozen two-bank lifetime plan."
+            )
+
+        data = self._get_bucket_view(
+            bank, bucket_id, size, dtype, mem_alloc_context=mem_alloc_context
+        )
+        self._bank_using[bank] = unit_id
+        self._unit_live_buckets[unit_id].add(bucket_id)
+        return data
+
+    def _allocate_planned(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        mem_alloc_context: Optional[Callable],
+    ) -> Bucket:
+        return Bucket(
+            data=self._validate_and_claim(
+                bucket_id, size, dtype, mem_alloc_context=mem_alloc_context
+            )
+        )
+
+    def claim_graph_bucket(self, bucket_id: int, size: int, dtype: torch.dtype) -> None:
+        """Claim and validate a main-grad lane before graph-baked fused wgrad writes."""
+        self._validate_and_claim(bucket_id, size, dtype)
+
+    def _build_unit_intervals(self):
+        intervals = defaultdict(list)
+        open_time = {}
+        live_buckets = defaultdict(set)
+        for time_index, (op, bucket_id) in enumerate(self._lifetime_events):
+            if not self._is_configured(bucket_id):
+                continue
+            unit_id = self._unit_id(bucket_id)
+            if op in ("claim", "alloc"):
+                if not live_buckets[unit_id]:
+                    open_time[unit_id] = time_index
+                live_buckets[unit_id].add(bucket_id)
+            else:
+                live_buckets[unit_id].discard(bucket_id)
+                if not live_buckets[unit_id] and unit_id in open_time:
+                    intervals[unit_id].append((open_time.pop(unit_id), time_index))
+        tail = len(self._lifetime_events)
+        for unit_id, start in open_time.items():
+            intervals[unit_id].append((start, tail))
+        return intervals
+
+    @staticmethod
+    def _intervals_overlap(lhs, rhs) -> bool:
+        return any(s1 < e2 and s2 < e1 for s1, e1 in lhs for s2, e2 in rhs)
+
+    def _color_units(self, intervals):
+        missing = sorted(unit_id for unit_id in self._configured_units if not intervals[unit_id])
+        if missing:
+            raise RuntimeError(
+                f"[FSDP][{self.name}] decoder FSDP units {missing} were not observed "
+                "during eager CUDA graph warmup; a safe two-bank plan cannot be frozen."
+            )
+
+        conflicts = {unit_id: set() for unit_id in self._configured_units}
+        units = sorted(self._configured_units)
+        for index, lhs in enumerate(units):
+            for rhs in units[index + 1 :]:
+                if self._intervals_overlap(intervals[lhs], intervals[rhs]):
+                    conflicts[lhs].add(rhs)
+                    conflicts[rhs].add(lhs)
+
+        plan = {}
+        for root in units:
+            if root in plan:
+                continue
+            plan[root] = 0
+            stack = [root]
+            while stack:
+                unit_id = stack.pop()
+                for neighbor in sorted(conflicts[unit_id]):
+                    expected = 1 - plan[unit_id]
+                    if neighbor in plan and plan[neighbor] != expected:
+                        raise RuntimeError(
+                            f"[FSDP][{self.name}] warmup requires more than two "
+                            "simultaneously compatible unit banks; conflict graph "
+                            f"is not two-colorable at units {unit_id} and {neighbor}."
+                        )
+                    if neighbor not in plan:
+                        plan[neighbor] = expected
+                        stack.append(neighbor)
+        return plan
+
+    def freeze_plan(self, graph_bucket_ids) -> None:
+        """Freeze decoder unit colors and materialize identical two-bank lanes."""
+        graph_bucket_ids = set(graph_bucket_ids)
+        if self._unit_plan is not None:
+            new_graph_buckets = graph_bucket_ids - self._frozen_graph_bucket_ids
+            if new_graph_buckets:
+                raise RuntimeError(
+                    f"[FSDP][{self.name}] plan already frozen but new graph buckets "
+                    f"appeared: {sorted(new_graph_buckets)}"
+                )
+            return
+        if not graph_bucket_ids:
+            self._unit_plan = {}
+            self.stop_recording()
+            return
+
+        unknown = graph_bucket_ids - set(self._configured_bucket_meta)
+        if unknown:
+            raise RuntimeError(
+                f"[FSDP][{self.name}] graph buckets {sorted(unknown)} are not in "
+                "the configured decoder FSDP units."
+            )
+
+        intervals = self._build_unit_intervals()
+        plan = self._color_units(intervals)
+
+        unit_dtype_buckets = defaultdict(list)
+        for bucket_id, dtype_sizes in self._observed_alloc_meta.items():
+            if not self._is_configured(bucket_id):
+                continue
+            unit_id = self._unit_id(bucket_id)
+            for dtype, size in dtype_sizes.items():
+                unit_dtype_buckets[(unit_id, dtype)].append(
+                    (self._bucket_offset(bucket_id), bucket_id, size)
+                )
+
+        arena_capacities = {}
+        bucket_layout = {}
+        for (unit_id, dtype), buckets in sorted(
+            unit_dtype_buckets.items(), key=lambda item: (item[0][0], str(item[0][1]))
+        ):
+            offset = 0
+            for _, bucket_id, size in sorted(buckets):
+                bucket_layout[(bucket_id, dtype)] = (offset, size)
+                offset += size
+            arena_capacities[dtype] = max(arena_capacities.get(dtype, 0), offset)
+
+        self._arena_capacities = arena_capacities
+        self._bucket_layout = bucket_layout
+        for bank in range(self.NUM_BANKS):
+            for dtype in sorted(arena_capacities, key=str):
+                self._materialize_arena(bank, dtype, allow_new=True)
+
+        # Capture starts from a clean dynamic allocator state. The all-gather
+        # and gradient-reduce pipelines must be drained before this call.
+        for bucket_id in self._configured_bucket_meta:
+            self.base.free(bucket_id)
+        self._unit_plan = plan
+        self._frozen_graph_bucket_ids = graph_bucket_ids
+        self.stop_recording()
+
+
 class DataParallelBuffer:
     """
     A class that manages the data parallel buffer for Fully Sharded Data Parallel (FSDP) training.
@@ -2020,6 +2458,128 @@ class ParamAndGradBuffer:
 
         log_single_rank(logger, logging.INFO, "\n".join(log_lines))
 
+    def configure_planned_double_buffer(self, decoder_bucket_ids) -> None:
+        """Select decoder FSDP units for the planned two-bank allocators.
+
+        The CUDA graph helper calls this after discovering the language
+        decoder and before eager warmup. Supplying one bucket selects the
+        complete FSDP unit, including its dense and expert parameter buckets.
+        """
+        if not self.ddp_config.megatron_fsdp_use_planned_double_buffer:
+            if decoder_bucket_ids:
+                raise RuntimeError(
+                    "Decoder planned-double-buffer configuration was requested "
+                    "without megatron_fsdp_use_planned_double_buffer."
+                )
+            return
+
+        decoder_unit_ids = set()
+        for bucket_id in decoder_bucket_ids:
+            if bucket_id < 0 or bucket_id >= len(self.parameter_groups):
+                raise RuntimeError(f"Invalid decoder FSDP bucket ID {bucket_id}.")
+            unit_id = self.parameter_groups[bucket_id].fsdp_unit_id
+            if unit_id in (None, -1):
+                raise RuntimeError(
+                    f"Decoder bucket {bucket_id} is not owned by an FSDP unit."
+                )
+            decoder_unit_ids.add(unit_id)
+
+        expanded_bucket_ids = {
+            bucket_id
+            for bucket_id, group in enumerate(self.parameter_groups)
+            if group.fsdp_unit_id in decoder_unit_ids
+        }
+        allocator_buffers = (
+            (self.weight_alloc, "model_weight_buffer"),
+            (self.transpose_weight_alloc, "transpose_weight_buffer"),
+            (self.main_grad_alloc, "main_grad_buffer"),
+        )
+        for allocator, buffer_name in allocator_buffers:
+            if not isinstance(allocator, PlannedUnitDoubleBufferAllocator):
+                raise RuntimeError(
+                    "Megatron-FSDP planned double-buffer mode did not install "
+                    f"a planned allocator for {buffer_name}."
+                )
+            bucket_meta = {}
+            for bucket_id in expanded_bucket_ids:
+                buffer = getattr(self.parameter_groups[bucket_id], buffer_name, None)
+                if (
+                    buffer is not None
+                    and buffer.is_data_distributed
+                    and buffer.temporary_bucket_allocator is allocator
+                ):
+                    allocation_dtype = buffer.dtype
+                    if (
+                        buffer_name == "main_grad_buffer"
+                        and self.mp_policy.grad_comm_dtype is not None
+                    ):
+                        allocation_dtype = self.mp_policy.grad_comm_dtype
+                    bucket_meta[bucket_id] = (buffer.bucket_index.size, allocation_dtype)
+            allocator.configure_units(bucket_meta)
+
+        self.double_buf_units = sorted(self.weight_alloc.configured_units)
+        if decoder_unit_ids and set(self.double_buf_units) != decoder_unit_ids:
+            missing = sorted(decoder_unit_ids - set(self.double_buf_units))
+            raise RuntimeError(
+                "Planned double-buffer decoder units do not have distributed "
+                f"weight buckets: {missing}."
+            )
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            (
+                f"[FSDP][{self._allocator_namespace}] planned decoder double buffer "
+                f"configured for {len(self.double_buf_units)} unit(s) and "
+                f"{len(self.weight_alloc.configured_bucket_ids)} weight bucket(s); "
+                "all other buckets use dynamic allocation."
+            ),
+        )
+
+    def freeze_planned_double_buffer(self, graph_bucket_ids) -> None:
+        """Freeze all configured decoder units before TE CUDA graph capture."""
+        if not self.ddp_config.megatron_fsdp_use_planned_double_buffer:
+            return
+
+        graph_bucket_ids = set(graph_bucket_ids)
+        total_materialized_bytes = 0
+        allocator_buffers = (
+            (self.weight_alloc, "model_weight_buffer"),
+            (self.transpose_weight_alloc, "transpose_weight_buffer"),
+            (self.main_grad_alloc, "main_grad_buffer"),
+        )
+        for allocator, buffer_name in allocator_buffers:
+            if not isinstance(allocator, PlannedUnitDoubleBufferAllocator):
+                raise RuntimeError("Planned double-buffer allocator wiring changed before capture.")
+            configured_bucket_ids = set(allocator.configured_bucket_ids)
+            missing = []
+            for bucket_id in graph_bucket_ids:
+                buffer = getattr(self.parameter_groups[bucket_id], buffer_name, None)
+                if (
+                    buffer is not None
+                    and buffer.is_data_distributed
+                    and buffer.temporary_bucket_allocator is allocator
+                    and bucket_id not in configured_bucket_ids
+                ):
+                    missing.append(bucket_id)
+            if missing:
+                raise RuntimeError(
+                    f"Graph-covered {buffer_name} bucket(s) {sorted(missing)} were "
+                    "not configured in a planned decoder FSDP unit."
+                )
+            allocator.freeze_plan(graph_bucket_ids & configured_bucket_ids)
+            total_materialized_bytes += allocator.materialized_bytes
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            (
+                f"[FSDP][{self._allocator_namespace}] froze two decoder banks "
+                f"({total_materialized_bytes / (1024**2):.2f} MiB materialized "
+                "across weight, transpose-weight, and main-grad lanes)."
+            ),
+        )
+
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
         """
         Initialize the buffers for each parameter group.
@@ -2216,24 +2776,56 @@ class ParamAndGradBuffer:
                 "NCCL UB is only supported with FSDP double buffer. "
                 "Please set fsdp_double_buffer=True in the ddp config."
             )
-        if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
-            UB_BUFFER_NUM = 2
+        use_planned_double_buffer = (
+            self.ddp_config.megatron_fsdp_use_planned_double_buffer
+            and len(self.bucketing_policy.fsdp_unit_modules) > 0
+        )
+        if use_planned_double_buffer:
+            self.weight_alloc = PlannedUnitDoubleBufferAllocator(
+                name=f"{self._allocator_namespace}_fsdp_params",
+                base=StorageResizeBasedBucketAllocator(),
+                fsdp_param_groups=self.parameter_groups,
+                mem_alloc_context=self.mem_alloc_context,
+            )
+            self.transpose_weight_alloc = PlannedUnitDoubleBufferAllocator(
+                name=f"{self._allocator_namespace}_fsdp_fp8_transpose_params",
+                base=StorageResizeBasedBucketAllocator(),
+                fsdp_param_groups=self.parameter_groups,
+                mem_alloc_context=self.mem_alloc_context,
+            )
+            self.main_grad_alloc = PlannedUnitDoubleBufferAllocator(
+                name=f"{self._allocator_namespace}_fsdp_grads",
+                base=StorageResizeBasedBucketAllocator(),
+                fsdp_param_groups=self.parameter_groups,
+                mem_alloc_context=self.mem_alloc_context,
+            )
+            if self.dist_index.use_hybrid_fsdp:
+                # This communication-only cast buffer is not referenced by a
+                # CUDA graph and remains dynamically allocated.
+                self.hsdp_grad_comm_alloc = StorageResizeBasedBucketAllocator()
+            # The language CUDA graph helper configures decoder units before
+            # the first eager warmup step. Vision units remain excluded.
+            self.double_buf_units = []
+        elif self.ddp_config.fsdp_double_buffer and len(
+            self.bucketing_policy.fsdp_unit_modules
+        ) > 0:
+            buffer_pool_size = 2
             self.weight_alloc = FixedPoolAllocator(
                 name=f"{self._allocator_namespace}_fsdp_params",
                 fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
+                size=buffer_pool_size,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.transpose_weight_alloc = FixedPoolAllocator(
                 name=f"{self._allocator_namespace}_fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
+                size=buffer_pool_size,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name=f"{self._allocator_namespace}_fsdp_grads",
                 fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
+                size=buffer_pool_size,
                 fallback_to_persistent_buffer=(
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                 ),
@@ -2246,7 +2838,7 @@ class ParamAndGradBuffer:
                 self.hsdp_grad_comm_alloc = FixedPoolAllocator(
                     name=f"{self._allocator_namespace}_hsdp_grad_comm",
                     fsdp_param_groups=self.parameter_groups,
-                    size=UB_BUFFER_NUM,
+                    size=buffer_pool_size,
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                     ),
