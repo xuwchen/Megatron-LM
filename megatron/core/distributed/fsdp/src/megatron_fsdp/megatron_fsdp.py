@@ -476,6 +476,11 @@ class MegatronFSDP(torch.nn.Module):
                 if fused_wgrad:
                     bucket_claims[bucket_id] = claim
 
+        if bucket_claims:
+            # Graph-baked fused wgrad writes reuse the same bucket address.
+            # Finish any older reduction reading that bucket before replay.
+            self.grad_reduce_pipeline.wait_for_pending_buckets(sorted(bucket_claims))
+
         if record_graph_bucket_claim is not None:
             for bucket_id in sorted(record_claims):
                 size, dtype = record_claims[bucket_id]

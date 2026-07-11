@@ -13,6 +13,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer impo
     Bucket,
     BucketingPolicy,
     FixedPoolAllocator,
+    GradReducePipeline,
     ParamAndGradBuffer,
     PlannedBucketAllocator,
     TemporaryBucketAllocator,
@@ -558,7 +559,7 @@ def test_fused_wgrad_claim_records_warmup_lifetimes_and_skips_persistent_grad_bu
     distributed_param = torch.nn.Parameter(torch.empty(1))
     persistent_param = torch.nn.Parameter(torch.empty(1))
     non_fused_param = torch.nn.Parameter(torch.empty(1))
-    record_events, claim_events = [], []
+    record_events, claim_events, wait_events = [], [], []
     distributed_grad_buffer = SimpleNamespace(
         is_data_distributed=True, bucket_index=SimpleNamespace(size=8), dtype=torch.float32
     )
@@ -587,6 +588,9 @@ def test_fused_wgrad_claim_records_warmup_lifetimes_and_skips_persistent_grad_bu
     torch.nn.Module.__init__(fsdp)
     fsdp.param_and_grad_buffer = pgb
     fsdp._cuda_graph_fused_wgrad_params = {id(distributed_param), id(persistent_param)}
+    fsdp.grad_reduce_pipeline = SimpleNamespace(
+        wait_for_pending_buckets=lambda bucket_ids: wait_events.append(tuple(bucket_ids))
+    )
 
     fsdp._claim_cuda_graph_fused_wgrad_buckets(
         [distributed_param, distributed_param, persistent_param, non_fused_param]
@@ -594,3 +598,52 @@ def test_fused_wgrad_claim_records_warmup_lifetimes_and_skips_persistent_grad_bu
 
     assert record_events == [(0, 8, torch.float16), (2, 8, torch.float16)]
     assert claim_events == [(0, 8, torch.float16)]
+    assert wait_events == [(0,)]
+
+
+@pytest.mark.parametrize(
+    (
+        "queued_bucket_ids",
+        "pending_bucket_ids",
+        "expected_remaining",
+        "expected_released",
+    ),
+    [
+        pytest.param([0, 1], [0], [1], [0], id="keep-safe-suffix"),
+        pytest.param([1, 0], [0], [], [1, 0], id="drain-through-newest-match"),
+        pytest.param([0, 1], [2], [0, 1], [], id="unrelated-bucket"),
+    ],
+)
+def test_grad_reduce_waits_for_exact_pending_buckets_before_graph_write(
+    monkeypatch,
+    queued_bucket_ids,
+    pending_bucket_ids,
+    expected_remaining,
+    expected_released,
+):
+    """Only an older RS reading the replayed bucket forces a pre-write wait."""
+    consumer_stream = object()
+    events = []
+    pipeline = GradReducePipeline.__new__(GradReducePipeline)
+    pipeline.buffer = SimpleNamespace(num_buckets=3)
+    pipeline.grad_reduce_queue = []
+    for bucket_id in queued_bucket_ids:
+        event = SimpleNamespace(
+            wait=lambda stream=None, bucket_id=bucket_id: events.append(
+                ("wait", bucket_id, stream)
+            )
+        )
+        free_bucket = lambda bucket_id=bucket_id: events.append(("free", bucket_id))
+        pipeline.grad_reduce_queue.append((event, free_bucket, bucket_id))
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: consumer_stream)
+
+    pipeline.wait_for_pending_buckets(pending_bucket_ids)
+    events.append(("write",))
+
+    assert [event[0] for event in events] == [
+        step for _ in expected_released for step in ("wait", "free")
+    ] + ["write"]
+    assert [event[1] for event in events if event[0] == "free"] == expected_released
+    assert all(event[2] is consumer_stream for event in events if event[0] == "wait")
+    assert [bucket_id for _, _, bucket_id in pipeline.grad_reduce_queue] == expected_remaining
