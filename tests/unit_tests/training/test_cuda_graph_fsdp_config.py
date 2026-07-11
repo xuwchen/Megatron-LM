@@ -290,6 +290,104 @@ def test_adapter_rejects_planned_double_buffer_with_fine_grained_gather(
         _validate_cuda_graph_config(config, ddp_config)
 
 
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        pytest.param(
+            {"nccl_ub": True},
+            "--use-nccl-ub",
+            id="nccl-user-buffer",
+        ),
+        pytest.param(
+            {"data_parallel_sharding_strategy": "optim_grads"},
+            "--data-parallel-sharding-strategy=optim_grads_params",
+            id="non-fully-sharded",
+        ),
+        pytest.param(
+            {"fsdp_double_buffer": False},
+            "--fsdp-double-buffer",
+            id="double-buffer-disabled",
+        ),
+        pytest.param(
+            {"fsdp_db_use_persist_buf_on_alloc_fail": True},
+            "--fsdp-db-use-persist-buf-on-alloc-fail",
+            id="persistent-spill",
+        ),
+    ],
+)
+def test_cli_rejects_other_unsupported_planned_double_buffer_configs(
+    overrides, message
+):
+    """CLI validation covers every independent planned-buffer safety guard."""
+    args = _te_planned_double_buffer_args(**overrides)
+
+    with pytest.raises(ValueError, match=message):
+        _validate_megatron_fsdp_cuda_graph_buffers(args)
+
+
+@pytest.mark.parametrize(
+    ("cuda_graph_impl", "ddp_overrides", "message"),
+    [
+        pytest.param(
+            "local",
+            {},
+            "supported only with cuda_graph_impl='transformer_engine'",
+            id="non-te-backend",
+        ),
+        pytest.param(
+            "transformer_engine",
+            {"megatron_fsdp_cuda_graph_mode": False},
+            "requires megatron_fsdp_cuda_graph_mode=True",
+            id="graph-mode-disabled",
+        ),
+        pytest.param(
+            "transformer_engine",
+            {"megatron_fsdp_use_planned_double_buffer": False},
+            "requires megatron_fsdp_use_planned_double_buffer=True",
+            id="planned-buffer-disabled",
+        ),
+        pytest.param(
+            "transformer_engine",
+            {"fsdp_double_buffer": False},
+            "requires fsdp_double_buffer=True",
+            id="double-buffer-disabled",
+        ),
+        pytest.param(
+            "transformer_engine",
+            {"fsdp_db_use_persist_buf_on_alloc_fail": True},
+            "does not support fsdp_db_use_persist_buf_on_alloc_fail=True",
+            id="persistent-spill",
+        ),
+        pytest.param(
+            "transformer_engine",
+            {"nccl_ub": True},
+            "does not yet support NCCL user buffers",
+            id="nccl-user-buffer",
+        ),
+        pytest.param(
+            "transformer_engine",
+            {"data_parallel_sharding_strategy": "optim_grads"},
+            "requires data_parallel_sharding_strategy='optim_grads_params'",
+            id="non-fully-sharded",
+        ),
+    ],
+)
+def test_adapter_rejects_other_unsupported_planned_double_buffer_configs(
+    cuda_graph_impl, ddp_overrides, message
+):
+    """Programmatic validation mirrors the CLI's planned-buffer guards."""
+    config = SimpleNamespace(
+        cuda_graph_impl=cuda_graph_impl,
+        cuda_graph_warmup_steps=3,
+        fp8_recipe=None,
+        overlap_moe_expert_parallel_comm=False,
+    )
+    ddp_config = _te_planned_double_buffer_config(**ddp_overrides)
+
+    with pytest.raises(ValueError, match=message):
+        _validate_cuda_graph_config(config, ddp_config)
+
+
 class _RecordingDP:
     """Minimal DDP stand-in that records the original module."""
 
