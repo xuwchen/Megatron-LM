@@ -4207,7 +4207,10 @@ class GradReducePipeline:
                 )
 
     def wait_for_previous_grad_reduce(
-        self, suggested_queue_size: int = 1, suggested_queue_capacity: Optional[int] = None
+        self,
+        suggested_queue_size: int = 1,
+        suggested_queue_capacity: Optional[int] = None,
+        wait_stream: Optional[torch.cuda.Stream] = None,
     ):
         """
         Wait for the previous reduce-scatter/all-reduce to finish.
@@ -4216,6 +4219,8 @@ class GradReducePipeline:
                 buckets. Defaults to 1.
             suggested_queue_capacity (Optional[int], optional): The recommended queue capacity
                 in number of parameters in all buckets in the reduction queue. Defaults to None.
+            wait_stream (Optional[torch.cuda.Stream], optional): Consumer stream that must wait
+                for each released reduction bucket. Defaults to the current stream.
         """
         if suggested_queue_capacity is not None:
             queue_space = sum(
@@ -4226,7 +4231,10 @@ class GradReducePipeline:
             )
             while queue_space > suggested_queue_capacity:
                 grad_reduce_event, free_up_grad_bucket, bucket_id = self.grad_reduce_queue.pop(0)
-                grad_reduce_event.wait()
+                if wait_stream is None:
+                    grad_reduce_event.wait()
+                else:
+                    grad_reduce_event.wait(stream=wait_stream)
                 free_up_grad_bucket()
                 queue_space -= self.buffer.parameter_groups[
                     bucket_id
@@ -4235,32 +4243,78 @@ class GradReducePipeline:
             suggested_queue_size = max(0, min(suggested_queue_size, self.buffer.num_buckets - 1))
             while len(self.grad_reduce_queue) > suggested_queue_size:
                 grad_reduce_event, free_up_grad_bucket, _ = self.grad_reduce_queue.pop(0)
-                grad_reduce_event.wait()
+                if wait_stream is None:
+                    grad_reduce_event.wait()
+                else:
+                    grad_reduce_event.wait(stream=wait_stream)
                 free_up_grad_bucket()
+
+    def wait_for_pending_buckets(
+        self,
+        bucket_ids,
+        wait_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Drain queued reductions that still read any requested bucket."""
+        pending_bucket_ids = set(bucket_ids)
+        if not pending_bucket_ids or not self.grad_reduce_queue:
+            return
+
+        keep_n = 0
+        for _, _, bucket_id in reversed(self.grad_reduce_queue):
+            if bucket_id in pending_bucket_ids:
+                break
+            keep_n += 1
+        if keep_n == len(self.grad_reduce_queue):
+            return
+
+        if wait_stream is None:
+            wait_stream = torch.cuda.current_stream()
+        self.wait_for_previous_grad_reduce(keep_n, wait_stream=wait_stream)
 
     def _enforce_double_buffer_limit(self, add_buckets):
         if not self.buffer.ddp_config.fsdp_double_buffer:
             return
 
         param_groups = self.buffer.parameter_groups
-        double_buf_units = set()
+        incoming_double_buf_units = set()
         for bucket_id in add_buckets:
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             if fsdp_unit_id in self.buffer.double_buf_units:
-                double_buf_units.add(fsdp_unit_id)
-        assert (
-            len(double_buf_units) <= 2
-        ), f"Double buffer limit exceeded. Current double_buf_units: {double_buf_units}."
+                incoming_double_buf_units.add(fsdp_unit_id)
+        if len(incoming_double_buf_units) > 2:
+            raise RuntimeError(
+                "Double buffer limit exceeded by one reduction group. "
+                f"Current double-buffer units: {incoming_double_buf_units}."
+            )
 
-        keep_n = len(self.grad_reduce_queue)
+        # Keep the largest queue suffix that, together with the incoming
+        # buckets, uses at most two planned units and does not contain an older
+        # reduction for an incoming unit. A repeated unit reuses the same
+        # main-grad lanes, so its earlier reduce-scatter must finish before the
+        # next graph replay can write those lanes. Dynamic Vision entries count
+        # toward queue length but do not consume a decoder bank.
+        live_double_buf_units = set(incoming_double_buf_units)
+        keep_n = 0
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
-            double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
-                keep_n -= 1
+            if fsdp_unit_id in incoming_double_buf_units:
+                break
+            if (
+                fsdp_unit_id in self.buffer.double_buf_units
+                and fsdp_unit_id not in live_double_buf_units
+                and len(live_double_buf_units) == 2
+            ):
+                break
+            if fsdp_unit_id in self.buffer.double_buf_units:
+                live_double_buf_units.add(fsdp_unit_id)
+            keep_n += 1
 
-        with torch.cuda.stream(self.rs_stream):
-            self.wait_for_previous_grad_reduce(keep_n)
+        # Logical bucket release happens immediately after event.wait(), so the
+        # consumer stream must be ordered after RS before it reuses a planned bank.
+        consumer_stream = torch.cuda.current_stream()
+        self.wait_for_previous_grad_reduce(
+            keep_n, wait_stream=consumer_stream
+        )
 
     def get_ready_bucket_group_for_reduction(self, bucket_id: int) -> Optional[List[int]]:
         """Checks if all buckets in the bucket group containing the given bucket_id
@@ -4745,11 +4799,11 @@ class AllGatherPipeline:
                 # is exceeding the coverage of the double buffer.
                 if self.buffer.ddp_config.fsdp_double_buffer:
                     fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
-                    double_buf_units.add(fsdp_unit_id)
-                    if len(double_buf_units) > 2:
-                        # Prefetching the next bucket will exceed the coverage of
-                        # the double buffer, so we need to stop prefetching.
-                        return True
+                    if fsdp_unit_id in self.buffer.double_buf_units:
+                        double_buf_units.add(fsdp_unit_id)
+                        if len(double_buf_units) > 2:
+                            # The next decoder unit would require a third bank.
+                            return True
                 return False
 
             if suggested_AG_prefetch_size is None:
