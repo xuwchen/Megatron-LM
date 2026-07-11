@@ -10,7 +10,9 @@ import torch
 from megatron.core.distributed.fsdp.src.megatron_fsdp import param_and_grad_buffer as pgb_module
 from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+    AllGatherPipeline,
     Bucket,
+    BucketStatus,
     BucketingPolicy,
     GradReducePipeline,
     ParamAndGradBuffer,
@@ -129,6 +131,46 @@ class _TrackingBucketAllocator(TemporaryBucketAllocator):
     def free(self, bucket_id):
         self.free_calls.append(bucket_id)
         self.buckets.pop(bucket_id, None)
+
+
+class _AllocatorBackedWeightBuffer:
+    """Minimal weight buffer whose temporary bucket is allocator-backed."""
+
+    def __init__(self, allocator, bucket_id, size):
+        self.allocator = allocator
+        self.bucket_id = bucket_id
+        self.bucket_index = SimpleNamespace(size=size)
+        self.dtype = torch.float32
+        self.is_data_distributed = True
+        self.data_parallel_group = object()
+        self.last_bucket = None
+
+    def fetch_bucket(self, set_param_data=False):
+        del set_param_data
+        self.last_bucket = self.allocator.allocate(
+            self.bucket_id,
+            self.bucket_index.size,
+            self.dtype,
+            torch.device("cpu"),
+        )
+        return self.last_bucket
+
+    def free_bucket_storage(self):
+        self.allocator.free(self.bucket_id)
+        self.last_bucket = None
+
+    def get_shard_from_local_buffer(self):
+        return torch.arange(self.bucket_index.size, dtype=self.dtype)
+
+
+class _CompletedCollective:
+    """Collective test double with the async Work wait contract."""
+
+    def __init__(self, waits):
+        self.waits = waits
+
+    def wait(self):
+        self.waits.append("wait")
 
 
 def _allocator_param_groups(*unit_ids):
@@ -367,6 +409,157 @@ def test_planned_unit_double_buffer_leaves_unconfigured_vision_unit_dynamic(
     assert allocator._bank_using == {}
     allocator.free(1)
     assert base.free_calls[-1] == 1
+
+
+def test_all_gather_prefetch_skips_vision_and_stops_before_third_planned_unit():
+    """A dynamic Vision bucket does not consume either decoder prefetch bank."""
+    params = [torch.nn.Parameter(torch.empty(1)) for _ in range(4)]
+    unit_ids = [10, 99, 11, 12]
+    parameter_groups = [
+        SimpleNamespace(
+            fsdp_unit_id=unit_id,
+            model_weight_buffer=SimpleNamespace(
+                bucket_index=SimpleNamespace(size=8)
+            ),
+            transpose_weight_buffer=None,
+        )
+        for unit_id in unit_ids
+    ]
+    buffer = SimpleNamespace(
+        ddp_config=SimpleNamespace(fsdp_double_buffer=True),
+        param_to_param_group={
+            param: bucket_id for bucket_id, param in enumerate(params)
+        },
+        parameter_groups=parameter_groups,
+        double_buf_units={10, 11, 12},
+        num_buckets=len(parameter_groups),
+        bucket_to_bucket_group={
+            bucket_id: [bucket_id] for bucket_id in range(len(parameter_groups))
+        },
+    )
+    pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
+    pipeline.buffer = buffer
+    pipeline.bucket_status = {
+        (bucket_id, False): BucketStatus.READY_TO_USE
+        for bucket_id in range(buffer.num_buckets)
+    }
+    pipeline.bucket_can_be_released = {
+        (bucket_id, False): True for bucket_id in range(buffer.num_buckets)
+    }
+
+    pipeline.all_gather_params(
+        [params[0]],
+        prefetch=True,
+        suggested_AG_prefetch_size=1_000_000,
+    )
+
+    assert pipeline.bucket_can_be_released == {
+        (0, False): False,
+        (1, False): False,
+        (2, False): False,
+        (3, False): True,
+    }
+
+
+@pytest.mark.parametrize("bwd", [False, True], ids=["rowwise-weight", "transpose-weight"])
+def test_all_gather_pipeline_releases_and_reuses_planned_weight_bank(
+    monkeypatch, cpu_global_memory_buffer, bwd
+):
+    """A, Vision, B may coexist; lazy release lets C reuse A's planned bank."""
+    del cpu_global_memory_buffer
+    unit_ids = [10, 99, 11, 12]
+    sizes = [8, 7, 8, 8]
+    parameter_groups = _allocator_param_groups(*unit_ids)
+    dynamic_base = _TrackingBucketAllocator()
+    allocator = PlannedUnitDoubleBufferAllocator(
+        f"weight_lane_{bwd}", dynamic_base, parameter_groups
+    )
+    allocator.configure_units(
+        {
+            bucket_id: (sizes[bucket_id], torch.float32)
+            for bucket_id in (0, 2, 3)
+        }
+    )
+
+    lane_buffers = []
+    for bucket_id, size in enumerate(sizes):
+        lane_buffer = _AllocatorBackedWeightBuffer(allocator, bucket_id, size)
+        lane_buffers.append(lane_buffer)
+        if bwd:
+            parameter_groups[bucket_id].model_weight_buffer = SimpleNamespace()
+            parameter_groups[bucket_id].transpose_weight_buffer = lane_buffer
+        else:
+            parameter_groups[bucket_id].model_weight_buffer = lane_buffer
+            parameter_groups[bucket_id].transpose_weight_buffer = None
+
+    pgb = SimpleNamespace(
+        parameter_groups=parameter_groups,
+        num_buckets=len(parameter_groups),
+        bucket_to_bucket_group={
+            bucket_id: [bucket_id] for bucket_id in range(len(parameter_groups))
+        },
+        dist_index=SimpleNamespace(use_hybrid_fsdp=False),
+        ddp_config=SimpleNamespace(
+            fsdp_double_buffer=True,
+            outer_dp_sharding_strategy="no_shard",
+        ),
+    )
+    pipeline = AllGatherPipeline(pgb)
+    collective_waits = []
+
+    def fake_all_gather_into_tensor(
+        output_tensor, input_tensor, group, async_op
+    ):
+        del group
+        assert async_op
+        output_tensor.copy_(input_tensor)
+        return _CompletedCollective(collective_waits)
+
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
+
+    def gather(bucket_id):
+        pipeline.async_bucket_gather(bucket_id, bwd)
+        pipeline.wait_bucket_ready(bucket_id, bwd)
+        return lane_buffers[bucket_id].last_bucket.data.data_ptr()
+
+    # Eager warmup records A and B as overlapping, while Vision remains dynamic.
+    gather(0)
+    gather(1)
+    gather(2)
+    assert dynamic_base.buckets[1] is lane_buffers[1].last_bucket
+    for bucket_id in (0, 1, 2):
+        pipeline.release_bucket(bucket_id, bwd)
+    gather(3)
+    pipeline.release_bucket(3, bwd)
+    allocator.freeze_plan({0, 2, 3})
+
+    assert allocator.unit_plan[10] != allocator.unit_plan[11]
+    assert allocator.unit_plan[10] == allocator.unit_plan[12]
+
+    a_ptr = gather(0)
+    gather(1)
+    b_ptr = gather(2)
+    assert a_ptr != b_ptr
+    assert dynamic_base.buckets[1] is lane_buffers[1].last_bucket
+
+    pipeline.release_bucket(0, bwd, lazy=True)
+    pipeline.release_bucket(1, bwd, lazy=True)
+    c_ptr = gather(3)
+
+    assert c_ptr == a_ptr
+    assert c_ptr != b_ptr
+    assert 1 not in dynamic_base.buckets
+    assert allocator._bank_using == {
+        allocator.unit_plan[11]: 11,
+        allocator.unit_plan[12]: 12,
+    }
+
+    pipeline.release_bucket(2, bwd)
+    pipeline.release_bucket(3, bwd)
+    assert allocator._bank_using == {}
+    assert len(collective_waits) == 8
 
 
 def test_planned_unit_double_buffer_claim_is_idempotent_and_released_for_reuse(
@@ -812,6 +1005,77 @@ def test_unplanned_synchronous_param_sync_batches_replicated_gathers(
         ("wait", 1, False),
         ("wait", 2, False),
     ]
+
+
+def test_pgb_configure_planned_double_buffer_expands_complete_unit_and_all_lanes(
+    monkeypatch,
+):
+    """One decoder bucket selects all unit buckets but never the Vision unit."""
+    parameter_groups = _allocator_param_groups(7, 7, 99)
+    weight_allocator = PlannedUnitDoubleBufferAllocator(
+        "configured_weight", _TrackingBucketAllocator(), parameter_groups
+    )
+    transpose_allocator = PlannedUnitDoubleBufferAllocator(
+        "configured_transpose", _TrackingBucketAllocator(), parameter_groups
+    )
+    grad_allocator = PlannedUnitDoubleBufferAllocator(
+        "configured_grad", _TrackingBucketAllocator(), parameter_groups
+    )
+
+    def buffer(allocator, size, dtype=torch.float32):
+        return SimpleNamespace(
+            is_data_distributed=True,
+            temporary_bucket_allocator=allocator,
+            bucket_index=SimpleNamespace(size=size),
+            dtype=dtype,
+        )
+
+    for bucket_id, (weight_size, transpose_size, grad_size) in enumerate(
+        ((8, 4, 9), (12, 6, 13), (5, 3, 7))
+    ):
+        group = parameter_groups[bucket_id]
+        group.model_weight_buffer = buffer(weight_allocator, weight_size)
+        group.transpose_weight_buffer = buffer(
+            transpose_allocator, transpose_size
+        )
+        group.main_grad_buffer = buffer(grad_allocator, grad_size)
+
+    fake_pgb = SimpleNamespace(
+        ddp_config=SimpleNamespace(
+            megatron_fsdp_use_planned_double_buffer=True
+        ),
+        parameter_groups=parameter_groups,
+        weight_alloc=weight_allocator,
+        transpose_weight_alloc=transpose_allocator,
+        main_grad_alloc=grad_allocator,
+        mp_policy=SimpleNamespace(grad_comm_dtype=torch.bfloat16),
+        double_buf_units=[],
+        _allocator_namespace="test_pgb",
+    )
+    monkeypatch.setattr(pgb_module, "log_single_rank", lambda *args, **kwargs: None)
+
+    ParamAndGradBuffer.configure_planned_double_buffer(fake_pgb, {0})
+
+    assert fake_pgb.double_buf_units == [7]
+    assert weight_allocator._configured_bucket_meta == {
+        0: (8, torch.float32),
+        1: (12, torch.float32),
+    }
+    assert transpose_allocator._configured_bucket_meta == {
+        0: (4, torch.float32),
+        1: (6, torch.float32),
+    }
+    assert grad_allocator._configured_bucket_meta == {
+        0: (9, torch.bfloat16),
+        1: (13, torch.bfloat16),
+    }
+    for planned_allocator in (
+        weight_allocator,
+        transpose_allocator,
+        grad_allocator,
+    ):
+        assert planned_allocator.configured_units == {7}
+        assert 2 not in planned_allocator.configured_bucket_ids
 
 
 def test_pgb_freeze_rejects_graph_buffer_missing_from_configured_planned_buckets():
