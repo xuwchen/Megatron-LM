@@ -833,7 +833,6 @@ class TestFSDPPlannedDoubleBufferCapture:
                 reset=lambda: events.append(("grad-reset", None))
             ),
             param_and_grad_buffer=param_and_grad_buffer,
-            _replace_param_with_raw_if_needed=lambda: events.append(("raw-params", None)),
         )
         helper = _bare_capture_lifecycle_helper(layer)
         helper._get_megatron_fsdp_instances = lambda: [fsdp_module]
@@ -844,7 +843,6 @@ class TestFSDPPlannedDoubleBufferCapture:
         assert events == [
             ("ag-reset", {"preserve_non_fsdp_units": True}),
             ("grad-reset", None),
-            ("raw-params", None),
         ]
 
     def test_freeze_resets_pipelines_and_accepts_exact_unit_hook_boundary(self):
@@ -882,17 +880,19 @@ class TestFSDPPlannedDoubleBufferCapture:
                 reset=lambda: events.append(("grad-reset", None))
             ),
             param_and_grad_buffer=param_and_grad_buffer,
+            is_param_fsdp_distributed=False,
             _replace_param_with_raw_if_needed=lambda: events.append(("raw-params", None)),
         )
         helper = _bare_capture_lifecycle_helper(layer)
         helper._get_megatron_fsdp_instances = lambda: [fsdp_module]
 
+        helper._prepare_fsdp_params_for_capture()
         helper._freeze_fsdp_planned_double_buffers()
 
         assert events == [
+            ("raw-params", None),
             ("ag-reset", {"preserve_non_fsdp_units": True}),
             ("grad-reset", None),
-            ("raw-params", None),
             ("freeze", {0}),
         ]
 

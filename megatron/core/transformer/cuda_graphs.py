@@ -3258,7 +3258,6 @@ class TECudaGraphHelper:
             grad_pipeline = getattr(fsdp_module, 'grad_reduce_pipeline', None)
             if grad_pipeline is not None and hasattr(grad_pipeline, 'reset'):
                 grad_pipeline.reset()
-            fsdp_module._replace_param_with_raw_if_needed()
 
             graph_bucket_ids, missing_hook_buckets = self._graph_bucket_ids_for_fsdp_module(
                 fsdp_module
