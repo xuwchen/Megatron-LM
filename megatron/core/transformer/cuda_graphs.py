@@ -1773,9 +1773,13 @@ def _layer_captures_attention(layer):
     return getattr(layer, '_cuda_graph_captures_attention', lambda: True)()
 
 
-def _layer_is_graphable(layer, config):
-    """
-    Check if a layer is graphable.
+def _layer_is_graphable(layer, config, *, use_megatron_fsdp=False):
+    """Check whether a layer can be captured by the TE CUDA graph helper.
+
+    Args:
+        layer: Candidate graph callable.
+        config: Transformer configuration that defines the requested graph scope.
+        use_megatron_fsdp: Whether the model is managed by Megatron-FSDP.
     """
 
     # Only GraphableMegatronModule can be graphed.
@@ -1790,6 +1794,14 @@ def _layer_is_graphable(layer, config):
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
+    # Megatron-FSDP currently installs gather/release and pre-backward hooks on
+    # the inner TransformerLayer, while TE registers the outer mHC wrapper as
+    # the graph callable. Capturing the wrapper would bypass those inner hooks
+    # and could bake released parameter storage into the graph. Keep the whole
+    # wrapper eager until its FSDP lifecycle is explicitly lifted to this
+    # callable boundary.
+    if use_megatron_fsdp and isinstance(layer, HyperConnectionHybridLayer):
+        return False
 
     # If cuda_graph_modules is not set, every layer is graphed (whole-layer
     # capture includes attention, so it requires a TE-graph-safe attention).
@@ -1808,6 +1820,20 @@ def _layer_is_graphable(layer, config):
         if isinstance(inner, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
             return True
         if isinstance(inner, TransformerLayer):
+            has_attention = not isinstance(inner.self_attention, IdentityOp)
+            has_mlp = not isinstance(inner.mlp, IdentityOp)
+            if has_attention and has_mlp:
+                # Non-empty scopes require splitting the wrapper around eager
+                # regions. HyperConnectionHybridLayer currently only implements
+                # that split for an MoE-only inner layer; pretending a composite
+                # attention+MLP layer were partial would silently skip or capture
+                # the wrong branch.
+                logger.warning(
+                    "Leaving composite HyperConnectionHybridLayer eager because partial TE "
+                    "CUDA graph capture is not implemented for an inner TransformerLayer "
+                    "that contains both attention and MLP."
+                )
+                return False
             if isinstance(inner.mlp, MoELayer):
                 # MoE inner: graphable via partial (router/preprocess) capture.
                 if (
@@ -1862,6 +1888,29 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _get_model_with_decoder(model_chunk):
+    """Return the decoder-bearing model for a training model chunk.
+
+    Standard GPT chunks expose ``decoder`` directly (possibly through a
+    ``.module`` wrapper). Multimodal models keep the GPT model under
+    ``language_model``, so resolve that nested module as a fallback.
+    """
+    try:
+        return get_attr_wrapped_model(
+            model_chunk, 'decoder', allow_none=False, return_model_obj=True
+        )
+    except RuntimeError as direct_error:
+        try:
+            language_model = get_attr_wrapped_model(
+                model_chunk, 'language_model', allow_none=False
+            )
+            return get_attr_wrapped_model(
+                language_model, 'decoder', allow_none=False, return_model_obj=True
+            )
+        except RuntimeError:
+            raise direct_error
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -1913,6 +1962,9 @@ class TECudaGraphHelper:
         # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
         self.num_microbatches = None
 
+        # mHC wrappers cannot yet own the inner TransformerLayer's Megatron-FSDP hook lifecycle.
+        self._uses_megatron_fsdp = bool(self._get_megatron_fsdp_instances())
+
         self._discover_layers()
 
         # Flags to track CUDA Graph state:
@@ -1931,11 +1983,14 @@ class TECudaGraphHelper:
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
+        from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+
+        use_megatron_fsdp = getattr(self, '_uses_megatron_fsdp', False)
+        num_mhc_layers_skipped_for_megatron_fsdp = 0
+
         for chunk_number, model_chunk in enumerate(self.model):
             try:
-                chunk_with_decoder = get_attr_wrapped_model(
-                    model_chunk, 'decoder', allow_none=False, return_model_obj=True
-                )
+                chunk_with_decoder = _get_model_with_decoder(model_chunk)
             except RuntimeError:
                 num_graphable_layers = 0
                 log_on_each_pipeline_stage(
@@ -1956,13 +2011,17 @@ class TECudaGraphHelper:
                 callables, callables_is_mtp = [], []
                 for layer_number in range(num_decoder_layers):
                     layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
+                    if use_megatron_fsdp and isinstance(layer, HyperConnectionHybridLayer):
+                        num_mhc_layers_skipped_for_megatron_fsdp += 1
+                    if _layer_is_graphable(layer, self.config, use_megatron_fsdp=use_megatron_fsdp):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
                     layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
+                    if use_megatron_fsdp and isinstance(layer, HyperConnectionHybridLayer):
+                        num_mhc_layers_skipped_for_megatron_fsdp += 1
+                    if _layer_is_graphable(layer, self.config, use_megatron_fsdp=use_megatron_fsdp):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(True)
@@ -1988,6 +2047,19 @@ class TECudaGraphHelper:
                     self.num_layers_per_chunk.append(0)
                     self.callables_per_chunk.append([])
                     self.callables_per_chunk_is_mtp.append([])
+
+        if num_mhc_layers_skipped_for_megatron_fsdp:
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
+                level=logging.WARNING,
+                msg=(
+                    f'Leaving {num_mhc_layers_skipped_for_megatron_fsdp} '
+                    'HyperConnectionHybridLayer callable(s) eager: TE CUDA graph capture '
+                    'does not yet support the inner-layer hook lifecycle used by Megatron-FSDP.'
+                ),
+            )
 
         log_on_each_pipeline_stage(
             logger=logger,
@@ -3337,7 +3409,11 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
                 self.vision_model.decoder, 'layers'
             ):
                 for layer in self.vision_model.decoder.layers:
-                    if _layer_is_graphable(layer, self.config):
+                    if _layer_is_graphable(
+                        layer,
+                        self.config,
+                        use_megatron_fsdp=getattr(self, '_uses_megatron_fsdp', False),
+                    ):
                         vision_layers.append(layer)
 
         if vision_layers:
