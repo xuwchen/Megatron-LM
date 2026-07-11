@@ -12,8 +12,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import Megat
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
     AllGatherPipeline,
     Bucket,
-    BucketStatus,
     BucketingPolicy,
+    BucketStatus,
     GradReducePipeline,
     ParamAndGradBuffer,
     PlannedUnitDoubleBufferAllocator,
@@ -411,8 +411,17 @@ def test_planned_unit_double_buffer_leaves_unconfigured_vision_unit_dynamic(
     assert base.free_calls[-1] == 1
 
 
-def test_all_gather_prefetch_skips_vision_and_stops_before_third_planned_unit():
-    """A dynamic Vision bucket does not consume either decoder prefetch bank."""
+@pytest.mark.parametrize(
+    ("use_planned_double_buffer", "expected_prefetched"),
+    [
+        pytest.param(True, {0, 1, 2}, id="planned-skips-dynamic-vision"),
+        pytest.param(False, {0, 1}, id="legacy-counts-dynamic-vision"),
+    ],
+)
+def test_all_gather_prefetch_preserves_double_buffer_unit_accounting(
+    use_planned_double_buffer, expected_prefetched
+):
+    """Planned and legacy pools retain their distinct prefetch accounting."""
     params = [torch.nn.Parameter(torch.empty(1)) for _ in range(4)]
     unit_ids = [10, 99, 11, 12]
     parameter_groups = [
@@ -426,7 +435,10 @@ def test_all_gather_prefetch_skips_vision_and_stops_before_third_planned_unit():
         for unit_id in unit_ids
     ]
     buffer = SimpleNamespace(
-        ddp_config=SimpleNamespace(fsdp_double_buffer=True),
+        ddp_config=SimpleNamespace(
+            fsdp_double_buffer=True,
+            megatron_fsdp_use_planned_double_buffer=use_planned_double_buffer,
+        ),
         param_to_param_group={
             param: bucket_id for bucket_id, param in enumerate(params)
         },
@@ -453,12 +465,11 @@ def test_all_gather_prefetch_skips_vision_and_stops_before_third_planned_unit():
         suggested_AG_prefetch_size=1_000_000,
     )
 
-    assert pipeline.bucket_can_be_released == {
-        (0, False): False,
-        (1, False): False,
-        (2, False): False,
-        (3, False): True,
-    }
+    assert {
+        bucket_id
+        for (bucket_id, _), can_be_released in pipeline.bucket_can_be_released.items()
+        if not can_be_released
+    } == expected_prefetched
 
 
 @pytest.mark.parametrize("bwd", [False, True], ids=["rowwise-weight", "transpose-weight"])
@@ -502,6 +513,7 @@ def test_all_gather_pipeline_releases_and_reuses_planned_weight_bank(
         ddp_config=SimpleNamespace(
             fsdp_double_buffer=True,
             outer_dp_sharding_strategy="no_shard",
+            megatron_fsdp_use_planned_double_buffer=True,
         ),
     )
     pipeline = AllGatherPipeline(pgb)
@@ -739,25 +751,35 @@ def test_grad_reduce_waits_for_exact_pending_buckets_before_graph_write(
 
 
 @pytest.mark.parametrize(
-    ("queued_bucket_ids", "expected_keep_n", "expected_remaining"),
+    (
+        "use_planned_double_buffer",
+        "queued_bucket_ids",
+        "expected_keep_n",
+        "expected_remaining",
+    ),
     [
-        pytest.param([0, 1, 2], 1, [2], id="vision-before-two-decoder-units"),
-        pytest.param([1, 0, 2], 2, [0, 2], id="vision-between-decoder-units"),
+        pytest.param(True, [0, 1, 2], 1, [2], id="planned-vision-before-decoders"),
+        pytest.param(True, [1, 0, 2], 2, [0, 2], id="planned-vision-between-decoders"),
+        pytest.param(False, [0, 1], 1, [1], id="legacy-counts-dynamic-vision"),
     ],
 )
 def test_grad_reduce_double_buffer_cutoff_counts_vision_queue_positions(
     monkeypatch,
+    use_planned_double_buffer,
     queued_bucket_ids,
     expected_keep_n,
     expected_remaining,
 ):
-    """Vision uses no bank, but its queue position remains part of the wait cutoff."""
+    """Vision uses no planned bank; legacy retains its original unit accounting."""
     vision_unit = 99
     decoder_unit_a = 10
     decoder_unit_b = 11
     incoming_unit_c = 12
     buffer = SimpleNamespace(
-        ddp_config=SimpleNamespace(fsdp_double_buffer=True),
+        ddp_config=SimpleNamespace(
+            fsdp_double_buffer=True,
+            megatron_fsdp_use_planned_double_buffer=use_planned_double_buffer,
+        ),
         parameter_groups=[
             SimpleNamespace(fsdp_unit_id=vision_unit),
             SimpleNamespace(fsdp_unit_id=decoder_unit_a),
@@ -768,12 +790,19 @@ def test_grad_reduce_double_buffer_cutoff_counts_vision_queue_positions(
     )
     pipeline = GradReducePipeline.__new__(GradReducePipeline)
     pipeline.buffer = buffer
-    pipeline.rs_stream = object()
+    rs_stream = object()
+    pipeline.rs_stream = rs_stream
     pipeline.grad_reduce_queue = [
         (None, None, bucket_id) for bucket_id in queued_bucket_ids
     ]
     wait_calls = []
     consumer_stream = object()
+    stream_contexts = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "stream",
+        lambda stream: stream_contexts.append(stream) or nullcontext(),
+    )
 
     def record_wait(keep_n, wait_stream=None):
         wait_calls.append((keep_n, wait_stream))
@@ -787,7 +816,9 @@ def test_grad_reduce_double_buffer_cutoff_counts_vision_queue_positions(
 
     pipeline._enforce_double_buffer_limit([3])
 
-    assert wait_calls == [(expected_keep_n, consumer_stream)]
+    expected_wait_stream = consumer_stream if use_planned_double_buffer else None
+    assert wait_calls == [(expected_keep_n, expected_wait_stream)]
+    assert stream_contexts == ([] if use_planned_double_buffer else [rs_stream])
     assert [
         bucket_id for _, _, bucket_id in pipeline.grad_reduce_queue
     ] == expected_remaining
@@ -798,7 +829,10 @@ def test_grad_reduce_double_buffer_orders_consumer_stream_before_bank_release(mo
     consumer_stream = object()
     events = []
     buffer = SimpleNamespace(
-        ddp_config=SimpleNamespace(fsdp_double_buffer=True),
+        ddp_config=SimpleNamespace(
+            fsdp_double_buffer=True,
+            megatron_fsdp_use_planned_double_buffer=True,
+        ),
         parameter_groups=[
             SimpleNamespace(fsdp_unit_id=10),
             SimpleNamespace(fsdp_unit_id=11),
@@ -879,7 +913,10 @@ def test_grad_reduce_double_buffer_drains_reentered_unit_before_new_claim(
     consumer_stream = object()
     events = []
     buffer = SimpleNamespace(
-        ddp_config=SimpleNamespace(fsdp_double_buffer=True),
+        ddp_config=SimpleNamespace(
+            fsdp_double_buffer=True,
+            megatron_fsdp_use_planned_double_buffer=True,
+        ),
         parameter_groups=[
             SimpleNamespace(fsdp_unit_id=unit_id) for unit_id in unit_ids
         ],

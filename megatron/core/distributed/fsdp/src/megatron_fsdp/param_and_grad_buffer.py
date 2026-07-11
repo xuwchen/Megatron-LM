@@ -4276,6 +4276,30 @@ class GradReducePipeline:
             return
 
         param_groups = self.buffer.parameter_groups
+        if not getattr(
+            self.buffer.ddp_config, "megatron_fsdp_use_planned_double_buffer", False
+        ):
+            double_buf_units = set()
+            for bucket_id in add_buckets:
+                fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
+                if fsdp_unit_id in self.buffer.double_buf_units:
+                    double_buf_units.add(fsdp_unit_id)
+            assert len(double_buf_units) <= 2, (
+                "Double buffer limit exceeded. "
+                f"Current double_buf_units: {double_buf_units}."
+            )
+
+            keep_n = len(self.grad_reduce_queue)
+            for _, _, bucket_id in reversed(self.grad_reduce_queue):
+                fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
+                double_buf_units.add(fsdp_unit_id)
+                if len(double_buf_units) > 2:
+                    keep_n -= 1
+
+            with torch.cuda.stream(self.rs_stream):
+                self.wait_for_previous_grad_reduce(keep_n)
+            return
+
         incoming_double_buf_units = set()
         for bucket_id in add_buckets:
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
@@ -4756,6 +4780,9 @@ class AllGatherPipeline:
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
+        use_planned_double_buffer = getattr(
+            self.buffer.ddp_config, "megatron_fsdp_use_planned_double_buffer", False
+        )
         if self.buffer.ddp_config.fsdp_double_buffer:
             double_buf_units = set()
             for bucket_id in ag_buckets:
@@ -4799,10 +4826,12 @@ class AllGatherPipeline:
                 # is exceeding the coverage of the double buffer.
                 if self.buffer.ddp_config.fsdp_double_buffer:
                     fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
-                    if fsdp_unit_id in self.buffer.double_buf_units:
+                    if not use_planned_double_buffer or (
+                        fsdp_unit_id in self.buffer.double_buf_units
+                    ):
                         double_buf_units.add(fsdp_unit_id)
                         if len(double_buf_units) > 2:
-                            # The next decoder unit would require a third bank.
+                            # The next unit exceeds this allocator's two-bank coverage.
                             return True
                 return False
 
