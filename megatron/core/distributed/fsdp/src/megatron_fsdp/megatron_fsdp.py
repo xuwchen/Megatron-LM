@@ -481,6 +481,11 @@ class MegatronFSDP(torch.nn.Module):
             ):
                 replay_claims[bucket_id] = claim
 
+        if replay_claims:
+            # Graph-baked fused wgrad writes reuse the same bucket address.
+            # Finish any older reduction reading that bucket before replay.
+            self.grad_reduce_pipeline.wait_for_pending_buckets(sorted(replay_claims))
+
         if record_claims:
             # Match replay ordering during eager lifetime observation: release
             # a prior unit before opening this unit's planned main-grad lifetime.
@@ -1359,17 +1364,18 @@ class MegatronFSDP(torch.nn.Module):
             self.synchronize_param_gather()
             for bucket_id in range(self.all_gather_pipeline.num_buckets):
                 self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
-                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
-                if group.model_weight_buffer is None:
-                    continue
-
-                if group.model_weight_buffer.is_data_distributed:
-                    # If model weight is sharded, we wait for the all-gather to complete and
-                    # then release the bucket immediately to save memory usage.
-                    self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
-
-            for bucket_id in range(self.all_gather_pipeline.num_buckets):
                 self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
+
+                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
+                if (
+                    group.model_weight_buffer is not None
+                    and group.model_weight_buffer.is_data_distributed
+                    and group.fsdp_unit_id not in (None, -1)
+                ):
+                    # Force-sync walks every bucket. Release each sharded FSDP
+                    # unit before gathering the next one so a fixed two-bank
+                    # allocator cannot be exhausted by this maintenance path.
+                    self.all_gather_pipeline.release_bucket(bucket_id, False)
 
     def start_grad_sync(self, *unused):
         """
