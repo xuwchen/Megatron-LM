@@ -131,6 +131,7 @@ This mode currently requires:
 
 - `--data-parallel-sharding-strategy optim_grads_params`
 - `--fsdp-double-buffer`
+- `--overlap-param-gather` and `--overlap-grad-reduce`
 - `--cuda-graph-warmup-steps >= 1`
 - `--fsdp-db-use-persist-buf-on-alloc-fail` to remain disabled (the default)
 - fine-grained parameter gather to remain disabled, including explicit
@@ -139,6 +140,9 @@ This mode currently requires:
   enables the same fine-grained FSDP hooks internally
 - `--use-nccl-ub` to remain disabled; planned banks are not yet compatible with NCCL user-buffer
   registration
+
+`start_param_sync(force_sync=True)` is unsupported because a whole-model unshard cannot remain
+resident in a frozen two-bank plan; the normal overlapped per-unit hooks must drive parameter sync.
 
 `MEGATRON_CG_SKIP_BUFFER_ADDRESS_CHECK=1` disables the replay-time parameter-address check for
 diagnostics only. Other values, including `0` and `false`, leave the check enabled. Bypassing it

@@ -726,8 +726,8 @@ def test_grad_reduce_double_buffer_drains_reentered_unit_before_new_claim(
     assert events[-1] == ("claim", incoming_bucket_id)
 
 
-def test_force_param_sync_releases_each_sharded_unit_before_next_gather():
-    """A maintenance sync cannot hold more decoder units than planned banks."""
+def test_force_param_sync_rejects_planned_allocator_without_state_changes():
+    """A whole-model sync cannot satisfy a frozen per-unit residency plan."""
     events = []
     pipeline = SimpleNamespace(
         num_buckets=4,
@@ -736,9 +736,6 @@ def test_force_param_sync_releases_each_sharded_unit_before_next_gather():
         ),
         wait_bucket_ready=lambda bucket_id, bwd: events.append(
             ("wait", bucket_id, bwd)
-        ),
-        release_bucket=lambda bucket_id, bwd: events.append(
-            ("release", bucket_id, bwd)
         ),
     )
     parameter_groups = [
@@ -751,29 +748,19 @@ def test_force_param_sync_releases_each_sharded_unit_before_next_gather():
     fake_fsdp = SimpleNamespace(
         _replace_param_with_raw_if_needed=lambda: events.append(("replace",)),
         data_parallel_sharding_strategy="optim_grads_params",
-        ddp_config=SimpleNamespace(overlap_param_gather=False),
+        ddp_config=SimpleNamespace(
+            overlap_param_gather=True,
+            megatron_fsdp_use_planned_double_buffer=True,
+        ),
         synchronize_param_gather=lambda: events.append(("synchronize",)),
         all_gather_pipeline=pipeline,
         param_and_grad_buffer=SimpleNamespace(parameter_groups=parameter_groups),
     )
 
-    MegatronFSDP.start_param_sync(fake_fsdp, force_sync=True)
+    with pytest.raises(RuntimeError, match="cannot materialize every FSDP unit"):
+        MegatronFSDP.start_param_sync(fake_fsdp, force_sync=True)
 
-    assert events == [
-        ("replace",),
-        ("synchronize",),
-        ("gather", 0, False),
-        ("wait", 0, False),
-        ("release", 0, False),
-        ("gather", 1, False),
-        ("wait", 1, False),
-        ("release", 1, False),
-        ("gather", 2, False),
-        ("wait", 2, False),
-        ("release", 2, False),
-        ("gather", 3, False),
-        ("wait", 3, False),
-    ]
+    assert events == []
 
 
 def test_pgb_freeze_rejects_graph_buffer_missing_from_configured_planned_buckets():

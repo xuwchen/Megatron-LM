@@ -122,6 +122,12 @@ def _validate_cuda_graph_config(config, ddp_config):
             "Megatron-FSDP planned double buffering requires "
             "data_parallel_sharding_strategy='optim_grads_params'."
         )
+    if not (ddp_config.overlap_param_gather and ddp_config.overlap_grad_reduce):
+        raise ValueError(
+            "Megatron-FSDP planned double buffering requires "
+            "overlap_param_gather=True and overlap_grad_reduce=True so decoder-unit "
+            "weight and gradient residency stays within the frozen bank schedule."
+        )
     uses_fine_grained_param_gather = (
         (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
         or ddp_config.megatron_fsdp_enable_fine_grained_param_gather

@@ -97,6 +97,8 @@ def _te_planned_double_buffer_args(cuda_graph_warmup_steps=3, **overrides):
         overlap_moe_expert_parallel_comm=False,
         nccl_ub=False,
         data_parallel_sharding_strategy="optim_grads_params",
+        overlap_param_gather=True,
+        overlap_grad_reduce=True,
         fsdp_double_buffer=True,
         fsdp_db_use_persist_buf_on_alloc_fail=False,
     )
@@ -114,6 +116,8 @@ def _te_planned_double_buffer_config(**overrides):
         fsdp_db_use_persist_buf_on_alloc_fail=False,
         nccl_ub=False,
         data_parallel_sharding_strategy="optim_grads_params",
+        overlap_param_gather=True,
+        overlap_grad_reduce=True,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -181,6 +185,15 @@ def test_te_planned_double_buffer_accepts_positive_warmup(cuda_graph_warmup_step
     _validate_megatron_fsdp_cuda_graph_buffers(args)
 
 
+@pytest.mark.parametrize("disabled_overlap", ["overlap_param_gather", "overlap_grad_reduce"])
+def test_te_planned_double_buffer_requires_overlapped_fsdp_communication(disabled_overlap):
+    """A frozen two-bank plan cannot hold synchronous whole-model residency."""
+    args = _te_planned_double_buffer_args(**{disabled_overlap: False})
+
+    with pytest.raises(ValueError, match="requires --overlap-param-gather"):
+        _validate_megatron_fsdp_cuda_graph_buffers(args)
+
+
 def test_adapter_rejects_planned_double_buffer_without_eager_warmup():
     """Programmatic callers cannot bypass lifetime observation."""
     config = SimpleNamespace(
@@ -205,6 +218,21 @@ def test_adapter_accepts_positive_eager_warmup(cuda_graph_warmup_steps):
     )
 
     _validate_cuda_graph_config(config, _te_planned_double_buffer_config())
+
+
+@pytest.mark.parametrize("disabled_overlap", ["overlap_param_gather", "overlap_grad_reduce"])
+def test_adapter_requires_overlapped_fsdp_communication(disabled_overlap):
+    """Programmatic callers must preserve the same planned residency schedule."""
+    config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_warmup_steps=3,
+        fp8_recipe=None,
+        overlap_moe_expert_parallel_comm=False,
+    )
+    ddp_config = _te_planned_double_buffer_config(**{disabled_overlap: False})
+
+    with pytest.raises(ValueError, match="requires overlap_param_gather=True"):
+        _validate_cuda_graph_config(config, ddp_config)
 
 
 @pytest.mark.parametrize(

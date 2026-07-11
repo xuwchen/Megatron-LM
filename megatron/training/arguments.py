@@ -397,6 +397,13 @@ def _validate_megatron_fsdp_cuda_graph_buffers(args):
             "--cuda-graph-impl=transformer_engine requires "
             "--data-parallel-sharding-strategy=optim_grads_params."
         )
+    if not (args.overlap_param_gather and args.overlap_grad_reduce):
+        raise ValueError(
+            "Megatron-FSDP planned double buffering with "
+            "--cuda-graph-impl=transformer_engine requires --overlap-param-gather "
+            "and --overlap-grad-reduce so decoder-unit weight and gradient residency "
+            "stays within the frozen bank schedule."
+        )
     if not args.fsdp_double_buffer:
         raise ValueError(
             "Megatron-FSDP with --cuda-graph-impl=transformer_engine requires "

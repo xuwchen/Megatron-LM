@@ -432,9 +432,12 @@ diagnostics only. It is unsafe for production because an address change can othe
 training corruption.
 
 The planned mode requires `optim_grads_params` sharding, `fsdp_double_buffer=True`, at least one
-CUDA graph warmup step, and `fsdp_db_use_persist_buf_on_alloc_fail=False`. It currently rejects
-NCCL user buffers because the planned banks are materialized after the existing manual
-registration point. Fine-grained parameter gather is also unsupported, whether enabled explicitly
+CUDA graph warmup step, `overlap_param_gather=True`, `overlap_grad_reduce=True`, and
+`fsdp_db_use_persist_buf_on_alloc_fail=False`. `start_param_sync(force_sync=True)` is unsupported
+because it requires every unsharded FSDP unit to remain resident after the call, which cannot fit
+the frozen per-unit bank schedule. The normal overlapped hooks must drive parameter sync. This mode
+currently rejects NCCL user buffers because the planned banks are materialized after the existing
+manual registration point. Fine-grained parameter gather is also unsupported, whether enabled explicitly
 with `--megatron-fsdp-enable-fine-grained-param-gather` or selected by the `mxfp8` recipe combined
 with `--fp8-param-gather`; `--overlap-moe-expert-parallel-comm` is unsupported because it enables
 the same fine-grained FSDP hooks internally. Under Megatron-FSDP, mHC-wrapped layers stay eager. For

@@ -1348,6 +1348,17 @@ class MegatronFSDP(torch.nn.Module):
                 other settings.
             force_dispatch (bool, optional): force dispatch regardless of other settings.
         """
+        if (
+            force_sync
+            and self.data_parallel_sharding_strategy == "optim_grads_params"
+            and self.ddp_config.megatron_fsdp_use_planned_double_buffer
+        ):
+            raise RuntimeError(
+                "start_param_sync(force_sync=True) cannot materialize every FSDP unit "
+                "with planned double buffering. The frozen bank plan supports overlapped "
+                "per-unit residency only."
+            )
+
         self._replace_param_with_raw_if_needed()
 
         if self.data_parallel_sharding_strategy == "no_shard":
@@ -1365,17 +1376,6 @@ class MegatronFSDP(torch.nn.Module):
             for bucket_id in range(self.all_gather_pipeline.num_buckets):
                 self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
                 self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
-
-                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
-                if (
-                    group.model_weight_buffer is not None
-                    and group.model_weight_buffer.is_data_distributed
-                    and group.fsdp_unit_id not in (None, -1)
-                ):
-                    # Force-sync walks every bucket. Release each sharded FSDP
-                    # unit before gathering the next one so a fixed two-bank
-                    # allocator cannot be exhausted by this maintenance path.
-                    self.all_gather_pipeline.release_bucket(bucket_id, False)
 
     def start_grad_sync(self, *unused):
         """
