@@ -763,6 +763,57 @@ def test_force_param_sync_rejects_planned_allocator_without_state_changes():
     assert events == []
 
 
+@pytest.mark.parametrize(
+    ("force_sync", "overlap_param_gather"),
+    [(True, True), (False, False)],
+)
+def test_unplanned_synchronous_param_sync_batches_replicated_gathers(
+    force_sync, overlap_param_gather
+):
+    """Synchronous replicated gathers retain their dispatch overlap."""
+    events = []
+    pipeline = SimpleNamespace(
+        num_buckets=3,
+        async_bucket_gather=lambda bucket_id, bwd: events.append(
+            ("gather", bucket_id, bwd)
+        ),
+        wait_bucket_ready=lambda bucket_id, bwd: events.append(
+            ("wait", bucket_id, bwd)
+        ),
+    )
+    parameter_groups = [
+        SimpleNamespace(
+            model_weight_buffer=SimpleNamespace(is_data_distributed=False)
+        )
+        for _ in range(pipeline.num_buckets)
+    ]
+    fake_fsdp = SimpleNamespace(
+        _replace_param_with_raw_if_needed=lambda: events.append(("replace",)),
+        data_parallel_sharding_strategy="optim_grads",
+        ddp_config=SimpleNamespace(
+            overlap_param_gather=overlap_param_gather,
+            megatron_fsdp_use_planned_double_buffer=False,
+            fsdp_all_gather_in_start_param_sync=False,
+        ),
+        synchronize_param_gather=lambda: events.append(("synchronize",)),
+        all_gather_pipeline=pipeline,
+        param_and_grad_buffer=SimpleNamespace(parameter_groups=parameter_groups),
+    )
+
+    MegatronFSDP.start_param_sync(fake_fsdp, force_sync=force_sync)
+
+    assert events == [
+        ("replace",),
+        ("synchronize",),
+        ("gather", 0, False),
+        ("gather", 1, False),
+        ("gather", 2, False),
+        ("wait", 0, False),
+        ("wait", 1, False),
+        ("wait", 2, False),
+    ]
+
+
 def test_pgb_freeze_rejects_graph_buffer_missing_from_configured_planned_buckets():
     """Intersecting with configured IDs must not hide a graph-covered planned buffer."""
     parameter_groups = _allocator_param_groups(0, 1)
