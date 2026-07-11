@@ -113,6 +113,8 @@ def test_megatron_fsdp_cuda_graph_buffer_validation(
     args = SimpleNamespace(
         cuda_graph_impl=cuda_graph_impl,
         use_megatron_fsdp=True,
+        overlap_param_gather=True,
+        overlap_grad_reduce=True,
         data_parallel_sharding_strategy="optim_grads_params",
         fsdp_double_buffer=fsdp_double_buffer,
         nccl_ub=nccl_ub,
@@ -139,7 +141,38 @@ def test_te_planned_sharding_strategy_matrix(strategy, expected_error):
     args = SimpleNamespace(
         cuda_graph_impl="transformer_engine",
         use_megatron_fsdp=True,
+        overlap_param_gather=True,
+        overlap_grad_reduce=True,
         data_parallel_sharding_strategy=strategy,
+        fsdp_double_buffer=False,
+        nccl_ub=False,
+    )
+
+    if expected_error is None:
+        _validate_megatron_fsdp_cuda_graph_buffers(args)
+    else:
+        with pytest.raises(ValueError, match=expected_error):
+            _validate_megatron_fsdp_cuda_graph_buffers(args)
+
+
+@pytest.mark.parametrize(
+    ("overlap_param_gather", "overlap_grad_reduce", "expected_error"),
+    [
+        pytest.param(False, True, "--overlap-param-gather", id="param-gather"),
+        pytest.param(True, False, "--overlap-grad-reduce", id="grad-reduce"),
+        pytest.param(True, True, None, id="both-enabled"),
+    ],
+)
+def test_te_planned_fully_sharded_requires_communication_overlap(
+    overlap_param_gather, overlap_grad_reduce, expected_error
+):
+    """Planned lifetimes require per-unit AG and RS scheduling."""
+    args = SimpleNamespace(
+        cuda_graph_impl="transformer_engine",
+        use_megatron_fsdp=True,
+        overlap_param_gather=overlap_param_gather,
+        overlap_grad_reduce=overlap_grad_reduce,
+        data_parallel_sharding_strategy="optim_grads_params",
         fsdp_double_buffer=False,
         nccl_ub=False,
     )
@@ -325,6 +358,8 @@ def test_programmatic_fsdp_wrapper_revalidates_cuda_graph_config(
     ddp_config = SimpleNamespace(
         megatron_fsdp_cuda_graph_mode=graph_mode,
         megatron_fsdp_use_planned_allocator=planned,
+        overlap_param_gather=True,
+        overlap_grad_reduce=True,
         nccl_ub=nccl_ub,
         data_parallel_sharding_strategy=strategy,
         fsdp_double_buffer=double_buffer,
@@ -335,6 +370,37 @@ def test_programmatic_fsdp_wrapper_revalidates_cuda_graph_config(
     else:
         with pytest.raises(ValueError, match=expected_error):
             _validate_cuda_graph_config(config, ddp_config)
+
+
+@pytest.mark.parametrize(
+    ("disabled_overlap", "expected_error"),
+    [
+        pytest.param(
+            "overlap_param_gather", "requires overlap_param_gather=True", id="param-gather"
+        ),
+        pytest.param(
+            "overlap_grad_reduce", "requires overlap_grad_reduce=True", id="grad-reduce"
+        ),
+    ],
+)
+def test_programmatic_te_planned_fully_sharded_requires_overlap(
+    disabled_overlap, expected_error
+):
+    """Programmatic setup cannot rely on later constructor-side overlap mutation."""
+    config = SimpleNamespace(cuda_graph_impl="transformer_engine")
+    ddp_config = SimpleNamespace(
+        megatron_fsdp_cuda_graph_mode=True,
+        megatron_fsdp_use_planned_allocator=True,
+        overlap_param_gather=True,
+        overlap_grad_reduce=True,
+        nccl_ub=False,
+        data_parallel_sharding_strategy="optim_grads_params",
+        fsdp_double_buffer=False,
+    )
+    setattr(ddp_config, disabled_overlap, False)
+
+    with pytest.raises(ValueError, match=expected_error):
+        _validate_cuda_graph_config(config, ddp_config)
 
 
 def test_capture_failure_restores_forward_pre_hooks_without_installing_manual_hooks(monkeypatch):

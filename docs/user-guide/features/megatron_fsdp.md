@@ -439,6 +439,13 @@ lifetimes rather than a fixed pair of buffers, so a bucket offset may require on
 colors. Each slot's capacity is the maximum padded size observed among the same-dtype buckets
 assigned to that `(color, bucket-offset)` pair.
 
+Fully sharded (`optim_grads_params`) planned allocation requires both
+`--overlap-param-gather` and `--overlap-grad-reduce`: its frozen plan covers the observed per-unit
+all-gather and reduce-scatter lifetimes, not synchronous or delayed full-model residency.
+`start_param_sync(force_sync=True)` is therefore rejected before changing parameter or pipeline
+state in this configuration. Releasing each unit immediately would satisfy the plan's capacity but
+would violate force-sync's contract that all unsharded parameters remain ready when it returns.
+
 Each parameter-and-gradient buffer has a distinct process-local namespace that combines a
 human-readable model-chunk label with a monotonic buffer instance ID. The instance ID prevents
 collisions between independently wrapped model groups that both contain a `model_chunk_0`, while

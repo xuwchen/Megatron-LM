@@ -647,3 +647,21 @@ def test_grad_reduce_waits_for_exact_pending_buckets_before_graph_write(
     assert [event[1] for event in events if event[0] == "free"] == expected_released
     assert all(event[2] is consumer_stream for event in events if event[0] == "wait")
     assert [bucket_id for _, _, bucket_id in pipeline.grad_reduce_queue] == expected_remaining
+
+
+def test_planned_force_param_sync_rejects_before_state_change():
+    """Force-sync cannot discard planned unit weights while promising all params are ready."""
+    events = []
+    fake_fsdp = SimpleNamespace(
+        data_parallel_sharding_strategy="optim_grads_params",
+        param_and_grad_buffer=SimpleNamespace(_uses_planned_allocator=True),
+        _replace_param_with_raw_if_needed=lambda: events.append("replace"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"start_param_sync\(force_sync=True\) is incompatible with planned allocation",
+    ):
+        MegatronFSDP.start_param_sync(fake_fsdp, force_sync=True)
+
+    assert events == []
