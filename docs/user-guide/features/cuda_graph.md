@@ -109,6 +109,60 @@ but custom training scripts must do the same work themselves.
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
+### Megatron-FSDP planned double buffering
+
+With Megatron-FSDP, the Transformer Engine backend uses a planned, decoder-only double buffer to
+keep the temporary parameter and main-gradient addresses referenced by CUDA graphs stable. An
+eager warmup records decoder FSDP-unit lifetimes and assigns overlapping units to two static banks.
+All buckets in one FSDP unit use the same bank color. Parameter all-gather and gradient
+reduce-scatter scheduling are limited to two decoder units so that a third live unit cannot
+overwrite either bank. A decoder unit cannot reclaim its main-gradient bank until any earlier
+reduce-scatter reading the same unit has completed. Before a fused weight-gradient CUDA graph
+writes `main_grad`, Megatron-FSDP claims and validates that unit's planned bank.
+
+Within each parameter-and-gradient buffer (one model chunk), the two banks are shared by
+all language-decoder layers. For each storage kind and dtype, each bank's arena is sized to the
+maximum aggregate bucket size of any decoder FSDP unit. Vision encoder buckets are not included in
+this plan and continue to use the dynamic allocator. Vision encoder TE
+capture is unsupported in this mode, so Vision computation remains eager. Under Megatron-FSDP,
+mHC-wrapped layers remain eager.
+
+This mode currently requires:
+
+- `--data-parallel-sharding-strategy optim_grads_params`
+- `--fsdp-double-buffer`
+- `--cuda-graph-warmup-steps >= 1`
+- `--fsdp-db-use-persist-buf-on-alloc-fail` to remain disabled (the default)
+- fine-grained parameter gather to remain disabled, including explicit
+  `--megatron-fsdp-enable-fine-grained-param-gather` and the `mxfp8` recipe combined with
+  `--fp8-param-gather`; `--overlap-moe-expert-parallel-comm` is also unsupported because it
+  enables the same fine-grained FSDP hooks internally
+- `--use-nccl-ub` to remain disabled; planned banks are not yet compatible with NCCL user-buffer
+  registration
+
+`MEGATRON_CG_SKIP_BUFFER_ADDRESS_CHECK=1` disables the replay-time parameter-address check for
+diagnostics only. Other values, including `0` and `false`, leave the check enabled. Bypassing it
+can turn an allocator error into silent corruption and is not supported for production runs.
+
+The planned bank lifetime topology observed during warmup must not change afterward; dynamic
+microbatch shapes, FSDP-unit topology, or communication schedules are not supported in this mode.
+A capture failure is fatal for the run and is not retryable. Cross-rank capture-failure consensus is
+deferred to follow-up work.
+
+For MoE decoders, the intended partial capture scopes are `attn`, `moe_router`, and
+`moe_preprocess`. Gated Delta Net (GDN) blocks are captured under the `attn` scope only with the
+explicit opt-in environment variable `MEGATRON_GDN_TE_CUDA_GRAPH=1`:
+
+```bash
+MEGATRON_GDN_TE_CUDA_GRAPH=1 python pretrain_multimodal.py \
+  --use-megatron-fsdp \
+  --data-parallel-sharding-strategy optim_grads_params \
+  --cuda-graph-impl transformer_engine \
+  --cuda-graph-modules attn moe_router moe_preprocess \
+  --cuda-graph-warmup-steps 3 \
+  --fsdp-double-buffer
+```
+
 ---
 
 ## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)
