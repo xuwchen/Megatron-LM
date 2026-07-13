@@ -184,6 +184,34 @@ def test_te_planned_fully_sharded_requires_communication_overlap(
             _validate_megatron_fsdp_cuda_graph_buffers(args)
 
 
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("cuda_graph_dynamic_microbatches", True, id="dynamic-graph-slots"),
+        pytest.param("sequence_packing_scheduler", "dp_balanced", id="sequence-packing"),
+        pytest.param("rl_use_sequence_packing", True, id="rl-sequence-packing"),
+    ],
+)
+def test_te_planned_rejects_dynamic_microbatch_topology_inputs(field, value):
+    """Dynamic planned schedules require the deferred retrace lifecycle."""
+    args = SimpleNamespace(
+        cuda_graph_impl="transformer_engine",
+        use_megatron_fsdp=True,
+        overlap_param_gather=True,
+        overlap_grad_reduce=True,
+        data_parallel_sharding_strategy="optim_grads_params",
+        fsdp_double_buffer=False,
+        nccl_ub=False,
+        cuda_graph_dynamic_microbatches=False,
+        sequence_packing_scheduler=None,
+        rl_use_sequence_packing=False,
+    )
+    setattr(args, field, value)
+
+    with pytest.raises(ValueError, match="does not support dynamic microbatch/topology"):
+        _validate_megatron_fsdp_cuda_graph_buffers(args)
+
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
 def test_per_layer_restrictions_do_not_leak_into_other_ddp_backends(cuda_graph_impl):
     """Megatron-FSDP-specific restrictions must not leak into other DDP backends."""
@@ -401,6 +429,65 @@ def test_programmatic_te_planned_fully_sharded_requires_overlap(
 
     with pytest.raises(ValueError, match=expected_error):
         _validate_cuda_graph_config(config, ddp_config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("cuda_graph_dynamic_microbatches", True, id="dynamic-graph-slots"),
+        pytest.param("sequence_packing_scheduler", "dp_balanced", id="sequence-packing"),
+        pytest.param("rl_use_sequence_packing", True, id="rl-sequence-packing"),
+    ],
+)
+def test_programmatic_te_planned_rejects_dynamic_topology(field, value):
+    """Programmatic callers cannot bypass the deferred dynamic-topology boundary."""
+    config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_dynamic_microbatches=False,
+        sequence_packing_scheduler=None,
+        rl_use_sequence_packing=False,
+    )
+    ddp_config = SimpleNamespace(
+        megatron_fsdp_cuda_graph_mode=True,
+        megatron_fsdp_use_planned_allocator=True,
+        overlap_param_gather=True,
+        overlap_grad_reduce=True,
+        nccl_ub=False,
+        data_parallel_sharding_strategy="optim_grads_params",
+        fsdp_double_buffer=False,
+    )
+    setattr(config, field, value)
+
+    with pytest.raises(ValueError, match="do not support dynamic microbatch/topology"):
+        _validate_cuda_graph_config(config, ddp_config)
+
+
+def test_feature_contract_is_checked_before_disabling_forward_hooks(monkeypatch):
+    """An unsupported TE build must leave caller-owned DDP hooks untouched."""
+    events = []
+
+    def fail_contract():
+        events.append("validate-contract")
+        raise RuntimeError("unsupported capture-time-hooks protocol")
+
+    helper = SimpleNamespace(
+        validate_capture_feature_contract=fail_contract,
+        create_cudagraphs=lambda: events.append("capture"),
+        cuda_graph_set_manual_hooks=lambda: events.append("manual-hooks"),
+    )
+    monkeypatch.setattr(
+        "megatron.training.training.disable_forward_pre_hook",
+        lambda model, param_sync: events.append("disable-hooks"),
+    )
+    monkeypatch.setattr(
+        "megatron.training.training.enable_forward_pre_hook",
+        lambda model: events.append("enable-hooks"),
+    )
+
+    with pytest.raises(RuntimeError, match="capture-time-hooks protocol"):
+        _capture_cudagraphs_with_forward_pre_hook_restore(["model"], helper, True)
+
+    assert events == ["validate-contract"]
 
 
 def test_capture_failure_restores_forward_pre_hooks_without_installing_manual_hooks(monkeypatch):

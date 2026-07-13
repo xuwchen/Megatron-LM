@@ -32,11 +32,13 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import (
+    _TE_CAPTURE_TIME_HOOKS_PROTOCOL,
     CudaGraphManager,
     TECudaGraphHelper,
     VisionTECudaGraphHelper,
     _CudagraphGlobalRecord,
     _get_model_with_decoder,
+    _get_te_capture_time_hooks_contract,
     _layer_captures_attention,
     _layer_is_graphable,
     _merge_observed_rotary_kwargs,
@@ -45,6 +47,7 @@ from megatron.core.transformer.cuda_graphs import (
 from megatron.core.transformer.cuda_graphs import (
     set_current_microbatch as set_cuda_graph_current_microbatch,
 )
+from megatron.core.transformer.cuda_graphs import validate_te_cuda_graph_topology
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -561,7 +564,95 @@ def _bare_capture_lifecycle_helper(layer, helper_cls=TECudaGraphHelper):
     return helper
 
 
+class TestTECaptureTimeHooksContract:
+    def test_explicit_protocol_marker_is_authoritative(self):
+        def marked_callable():
+            return None
+
+        marked_callable.__mcore_cuda_graph_protocols__ = {
+            _TE_CAPTURE_TIME_HOOKS_PROTOCOL
+        }
+        assert (
+            _get_te_capture_time_hooks_contract(marked_callable)
+            == "explicit-protocol-marker"
+        )
+
+        marked_callable.__mcore_cuda_graph_protocols__ = {"different_protocol"}
+        assert _get_te_capture_time_hooks_contract(marked_callable) is None
+
+    def test_module_protocol_marker_is_supported(self, monkeypatch):
+        def unmarked_callable():
+            return None
+
+        graph_module = SimpleNamespace(
+            __mcore_cuda_graph_protocols__=(_TE_CAPTURE_TIME_HOOKS_PROTOCOL,)
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.inspect.getmodule",
+            lambda unused: graph_module,
+        )
+
+        assert (
+            _get_te_capture_time_hooks_contract(unmarked_callable)
+            == "explicit-protocol-marker"
+        )
+
+    def test_argument_name_alone_does_not_claim_protocol(self, monkeypatch):
+        def public_callable(capture_time_hooks=None):
+            return capture_time_hooks
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.inspect.getmodule",
+            lambda unused: SimpleNamespace(),
+        )
+
+        assert _get_te_capture_time_hooks_contract(public_callable) is None
+
+
 class TestTECudaGraphCaptureFailClean:
+    @staticmethod
+    def _planned_fsdp_module():
+        return SimpleNamespace(
+            param_and_grad_buffer=SimpleNamespace(_uses_planned_allocator=True)
+        )
+
+    def test_feature_contract_fails_before_capture_mutation(self, monkeypatch):
+        helper = _bare_capture_lifecycle_helper(torch.nn.Linear(2, 2))
+        helper._get_megatron_fsdp_instances = lambda: [self._planned_fsdp_module()]
+        events = []
+        helper._start_capturing = lambda: events.append("start-capturing")
+
+        def unsupported_callable():
+            return None
+
+        unsupported_callable.__mcore_cuda_graph_protocols__ = set()
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.make_graphed_callables",
+            unsupported_callable,
+        )
+
+        with pytest.raises(RuntimeError, match="capture-time-hooks protocol"):
+            helper.create_cudagraphs()
+
+        assert events == []
+        assert not helper._capture_failed
+
+    def test_no_graphable_callable_does_not_require_overlay(self, monkeypatch):
+        helper = _bare_capture_lifecycle_helper(torch.nn.Linear(2, 2))
+        helper.flattened_callables = []
+        helper._get_megatron_fsdp_instances = lambda: [self._planned_fsdp_module()]
+
+        def unsupported_callable():
+            return None
+
+        unsupported_callable.__mcore_cuda_graph_protocols__ = set()
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.make_graphed_callables",
+            unsupported_callable,
+        )
+
+        helper.validate_capture_feature_contract()
+
     def test_abort_restores_owned_state_callable_hooks_and_fsdp_exposure(self, monkeypatch):
         layer = torch.nn.Linear(2, 2)
 
@@ -724,6 +815,84 @@ class TestTECudaGraphCaptureFailClean:
             ("transpose", {0}),
             ("main-grad", {0}),
         ]
+
+
+class TestTECudaGraphTopologySignature:
+    @staticmethod
+    def _helper():
+        helper = _bare_capture_lifecycle_helper(torch.nn.Linear(2, 2))
+        helper.config = SimpleNamespace(
+            microbatch_group_size_per_vp_stage=2,
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
+            overlap_moe_expert_parallel_comm=False,
+            delay_wgrad_compute=False,
+            cuda_graph_dynamic_microbatches=False,
+        )
+        helper.model = [object(), object()]
+        helper.callables_per_chunk = [[object()], [object(), object()]]
+        helper.pp_group = SimpleNamespace(size=lambda: 4, rank=lambda: 1)
+        helper.p2p_communicator = SimpleNamespace(
+            virtual_pipeline_model_parallel_size=2
+        )
+        helper.seq_length = 4096
+        helper.thd_sequence_length_upper_bound = None
+        helper._graphs_created = True
+        helper._fsdp_planned_topology_signature = (
+            helper._current_fsdp_planned_topology_signature(
+                num_microbatches=8,
+                micro_batch_size=1,
+            )
+        )
+        return helper
+
+    def test_matching_signature_passes_and_predictable_drift_fails(self):
+        helper = self._helper()
+
+        helper.validate_runtime_topology(
+            num_microbatches=8,
+            micro_batch_size=1,
+            phase="training",
+        )
+        with pytest.raises(RuntimeError, match="num_microbatches.*captured=8.*runtime=9"):
+            helper.validate_runtime_topology(
+                num_microbatches=9,
+                micro_batch_size=1,
+                phase="training",
+            )
+
+        helper.config.microbatch_group_size_per_vp_stage = 4
+        with pytest.raises(RuntimeError, match="microbatch_group_size_per_vp_stage"):
+            helper.validate_runtime_topology(
+                num_microbatches=8,
+                micro_batch_size=1,
+                phase="evaluation",
+            )
+
+    def test_validator_is_installed_and_removed_with_graph_ownership(self):
+        helper = self._helper()
+        helper._install_fsdp_planned_topology_validator()
+
+        validate_te_cuda_graph_topology(
+            helper.config,
+            num_microbatches=8,
+            micro_batch_size=1,
+            phase="training",
+        )
+        helper._remove_fsdp_planned_topology_validator()
+        validate_te_cuda_graph_topology(
+            helper.config,
+            num_microbatches=99,
+            micro_batch_size=99,
+            phase="training",
+        )
+
+    def test_stock_te_config_without_validator_is_unchanged(self):
+        validate_te_cuda_graph_topology(
+            SimpleNamespace(),
+            num_microbatches=3,
+            micro_batch_size=2,
+            phase="evaluation",
+        )
 
 
 def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):

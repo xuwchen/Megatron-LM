@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import math
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -552,6 +553,180 @@ def test_planned_allocator_rejects_new_buckets_after_plan_is_frozen(cpu_global_m
         allocator.freeze_plan([0, 1])
 
     assert allocator._plan == original_plan
+
+
+def test_planned_allocator_diagnostics_report_materialized_storage_once(
+    cpu_global_memory_buffer, caplog, monkeypatch
+):
+    """Diagnostics count shared slot storage once and do not touch allocator state."""
+    allocator = PlannedBucketAllocator(
+        "model_chunk_0_fsdp_params",
+        _TrackingBucketAllocator(),
+        _allocator_param_groups(0, 0, 1, 1),
+    )
+    allocations = (
+        (0, 8, torch.float32),
+        (1, 4, torch.float64),
+        (2, 6, torch.float32),
+        (3, 10, torch.float64),
+    )
+    for bucket_id, size, dtype in allocations:
+        allocator.allocate(bucket_id, size, dtype, torch.device("cpu"))
+        allocator.free(bucket_id)
+
+    with caplog.at_level(logging.DEBUG, logger=pgb_module.__name__):
+        allocator.freeze_plan(range(4))
+    allocator.claim_graph_bucket(0, 8, torch.float32)
+
+    plan_before = dict(allocator._plan)
+    materialization_before = dict(allocator._slot_materialization)
+    slot_using_before = dict(allocator._slot_using)
+    storage_before = {
+        key: (tensor.data_ptr(), tensor.numel())
+        for key, tensor in cpu_global_memory_buffer.buffer.items()
+    }
+
+    def reject_tensor_allocation(*args, **kwargs):
+        raise AssertionError("plan diagnostics must not allocate tensors")
+
+    monkeypatch.setattr(pgb_module.torch, "empty", reject_tensor_allocation)
+    monkeypatch.setattr(cpu_global_memory_buffer, "get_tensor", reject_tensor_allocation)
+    diagnostics = allocator.get_plan_diagnostics()
+    assert allocator.get_plan_diagnostics() == diagnostics
+
+    assert allocator._plan == plan_before
+    assert allocator._slot_materialization == materialization_before
+    assert allocator._slot_using == slot_using_before
+    assert {
+        key: (tensor.data_ptr(), tensor.numel())
+        for key, tensor in cpu_global_memory_buffer.buffer.items()
+    } == storage_before
+
+    assert diagnostics["storage_kind"] == "weight"
+    assert diagnostics["planned_bucket_count"] == 4
+    assert diagnostics["color_counts_by_offset"] == [
+        {"bucket_offset": 0, "color_count": 1},
+        {"bucket_offset": 1, "color_count": 1},
+    ]
+    assert diagnostics["max_color_count_per_offset"] == 1
+    assert diagnostics["total_color_count_across_offsets"] == 2
+    assert diagnostics["logical_slot_count"] == 2
+    assert diagnostics["materialized_slot_count"] == 2
+    assert diagnostics["occupied_slot_count"] == 1
+    assert diagnostics["unique_storage_count"] == 2
+    assert diagnostics["materialized_bytes"] == 8 * 4 + 10 * 8
+    assert diagnostics["bucket_to_slot"] == [
+        {"bucket_id": 0, "color": 0, "bucket_offset": 0},
+        {"bucket_id": 1, "color": 0, "bucket_offset": 1},
+        {"bucket_id": 2, "color": 0, "bucket_offset": 0},
+        {"bucket_id": 3, "color": 0, "bucket_offset": 1},
+    ]
+    assert [slot["occupant_bucket_id"] for slot in diagnostics["slots"]] == [0, None]
+    assert diagnostics["dtype_summaries"] == [
+        {
+            "storage_kind": "weight",
+            "dtype": "torch.float32",
+            "planned_bucket_count": 2,
+            "distinct_color_id_count": 1,
+            "slot_count": 1,
+            "unique_storage_count": 1,
+            "capacity_elements": 8,
+            "materialized_bytes": 32,
+        },
+        {
+            "storage_kind": "weight",
+            "dtype": "torch.float64",
+            "planned_bucket_count": 2,
+            "distinct_color_id_count": 1,
+            "slot_count": 1,
+            "unique_storage_count": 1,
+            "capacity_elements": 10,
+            "materialized_bytes": 80,
+        },
+    ]
+    assert diagnostics["offset_dtype_summaries"] == [
+        {
+            "storage_kind": "weight",
+            "bucket_offset": 0,
+            "dtype": "torch.float32",
+            "planned_bucket_count": 2,
+            "distinct_color_id_count": 1,
+            "slot_count": 1,
+            "unique_storage_count": 1,
+            "capacity_elements": 8,
+            "materialized_bytes": 32,
+        },
+        {
+            "storage_kind": "weight",
+            "bucket_offset": 1,
+            "dtype": "torch.float64",
+            "planned_bucket_count": 2,
+            "distinct_color_id_count": 1,
+            "slot_count": 1,
+            "unique_storage_count": 1,
+            "capacity_elements": 10,
+            "materialized_bytes": 80,
+        },
+    ]
+    assert len(diagnostics["plan_checksum"]) == 64
+    assert diagnostics["plan_checksum_scope"] == (
+        "freeze-time-plan-and-materialization"
+    )
+    assert "materialized_bytes=112" in caplog.text
+    assert "bucket_to_slot=" in caplog.text
+    assert "slot=" in caplog.text
+
+
+def test_planned_allocator_plan_checksum_is_namespace_and_pointer_independent(
+    cpu_global_memory_buffer, caplog
+):
+    """Equivalent logical plans hash identically across process-local storage names."""
+
+    def freeze(name, first_size=8, overlap=False):
+        allocator = PlannedBucketAllocator(
+            name, _TrackingBucketAllocator(), _allocator_param_groups(0, 1)
+        )
+        allocator.allocate(0, first_size, torch.float32, torch.device("cpu"))
+        if overlap:
+            allocator.allocate(1, 6, torch.float32, torch.device("cpu"))
+            allocator.free(1)
+            allocator.free(0)
+        else:
+            allocator.free(0)
+            allocator.allocate(1, 6, torch.float32, torch.device("cpu"))
+            allocator.free(1)
+        allocator.freeze_plan([0, 1])
+        return allocator
+
+    first = freeze("model_chunk_0_param_and_grad_buffer_2_fsdp_params")
+    second = freeze("model_chunk_0_param_and_grad_buffer_9_fsdp_params")
+
+    assert first.get_plan_diagnostics()["plan_checksum"] == second.get_plan_diagnostics()[
+        "plan_checksum"
+    ]
+    assert {
+        materialization[2] for materialization in first._slot_materialization.values()
+    }.isdisjoint(
+        materialization[2] for materialization in second._slot_materialization.values()
+    )
+
+    different_capacity = freeze(
+        "model_chunk_0_param_and_grad_buffer_10_fsdp_params", first_size=9
+    )
+    different_coloring = freeze(
+        "model_chunk_0_param_and_grad_buffer_11_fsdp_params", overlap=True
+    )
+    assert different_capacity._plan == first._plan
+    assert different_capacity._plan_checksum != first._plan_checksum
+    assert different_coloring._plan != first._plan
+    assert different_coloring._plan_checksum != first._plan_checksum
+
+    diagnostics_before = first.get_plan_diagnostics()
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=pgb_module.__name__):
+        first.freeze_plan([0, 1])
+    assert first.get_plan_diagnostics() == diagnostics_before
+    assert caplog.text == ""
 
 
 def test_fused_wgrad_claim_records_warmup_lifetimes_and_skips_persistent_grad_buffers():
