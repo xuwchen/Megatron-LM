@@ -189,6 +189,7 @@ def test_te_planned_fully_sharded_requires_communication_overlap(
     ("field", "value"),
     [
         pytest.param("cuda_graph_dynamic_microbatches", True, id="dynamic-graph-slots"),
+        pytest.param("variable_seq_lengths", True, id="variable-sequence-lengths"),
         pytest.param("sequence_packing_scheduler", "dp_balanced", id="sequence-packing"),
         pytest.param("rl_use_sequence_packing", True, id="rl-sequence-packing"),
     ],
@@ -204,6 +205,7 @@ def test_te_planned_rejects_dynamic_microbatch_topology_inputs(field, value):
         fsdp_double_buffer=False,
         nccl_ub=False,
         cuda_graph_dynamic_microbatches=False,
+        variable_seq_lengths=False,
         sequence_packing_scheduler=None,
         rl_use_sequence_packing=False,
     )
@@ -435,6 +437,7 @@ def test_programmatic_te_planned_fully_sharded_requires_overlap(
     ("field", "value"),
     [
         pytest.param("cuda_graph_dynamic_microbatches", True, id="dynamic-graph-slots"),
+        pytest.param("variable_seq_lengths", True, id="variable-sequence-lengths"),
         pytest.param("sequence_packing_scheduler", "dp_balanced", id="sequence-packing"),
         pytest.param("rl_use_sequence_packing", True, id="rl-sequence-packing"),
     ],
@@ -444,6 +447,7 @@ def test_programmatic_te_planned_rejects_dynamic_topology(field, value):
     config = SimpleNamespace(
         cuda_graph_impl="transformer_engine",
         cuda_graph_dynamic_microbatches=False,
+        variable_seq_lengths=False,
         sequence_packing_scheduler=None,
         rl_use_sequence_packing=False,
     )

@@ -460,8 +460,9 @@ state in this configuration. Releasing each unit immediately would satisfy the p
 would violate force-sync's contract that all unsharded parameters remain ready when it returns.
 
 Dynamic microbatch/topology inputs are outside this core path:
-`--cuda-graph-dynamic-microbatches`, sequence-packing schedulers, and RL sequence packing are
-rejected during configuration. They require a later all-rank retrace/recapture lifecycle.
+`--cuda-graph-dynamic-microbatches`, variable sequence lengths, sequence-packing schedulers, and
+RL sequence packing are rejected during configuration. They require a later all-rank
+retrace/recapture lifecycle.
 
 Each parameter-and-gradient buffer has a distinct process-local namespace that combines a
 human-readable model-chunk label with a monotonic buffer instance ID. The instance ID prevents

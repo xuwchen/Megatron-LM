@@ -92,13 +92,15 @@ def _validate_cuda_graph_config(config, ddp_config):
         )
     if (
         getattr(config, "cuda_graph_dynamic_microbatches", False)
+        or getattr(config, "variable_seq_lengths", False)
         or getattr(config, "sequence_packing_scheduler", None) is not None
         or getattr(config, "rl_use_sequence_packing", False)
     ):
         raise ValueError(
             "Megatron-FSDP planned TE CUDA graphs do not support dynamic "
             "microbatch/topology inputs in this core path. Disable dynamic CUDA graph "
-            "microbatches and sequence packing; retrace support is deferred."
+            "microbatches, variable sequence lengths, and sequence packing; retrace "
+            "support is deferred."
         )
 
     if ddp_config.nccl_ub:

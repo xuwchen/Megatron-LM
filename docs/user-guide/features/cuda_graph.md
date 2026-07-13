@@ -148,9 +148,10 @@ microbatch count as capture. A predictable mismatch is a fatal error and require
 job; automatic reset or retrace is not supported. Allocator occupancy, capacity, dtype, and pointer
 checks remain authoritative for runtime changes that the boundary signature cannot predict.
 
-The core planned-FSDP path rejects `--cuda-graph-dynamic-microbatches`, sequence-packing
-schedulers, and RL sequence packing during configuration. Supporting those dynamic schedules
-requires the later all-rank retrace/recapture lifecycle; they must remain eager in this PR.
+The core planned-FSDP path rejects `--cuda-graph-dynamic-microbatches`, variable sequence
+lengths, sequence-packing schedulers, and RL sequence packing during configuration. Supporting
+those dynamic schedules requires the later all-rank retrace/recapture lifecycle; they must remain
+eager in this PR.
 
 The number of planned slots is not fixed at two. Warmup records each bucket's exact padded size,
 dtype, and allocate/free lifetime. At freeze, non-overlapping graph-covered lifetimes are colored,

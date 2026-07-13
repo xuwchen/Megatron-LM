@@ -119,6 +119,7 @@ class _TECudaGraphTopologySignature:
     overlap_moe_expert_parallel_comm: bool
     delay_wgrad_compute: bool
     dynamic_microbatches: bool
+    variable_seq_lengths: bool
     sequence_length: int
     thd_sequence_length_upper_bound: int | None
 
@@ -3261,6 +3262,7 @@ class TECudaGraphHelper:
             dynamic_microbatches=bool(
                 getattr(self.config, 'cuda_graph_dynamic_microbatches', False)
             ),
+            variable_seq_lengths=bool(getattr(self.config, 'variable_seq_lengths', False)),
             sequence_length=int(self.seq_length),
             thd_sequence_length_upper_bound=self.thd_sequence_length_upper_bound,
         )

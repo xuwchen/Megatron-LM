@@ -827,6 +827,7 @@ class TestTECudaGraphTopologySignature:
             overlap_moe_expert_parallel_comm=False,
             delay_wgrad_compute=False,
             cuda_graph_dynamic_microbatches=False,
+            variable_seq_lengths=False,
         )
         helper.model = [object(), object()]
         helper.callables_per_chunk = [[object()], [object(), object()]]
@@ -862,6 +863,15 @@ class TestTECudaGraphTopologySignature:
 
         helper.config.microbatch_group_size_per_vp_stage = 4
         with pytest.raises(RuntimeError, match="microbatch_group_size_per_vp_stage"):
+            helper.validate_runtime_topology(
+                num_microbatches=8,
+                micro_batch_size=1,
+                phase="evaluation",
+            )
+
+        helper.config.microbatch_group_size_per_vp_stage = 2
+        helper.config.variable_seq_lengths = True
+        with pytest.raises(RuntimeError, match="variable_seq_lengths"):
             helper.validate_runtime_topology(
                 num_microbatches=8,
                 micro_batch_size=1,
