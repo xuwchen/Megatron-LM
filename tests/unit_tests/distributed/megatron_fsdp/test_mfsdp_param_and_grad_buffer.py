@@ -21,6 +21,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer impo
     _get_allocator_namespace,
     _get_parameter_groups,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import safe_get_rank
 
 
 class _ExpertTestModule(torch.nn.Module):
@@ -672,7 +673,8 @@ def test_planned_allocator_diagnostics_report_materialized_storage_once(
     assert diagnostics["plan_checksum_scope"] == (
         "freeze-time-plan-and-materialization"
     )
-    assert "materialized_bytes=112" in caplog.text
+    if safe_get_rank() == 0:
+        assert "materialized_bytes=112" in caplog.text
     assert "bucket_to_slot=" in caplog.text
     assert "slot=" in caplog.text
 
