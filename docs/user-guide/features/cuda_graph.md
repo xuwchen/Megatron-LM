@@ -130,11 +130,35 @@ continue to use their existing eager allocators. Every parameter-and-gradient bu
 namespace composed of its human-readable model-chunk label and a process-local monotonic instance
 ID. This keeps both virtual-pipeline chunks and separately wrapped model groups disjoint.
 
+This path requires a Transformer Engine build that implements MCore's versioned
+`capture_time_hooks` contract for all four forward/backward pre/post hook phases. Compatible builds
+advertise `mcore_fsdp_capture_time_hooks_v1` through the `__mcore_cuda_graph_protocols__` marker on
+`make_graphed_callables()` or its module. The repository validation loader publishes this marker
+only after verifying TE commit `4251467130ce88595f584a5160e6350176333923` and the pinned
+`graph.py` SHA-256 `71188f41bd37611075f520222f9408249372c2e8a2356f68760dd36429a5cfe9`.
+An argument named `capture_time_hooks` alone does not establish the required semantics. Models
+that pass runtime tensors through keyword arguments need TE 1.10 or newer for the public
+`sample_kwargs` API and the pinned overlay's mixed positional/keyword-input fix. In particular,
+model-computed rotary inputs must be observed during eager warmup and declared as graph inputs.
+
+After capture succeeds, the planned-FSDP path freezes a local PP/VPP topology and schedule
+signature. Every training and evaluation iteration must retain the captured topology, graph scope,
+microbatch size, and number of microbatches; evaluation therefore uses the same microbatch size and
+microbatch count as capture. A predictable mismatch is a fatal error and requires restarting the
+job; automatic reset or retrace is not supported. Allocator occupancy, capacity, dtype, and pointer
+checks remain authoritative for runtime changes that the boundary signature cannot predict.
+
+The core planned-FSDP path rejects `--cuda-graph-dynamic-microbatches`, sequence-packing
+schedulers, and RL sequence packing during configuration. Supporting those dynamic schedules
+requires the later all-rank retrace/recapture lifecycle; they must remain eager in this PR.
+
 The number of planned slots is not fixed at two. Warmup records each bucket's exact padded size,
 dtype, and allocate/free lifetime. At freeze, non-overlapping graph-covered lifetimes are colored,
 and each used `(color, bucket-offset)` pair is materialized at the maximum observed size of the
-buckets assigned to it. A workload may therefore need one, two, or more colors according to its
-peak overlap. These lifetime-planned slots are not FSDP double buffers.
+buckets assigned to it. A workload may therefore need one, two, or more colors according to the
+conservative conflict graph inferred from observed lifetimes; greedy coloring can exceed both the
+instantaneous peak-live count and the minimum coloring. These lifetime-planned slots are not FSDP
+double buffers.
 
 NCCL user buffers are a separate unsupported combination. Planned slots retain the FSDP
 memory-allocation context, but the current manual NCCL registration can run before those slots are
@@ -297,10 +321,11 @@ models as well:
   inputs such as language MRoPE because they must be observed before capture. The same restriction
   applies when a custom loop opts into `VisionTECudaGraphHelper` for vision 2-D RoPE.
 - `--cuda-graph-dynamic-microbatches` assumes every rank in a pipeline group enters the same
-  dynamic-slot discovery collective and that the capture topology stays fixed. Mixing ranks with graphable
-  callables and empty ranks is unsupported, and this core path does not preflight that topology.
-  Such custom or empty-stage layouts must disable dynamic microbatch slots or remain eager. The
-  custom Vision helper does not support dynamic-microbatch capture.
+  dynamic-slot discovery collective and that the capture topology stays fixed. Mixing ranks with
+  graphable callables and empty ranks is unsupported. The planned-FSDP iteration-boundary signature
+  detects later local schedule changes, but it does not provide pre-capture, cross-rank consensus
+  for custom or empty-stage layouts. Those layouts must disable dynamic microbatch slots or remain
+  eager. The custom Vision helper does not support dynamic-microbatch capture.
 - Selective activation recomputation must not overlap a captured region when bitwise agreement with
   eager execution is required. Argument validation reports overlapping modules; in particular,
   `moe_router` capture overlaps full-`moe` recompute and any captured `shared_experts`, while

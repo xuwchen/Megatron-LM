@@ -435,9 +435,22 @@ is released once the plan is frozen, including when no buckets are covered.
 
 Planned allocation is the only supported temporary-buffer policy for Megatron-FSDP per-layer TE
 graphs. `fsdp_double_buffer=True` is rejected. Planned colors represent peak overlapping observed
-lifetimes rather than a fixed pair of buffers, so a bucket offset may require one, two, or more
-colors. Each slot's capacity is the maximum padded size observed among the same-dtype buckets
-assigned to that `(color, bucket-offset)` pair.
+lifetimes plus conservative conflicts, rather than a fixed pair of buffers. A bucket offset may
+therefore require one, two, or more colors. Its color count is a graph-coloring result, not an exact
+instantaneous peak-live measurement: unobserved or different-dtype buckets add conflicts, and the
+greedy coloring may use more colors than the minimum. Each slot's capacity is the maximum padded
+size observed among the same-dtype buckets assigned to that `(color, bucket-offset)` pair.
+
+`PlannedBucketAllocator.get_plan_diagnostics()` returns a read-only structured snapshot. It reports
+per-offset color counts; logical and materialized slot counts; each slot's dtype, capacity, members,
+and current occupant; and materialized bytes deduplicated by backing storage. Per-offset counts are
+authoritative because equal color IDs at different offsets name different slots. The stable,
+freeze-time plan checksum includes storage kind, bucket-to-`(color, offset)` assignments, and slot
+dtype/capacity known at freeze (or an unmaterialized marker), while excluding the process-local
+allocator namespace and `data_ptr`. If an unobserved slot materializes lazily afterward, the
+checksum remains the freeze-time identity; the current slot records and materialized-byte summaries
+report its live dtype/capacity/storage. Freeze logs a compact rank-zero INFO summary; DEBUG logs
+contain the complete bucket-to-slot mapping and slot details.
 
 Fully sharded (`optim_grads_params`) planned allocation requires both
 `--overlap-param-gather` and `--overlap-grad-reduce`: its frozen plan covers the observed per-unit
@@ -445,6 +458,10 @@ all-gather and reduce-scatter lifetimes, not synchronous or delayed full-model r
 `start_param_sync(force_sync=True)` is therefore rejected before changing parameter or pipeline
 state in this configuration. Releasing each unit immediately would satisfy the plan's capacity but
 would violate force-sync's contract that all unsharded parameters remain ready when it returns.
+
+Dynamic microbatch/topology inputs are outside this core path:
+`--cuda-graph-dynamic-microbatches`, sequence-packing schedulers, and RL sequence packing are
+rejected during configuration. They require a later all-rank retrace/recapture lifecycle.
 
 Each parameter-and-gradient buffer has a distinct process-local namespace that combines a
 human-readable model-chunk label with a monotonic buffer instance ID. The instance ID prevents
