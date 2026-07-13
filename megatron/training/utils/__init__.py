@@ -7,6 +7,7 @@ from megatron.training.utils.common_utils import (
     check_adlr_autoresume_termination,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    is_gtp_remat_active,
     get_blend_and_blend_per_split,
     get_device_arch_version,
     get_ltor_masks_and_position_ids,

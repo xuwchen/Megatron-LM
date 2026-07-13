@@ -204,7 +204,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         data_parallel_rank = param_and_grad_buffer.data_parallel_group.rank()
-        data_parallel_world_size = param_and_grad_buffer.data_parallel_group.size()
+        data_parallel_world_size = (
+            param_and_grad_buffer.num_optimizer_shards
+            if param_and_grad_buffer.num_optimizer_shards is not None
+            else param_and_grad_buffer.data_parallel_group.size()
+        )
 
         bucket = param_and_grad_buffer.buckets[bucket_index]
         gbuf_size = bucket.grad_data.numel()
@@ -418,6 +422,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                         copy_optimizer_param_metadata(shard_model_param, model_param)
 
                     # Generate main param.
@@ -449,6 +454,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_main_param, model_param)
                         copy_optimizer_param_metadata(shard_main_param, model_param)
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
@@ -471,6 +477,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
+                    tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                     copy_optimizer_param_metadata(shard_model_param, model_param)
 
                 else:
@@ -584,6 +591,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=data_parallel_world_size,
         )
 
     @staticmethod
