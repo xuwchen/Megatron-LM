@@ -1227,7 +1227,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         elif attn_in_graph:
             if not self.config.create_attention_mask_in_dataloader:
-                if self.self_attention.attn_mask_type not in (
+                attn_mask_type = getattr(self.self_attention, "attn_mask_type", None)
+                if attn_mask_type is not None and attn_mask_type not in (
                     AttnMaskType.causal,
                     AttnMaskType.no_mask,
                     AttnMaskType.causal_bottom_right,
@@ -1237,7 +1238,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                         logging.WARNING,
                         "TE CUDA graph capture is omitting attention_mask because "
                         "create_attention_mask_in_dataloader is False, but "
-                        f"attn_mask_type={self.self_attention.attn_mask_type.name} may require "
+                        f"attn_mask_type={attn_mask_type.name} may require "
                         "an explicit mask. Ensure this is intended for the current workload.",
                     )
             else:
