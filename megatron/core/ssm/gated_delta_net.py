@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Optional, Union
@@ -339,6 +340,18 @@ class GatedDeltaNet(MegatronModule):
             (tuple[Tensor, Tensor]) GDN output and bias.
 
         """
+        if os.environ.get("MCORE_GDN_CAPTURE_PROBE", "0") == "1":
+            is_capturing = torch.cuda.is_current_stream_capturing()
+            phase = "capture" if is_capturing else "eager"
+            seen_attr = f"_gdn_capture_probe_seen_{phase}"
+            if not getattr(self, seen_attr, False):
+                setattr(self, seen_attr, True)
+                print(
+                    f"[GDN_CAPTURE_PROBE] rank={os.environ.get('RANK', '?')} "
+                    f"layer={self.layer_number} phase={phase}",
+                    flush=True,
+                )
+
         # TODO: Deal with attention_mask
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
