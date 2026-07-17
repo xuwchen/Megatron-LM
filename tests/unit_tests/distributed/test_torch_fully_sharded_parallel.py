@@ -11,6 +11,9 @@ from megatron.core.distributed.torch_fully_sharded_data_parallel import (
     TorchFullyShardedDataParallel,
     _build_fsdp_wrap_plan,
 )
+from megatron.core.distributed.torch_fully_sharded_data_parallel_config import (
+    TorchFullyShardedDataParallelConfig,
+)
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
@@ -75,6 +78,46 @@ class _WrapRoot(torch.nn.Module):
         super().__init__()
         self.parent = _WrapParent()
         self.shared_leaf = self.parent.leaf
+
+
+class _ConditionalParamBlock(torch.nn.Module):
+    """Keep rank-divergent parameter usage inside one shared FSDP group."""
+
+    def __init__(self):
+        super().__init__()
+        self.always = torch.nn.Linear(8, 8, bias=False)
+        self.branch_a = torch.nn.Linear(8, 8, bias=False)
+        self.branch_b = torch.nn.Linear(8, 8, bias=False)
+        self.explicit_zero = torch.nn.Parameter(torch.ones(8))
+        self.globally_unused = torch.nn.Parameter(torch.ones(8))
+        self.frozen = torch.nn.Parameter(torch.ones(8), requires_grad=False)
+
+    def forward(self, inputs, use_branch_a, use_branch_b):
+        """Run the same FSDP module on every rank but select different parameters."""
+        output = self.always(inputs) + 0.0 * self.explicit_zero
+        if use_branch_a:
+            output = output + self.branch_a(inputs)
+        if use_branch_b:
+            output = output + self.branch_b(inputs)
+        return output
+
+
+class _ConditionalParamRoot(torch.nn.Module):
+    """Root module containing one conditionally used FSDP parameter group."""
+
+    def __init__(self):
+        super().__init__()
+        self.block = _ConditionalParamBlock()
+        self.root_scale = torch.nn.Parameter(torch.ones(8))
+        self.root_branch = torch.nn.Parameter(torch.ones(8))
+        self.root_globally_unused = torch.nn.Parameter(torch.ones(8))
+
+    def forward(self, inputs, use_branch_a, use_branch_b, use_root_branch):
+        """Delegate to the conditional block on every rank."""
+        output = self.block(inputs, use_branch_a, use_branch_b) * self.root_scale
+        if use_root_branch:
+            output = output + self.root_branch
+        return output
 
 
 class _SyncControlSpy:
@@ -344,6 +387,59 @@ def test_fsdp2_constructor_configures_per_token_reduction(
     assert fsdp_model._gradient_scale_correction == expected_correction
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("api_supported", [False, True])
+def test_fsdp2_constructor_configures_unused_parameter_reduction(
+    monkeypatch, enabled, api_supported
+):
+    """Opt in recursively and fail clearly when the PyTorch API is unavailable."""
+    model = _WrapRoot()
+    fake_mesh = object()
+    fake_process_group = object()
+    unused_param_calls = []
+
+    class _FakeDeviceMesh:
+        @staticmethod
+        def from_group(process_group, device_type):
+            assert process_group is fake_process_group
+            assert device_type == "cuda"
+            return fake_mesh
+
+    def fake_fully_shard(module, **kwargs):
+        if api_supported:
+            setattr(
+                module,
+                "set_reduce_scatter_unused_params",
+                lambda value, recurse, module=module: unused_param_calls.append(
+                    (module, value, recurse)
+                ),
+            )
+
+    monkeypatch.setattr(torch_fsdp2, "DeviceMesh", _FakeDeviceMesh)
+    monkeypatch.setattr(torch_fsdp2, "fully_shard", fake_fully_shard)
+
+    config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
+    ddp_config = TorchFullyShardedDataParallelConfig(reduce_scatter_unused_params=enabled)
+
+    if enabled and not api_supported:
+        with pytest.raises(RuntimeError, match="PyTorch >= 2.13"):
+            TorchFullyShardedDataParallel(
+                config,
+                ddp_config,
+                model,
+                sub_modules_to_wrap=_WRAP_TYPES,
+                process_group=fake_process_group,
+            )
+        return
+
+    TorchFullyShardedDataParallel(
+        config, ddp_config, model, sub_modules_to_wrap=_WRAP_TYPES, process_group=fake_process_group
+    )
+
+    expected_calls = [(model, True, True)] if enabled else []
+    assert unused_param_calls == expected_calls
+
+
 def test_fsdp2_constructor_wraps_nested_modules(init_model_parallel):
     """Run forward and backward with real nested FSDP2 groups."""
     if not is_torch_min_version("2.6.0"):
@@ -411,6 +507,82 @@ def test_fsdp2_no_sync_accumulates_and_reduces_gradients(init_model_parallel):
             torch.testing.assert_close(
                 fsdp_grad.full_tensor(), reference_param.grad, rtol=1e-5, atol=1e-6
             )
+
+
+def test_fsdp2_rank_divergent_unused_parameters_match_global_reference(init_model_parallel):
+    """Pad locally unused gradients so every rank reduce-scatters the same parameter list."""
+    if not is_torch_min_version("2.13.0"):
+        pytest.skip("Unused-parameter-safe FSDP2 reduce-scatter requires PyTorch >= 2.13.")
+    if torch.distributed.get_world_size() != 8:
+        pytest.skip("This numerical test requires exactly 8 ranks.")
+
+    config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
+    ddp_config = TorchFullyShardedDataParallelConfig(reduce_scatter_unused_params=True)
+    reference_model = _ConditionalParamRoot().cuda()
+    with torch.no_grad():
+        for param in reference_model.parameters():
+            torch.distributed.broadcast(param, src=0)
+    model = _ConditionalParamRoot().cuda()
+    model.load_state_dict(reference_model.state_dict())
+
+    fsdp_model = TorchFullyShardedDataParallel(
+        config, ddp_config, model, sub_modules_to_wrap={_ConditionalParamBlock}
+    )
+    group = fsdp_model.process_group
+    rank = torch.distributed.get_rank(group)
+    world_size = torch.distributed.get_world_size(group)
+    microbatch_inputs = [
+        torch.full((2, 8), (rank + 1) * (microbatch + 1) / 10, device="cuda")
+        for microbatch in range(2)
+    ]
+    branch_flags = [(rank < 4, False, False), (False, 2 <= rank < 6, rank % 2 == 0)]
+
+    fsdp_model.zero_grad(set_to_none=True)
+    reference_model.zero_grad(set_to_none=True)
+    with fsdp_model.no_sync():
+        fsdp_model(microbatch_inputs[0], *branch_flags[0]).square().mean().backward()
+    fsdp_model(microbatch_inputs[1], *branch_flags[1]).square().mean().backward()
+
+    for microbatch_input, flags in zip(microbatch_inputs, branch_flags):
+        reference_model(microbatch_input, *flags).square().mean().backward()
+
+    if rank >= 4:
+        assert reference_model.block.branch_a.weight.grad is None
+    if not 2 <= rank < 6:
+        assert reference_model.block.branch_b.weight.grad is None
+    if rank % 2 == 0:
+        assert reference_model.root_branch.grad is not None
+    else:
+        assert reference_model.root_branch.grad is None
+    assert reference_model.block.explicit_zero.grad is not None
+    assert torch.count_nonzero(reference_model.block.explicit_zero.grad) == 0
+    assert reference_model.block.globally_unused.grad is None
+    assert reference_model.block.frozen.grad is None
+    assert reference_model.root_globally_unused.grad is None
+
+    expected_grads = {}
+    for name, param in reference_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        grad = torch.zeros_like(param) if param.grad is None else param.grad.clone()
+        torch.distributed.all_reduce(grad, group=group)
+        grad.div_(world_size)
+        expected_grads[name] = grad
+
+    fsdp_params = dict(fsdp_model.module.named_parameters())
+    actual_grads = {}
+    for name, param in fsdp_params.items():
+        if not param.requires_grad:
+            assert param.grad is None
+            continue
+        assert param.grad is not None
+        actual_grad = param.grad.full_tensor()
+        actual_grads[name] = actual_grad
+        torch.testing.assert_close(actual_grad, expected_grads[name], rtol=1e-5, atol=1e-6)
+
+    assert torch.count_nonzero(actual_grads["block.explicit_zero"]) == 0
+    assert torch.count_nonzero(actual_grads["block.globally_unused"]) == 0
+    assert torch.count_nonzero(actual_grads["root_globally_unused"]) == 0
 
 
 @pytest.mark.parametrize("all_zero_tokens", [False, True])

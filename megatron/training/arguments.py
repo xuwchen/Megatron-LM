@@ -4211,6 +4211,14 @@ def _add_distributed_args(parser):
         'Set to enable FSDP ZeRO-2.',
     )
     group.add_argument(
+        '--torch-fsdp2-reduce-scatter-unused-params',
+        action='store_true',
+        help='Include zero gradients for locally unused parameters in PyTorch FSDP2 '
+        'reduce-scatter collectives. This supports rank-divergent conditional parameter '
+        'usage and requires PyTorch >= 2.13. It does not support skipping whole FSDP '
+        'modules on only some ranks.',
+    )
+    group.add_argument(
         '--cp-comm-type',
         nargs='+',
         type=str,
