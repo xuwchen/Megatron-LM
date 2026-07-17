@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
+from typing import Literal
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 
@@ -8,6 +9,17 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 @dataclass
 class TorchFullyShardedDataParallelConfig(DistributedDataParallelConfig):
     """Configuration for TorchFullyShardedDataParallel."""
+
+    gradient_accumulation_mode: Literal["classic", "partial_reduce_scatter"] = "classic"
+    """
+    Controls communication for intermediate gradient-accumulation microbatches.
+    ``classic`` disables both reduce-scatter and all-reduce, while
+    ``partial_reduce_scatter`` keeps reduce-scatter enabled and defers the HSDP
+    replica all-reduce until the final microbatch.
+    Partial reduce-scatter requires every rank and microbatch to execute the same
+    FSDP module groups in the same order; unused-parameter reduction only pads
+    parameters inside groups that were actually executed.
+    """
 
     reshard_after_forward: bool | int | None = None
     """

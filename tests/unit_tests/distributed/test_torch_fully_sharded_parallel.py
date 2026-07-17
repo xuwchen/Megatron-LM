@@ -17,6 +17,7 @@ from megatron.core.distributed.torch_fully_sharded_data_parallel import (
     _build_fsdp_device_mesh,
     _build_fsdp_wrap_plan,
     _clone_fsdp_output_views,
+    _validate_fsdp_gradient_accumulation_mode,
 )
 from megatron.core.distributed.torch_fully_sharded_data_parallel_config import (
     TorchFullyShardedDataParallelConfig,
@@ -183,6 +184,32 @@ class _GradientSyncOnlySpy:
 
     def set_requires_gradient_sync(self, requires_gradient_sync, recurse):
         self.calls.append(("gradient_sync", requires_gradient_sync, recurse))
+
+
+class _PartialSyncControlSpy:
+    """Record partial reduce-scatter controls and reject classic synchronization."""
+
+    def __init__(self):
+        self.calls = []
+
+    def set_is_last_backward(self, is_last_backward):
+        self.calls.append(("last_backward", is_last_backward))
+
+    def set_requires_all_reduce(self, requires_all_reduce, recurse):
+        self.calls.append(("all_reduce", requires_all_reduce, recurse))
+
+    def set_requires_gradient_sync(self, _requires_gradient_sync, _recurse):
+        raise AssertionError("partial_reduce_scatter must keep reduce-scatter enabled")
+
+
+def _get_partial_reduce_outputs(*fsdp_modules):
+    """Return PyTorch's pending HSDP partial reductions for the given modules."""
+    outputs = []
+    for fsdp_module in fsdp_modules:
+        fsdp_group = torch_fsdp2.fully_shard.state(fsdp_module)._fsdp_param_group
+        if fsdp_group is not None:
+            outputs.append(fsdp_group._partial_reduce_output)
+    return outputs
 
 
 _WRAP_TYPES = {_WrapRoot, _WrapParent, _WrapLeaf, torch.nn.Linear}
@@ -389,6 +416,90 @@ def test_fsdp2_no_sync_supports_older_fsdp2_controls():
         ("gradient_sync", True, True),
     ]
     assert fsdp_model._no_sync_depth == 0
+
+
+@pytest.mark.parametrize("raise_in_context", [False, True])
+def test_fsdp2_partial_reduce_scatter_restores_control_flags(raise_in_context):
+    """Defer only the HSDP replica all-reduce and restore controls on every exit."""
+    root_module = _PartialSyncControlSpy()
+    fsdp_model = object.__new__(TorchFullyShardedDataParallel)
+    object.__setattr__(fsdp_model, "module", root_module)
+    object.__setattr__(fsdp_model, "_no_sync_depth", 0)
+    object.__setattr__(fsdp_model, "gradient_accumulation_mode", "partial_reduce_scatter")
+
+    if raise_in_context:
+        with pytest.raises(RuntimeError, match="microbatch failure"):
+            with fsdp_model.no_sync():
+                root_module.calls.append("body")
+                raise RuntimeError("microbatch failure")
+    else:
+        with fsdp_model.no_sync():
+            root_module.calls.append("body")
+
+    assert root_module.calls == [
+        ("last_backward", False),
+        ("all_reduce", False, True),
+        "body",
+        ("all_reduce", True, True),
+        ("last_backward", True),
+    ]
+    assert fsdp_model._no_sync_depth == 0
+
+
+def test_fsdp2_partial_reduce_scatter_no_sync_is_reentrant():
+    """Change partial-reduction controls only for the outermost context."""
+    root_module = _PartialSyncControlSpy()
+    fsdp_model = object.__new__(TorchFullyShardedDataParallel)
+    object.__setattr__(fsdp_model, "module", root_module)
+    object.__setattr__(fsdp_model, "_no_sync_depth", 0)
+    object.__setattr__(fsdp_model, "gradient_accumulation_mode", "partial_reduce_scatter")
+
+    with fsdp_model.no_sync():
+        root_module.calls.append("outer body")
+        with fsdp_model.no_sync():
+            root_module.calls.append("inner body")
+
+    assert root_module.calls == [
+        ("last_backward", False),
+        ("all_reduce", False, True),
+        "outer body",
+        "inner body",
+        ("all_reduce", True, True),
+        ("last_backward", True),
+    ]
+    assert fsdp_model._no_sync_depth == 0
+
+
+def test_fsdp2_partial_reduce_scatter_no_sync_requires_new_controls():
+    """Fail before changing context depth when a required PyTorch control is absent."""
+    fsdp_model = object.__new__(TorchFullyShardedDataParallel)
+    object.__setattr__(fsdp_model, "module", _SyncControlSpy())
+    object.__setattr__(fsdp_model, "_no_sync_depth", 0)
+    object.__setattr__(fsdp_model, "gradient_accumulation_mode", "partial_reduce_scatter")
+
+    with pytest.raises(RuntimeError, match="set_requires_all_reduce"):
+        with fsdp_model.no_sync():
+            pass
+
+    assert fsdp_model._no_sync_depth == 0
+
+
+def test_fsdp2_validates_gradient_accumulation_mode(monkeypatch):
+    """Reject unsupported or unsafe partial reduce-scatter configurations early."""
+    monkeypatch.setattr(torch_fsdp2, "is_torch_min_version", lambda _version: True)
+    _validate_fsdp_gradient_accumulation_mode("classic", False, False)
+    _validate_fsdp_gradient_accumulation_mode("partial_reduce_scatter", True, True)
+
+    with pytest.raises(ValueError, match="must be one of"):
+        _validate_fsdp_gradient_accumulation_mode("unknown", True, True)
+    with pytest.raises(ValueError, match="requires HSDP"):
+        _validate_fsdp_gradient_accumulation_mode("partial_reduce_scatter", False, True)
+    with pytest.raises(ValueError, match="reduce_scatter_unused_params=True"):
+        _validate_fsdp_gradient_accumulation_mode("partial_reduce_scatter", True, False)
+
+    monkeypatch.setattr(torch_fsdp2, "is_torch_min_version", lambda _version: False)
+    with pytest.raises(RuntimeError, match="PyTorch >= 2.13"):
+        _validate_fsdp_gradient_accumulation_mode("partial_reduce_scatter", True, True)
 
 
 def test_fsdp2_scale_gradients_scales_shared_parameter_once():
@@ -726,13 +837,24 @@ def test_fsdp2_clones_output_views_before_registering_backward_hook(init_model_p
     )
 
 
-def test_fsdp2_hsdp_mesh_and_no_sync_match_global_reference(init_hsdp_model_parallel):
-    """Validate the real 2x4 mesh and classic accumulation against full DP."""
+@pytest.mark.parametrize("gradient_accumulation_mode", ["classic", "partial_reduce_scatter"])
+def test_fsdp2_hsdp_mesh_and_no_sync_match_global_reference(
+    init_hsdp_model_parallel, gradient_accumulation_mode
+):
+    """Validate real 2x4 HSDP accumulation modes against full DP."""
     if not is_torch_min_version("2.6.0"):
         pytest.skip("FSDP2 is not supported on this version of PyTorch.")
+    if gradient_accumulation_mode == "partial_reduce_scatter" and not is_torch_min_version(
+        "2.13.0"
+    ):
+        pytest.skip("Partial reduce-scatter accumulation requires PyTorch >= 2.13.")
 
     config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
-    ddp_config = TorchFullyShardedDataParallelConfig(num_distributed_optimizer_instances=2)
+    ddp_config = TorchFullyShardedDataParallelConfig(
+        num_distributed_optimizer_instances=2,
+        gradient_accumulation_mode=gradient_accumulation_mode,
+        reduce_scatter_unused_params=gradient_accumulation_mode == "partial_reduce_scatter",
+    )
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     reference_model = _NestedWrapRoot().cuda()
     with torch.no_grad():
@@ -775,7 +897,15 @@ def test_fsdp2_hsdp_mesh_and_no_sync_match_global_reference(init_hsdp_model_para
 
         with fsdp_model.no_sync():
             fsdp_model(microbatch_inputs[0]).square().mean().backward()
+        fsdp_modules = (fsdp_model.module.parent.leaf, fsdp_model.module.parent, fsdp_model.module)
+        partial_reduce_outputs = _get_partial_reduce_outputs(*fsdp_modules)
+        if gradient_accumulation_mode == "partial_reduce_scatter":
+            assert partial_reduce_outputs
+            assert all(output is not None for output in partial_reduce_outputs)
+        else:
+            assert all(output is None for output in partial_reduce_outputs)
         fsdp_model(microbatch_inputs[1]).square().mean().backward()
+        assert all(output is None for output in _get_partial_reduce_outputs(*fsdp_modules))
 
         for microbatch_input in microbatch_inputs:
             reference_model(microbatch_input).square().mean().backward()
@@ -841,15 +971,34 @@ def test_fsdp2_no_sync_accumulates_and_reduces_gradients(init_model_parallel):
             )
 
 
-def test_fsdp2_rank_divergent_unused_parameters_match_global_reference(init_model_parallel):
-    """Pad locally unused gradients so every rank reduce-scatters the same parameter list."""
+@pytest.mark.parametrize(
+    ("parallel_fixture", "gradient_accumulation_mode"),
+    [
+        pytest.param("init_model_parallel", "classic", id="fsdp1d-classic"),
+        pytest.param("init_hsdp_model_parallel", "partial_reduce_scatter", id="hsdp-partial"),
+    ],
+)
+def test_fsdp2_rank_divergent_unused_parameters_match_global_reference(
+    request, parallel_fixture, gradient_accumulation_mode
+):
+    """Match rank-divergent unused gradients for 1D classic and HSDP partial modes."""
+    request.getfixturevalue(parallel_fixture)
+    use_partial_reduce_scatter = gradient_accumulation_mode == "partial_reduce_scatter"
+
     if not is_torch_min_version("2.13.0"):
         pytest.skip("Unused-parameter-safe FSDP2 reduce-scatter requires PyTorch >= 2.13.")
     if torch.distributed.get_world_size() != 8:
         pytest.skip("This numerical test requires exactly 8 ranks.")
 
     config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
-    ddp_config = TorchFullyShardedDataParallelConfig(reduce_scatter_unused_params=True)
+    ddp_config = TorchFullyShardedDataParallelConfig(
+        reduce_scatter_unused_params=True,
+        num_distributed_optimizer_instances=2 if use_partial_reduce_scatter else 1,
+        gradient_accumulation_mode=gradient_accumulation_mode,
+    )
+    pg_collection = (
+        ProcessGroupCollection.use_mpu_process_groups() if use_partial_reduce_scatter else None
+    )
     reference_model = _ConditionalParamRoot().cuda()
     with torch.no_grad():
         for param in reference_model.parameters():
@@ -858,8 +1007,13 @@ def test_fsdp2_rank_divergent_unused_parameters_match_global_reference(init_mode
     model.load_state_dict(reference_model.state_dict())
 
     fsdp_model = TorchFullyShardedDataParallel(
-        config, ddp_config, model, sub_modules_to_wrap={_ConditionalParamBlock}
+        config,
+        ddp_config,
+        model,
+        sub_modules_to_wrap={_ConditionalParamBlock},
+        pg_collection=pg_collection,
     )
+    assert fsdp_model.is_hsdp is use_partial_reduce_scatter
     group = fsdp_model.process_group
     rank = torch.distributed.get_rank(group)
     world_size = torch.distributed.get_world_size(group)
@@ -873,7 +1027,18 @@ def test_fsdp2_rank_divergent_unused_parameters_match_global_reference(init_mode
     reference_model.zero_grad(set_to_none=True)
     with fsdp_model.no_sync():
         fsdp_model(microbatch_inputs[0], *branch_flags[0]).square().mean().backward()
+    if use_partial_reduce_scatter:
+        partial_reduce_outputs = _get_partial_reduce_outputs(
+            fsdp_model.module.block, fsdp_model.module
+        )
+        assert partial_reduce_outputs
+        assert all(output is not None for output in partial_reduce_outputs)
     fsdp_model(microbatch_inputs[1], *branch_flags[1]).square().mean().backward()
+    if use_partial_reduce_scatter:
+        assert all(
+            output is None
+            for output in _get_partial_reduce_outputs(fsdp_model.module.block, fsdp_model.module)
+        )
 
     for microbatch_input, flags in zip(microbatch_inputs, branch_flags):
         reference_model(microbatch_input, *flags).square().mean().backward()
@@ -900,6 +1065,7 @@ def test_fsdp2_rank_divergent_unused_parameters_match_global_reference(init_mode
         torch.distributed.all_reduce(grad, group=group)
         grad.div_(world_size)
         expected_grads[name] = grad
+    assert torch.count_nonzero(expected_grads["block.branch_a.weight"]) > 0
 
     fsdp_params = dict(fsdp_model.module.named_parameters())
     actual_grads = {}
@@ -917,32 +1083,61 @@ def test_fsdp2_rank_divergent_unused_parameters_match_global_reference(init_mode
     assert torch.count_nonzero(actual_grads["root_globally_unused"]) == 0
 
 
+@pytest.mark.parametrize(
+    ("parallel_fixture", "gradient_accumulation_mode"),
+    [
+        pytest.param("init_model_parallel", "classic", id="fsdp1d-classic"),
+        pytest.param("init_hsdp_model_parallel", "partial_reduce_scatter", id="hsdp-partial"),
+    ],
+)
 @pytest.mark.parametrize("all_zero_tokens", [False, True])
 @pytest.mark.parametrize("model_dtype", [torch.float32, torch.bfloat16])
 def test_fsdp2_per_token_gradient_scaling_matches_global_reference(
-    init_model_parallel, all_zero_tokens, model_dtype
+    request, parallel_fixture, gradient_accumulation_mode, all_zero_tokens, model_dtype
 ):
-    """Normalize SUM-reduced FSDP2 gradients by the global valid-token count."""
+    """Match per-token SUM normalization for 1D classic and HSDP partial modes."""
+    request.getfixturevalue(parallel_fixture)
+    use_partial_reduce_scatter = gradient_accumulation_mode == "partial_reduce_scatter"
     if not is_torch_min_version("2.6.0"):
         pytest.skip("FSDP2 is not supported on this version of PyTorch.")
+    if use_partial_reduce_scatter and not is_torch_min_version("2.13.0"):
+        pytest.skip("Partial reduce-scatter accumulation requires PyTorch >= 2.13.")
     if torch.distributed.get_world_size() != 8:
         pytest.skip("This numerical test requires exactly 8 ranks.")
 
     config = TransformerConfig(
         num_layers=1, kv_channels=1, bf16=True, calculate_per_token_loss=True
     )
-    ddp_config = DistributedDataParallelConfig(average_in_collective=False)
+    ddp_config = TorchFullyShardedDataParallelConfig(
+        average_in_collective=False,
+        num_distributed_optimizer_instances=2 if use_partial_reduce_scatter else 1,
+        gradient_accumulation_mode=gradient_accumulation_mode,
+        reduce_scatter_unused_params=use_partial_reduce_scatter,
+    )
+    pg_collection = (
+        ProcessGroupCollection.use_mpu_process_groups() if use_partial_reduce_scatter else None
+    )
+    group = (
+        pg_collection.dp_cp
+        if pg_collection is not None
+        else parallel_state.get_data_parallel_group(with_context_parallel=True)
+    )
     reference_model = _NestedWrapRoot().cuda().to(model_dtype)
     with torch.no_grad():
         for param in reference_model.parameters():
-            torch.distributed.broadcast(param, src=0)
+            torch.distributed.broadcast(param, src=0, group=group)
     model = _NestedWrapRoot().cuda().to(model_dtype)
     model.load_state_dict(reference_model.state_dict())
 
     fsdp_model = TorchFullyShardedDataParallel(
-        config, ddp_config, model, sub_modules_to_wrap={_WrapParent, _WrapLeaf, torch.nn.Linear}
+        config,
+        ddp_config,
+        model,
+        sub_modules_to_wrap={_WrapParent, _WrapLeaf, torch.nn.Linear},
+        pg_collection=pg_collection,
     )
-    group = fsdp_model.process_group
+    assert fsdp_model.is_hsdp is use_partial_reduce_scatter
+    assert fsdp_model.process_group is group
     rank = torch.distributed.get_rank(group)
     token_counts = [0, 0] if all_zero_tokens else [rank % 4, (3 * rank + 1) % 5]
     token_ids = torch.arange(4, device="cuda")
@@ -961,7 +1156,20 @@ def test_fsdp2_per_token_gradient_scaling_matches_global_reference(
     reference_model.zero_grad(set_to_none=True)
     with fsdp_model.no_sync():
         token_sum_loss(fsdp_model, microbatch_inputs[0], token_counts[0]).backward()
+    if use_partial_reduce_scatter:
+        partial_reduce_outputs = _get_partial_reduce_outputs(
+            fsdp_model.module.parent.leaf, fsdp_model.module.parent, fsdp_model.module
+        )
+        assert partial_reduce_outputs
+        assert all(output is not None for output in partial_reduce_outputs)
     token_sum_loss(fsdp_model, microbatch_inputs[1], token_counts[1]).backward()
+    if use_partial_reduce_scatter:
+        assert all(
+            output is None
+            for output in _get_partial_reduce_outputs(
+                fsdp_model.module.parent.leaf, fsdp_model.module.parent, fsdp_model.module
+            )
+        )
 
     for microbatch_input, token_count in zip(microbatch_inputs, token_counts):
         token_sum_loss(reference_model, microbatch_input, token_count).backward()
