@@ -459,13 +459,19 @@ class CheckpointType(Enum):
     FSDP_DTENSOR = auto()
 
 
-def _validate_torch_fsdp2_hsdp_checkpoint_format(args, ckpt_format: Optional[str]) -> None:
-    """Reject checkpoint formats that cannot represent FSDP2's 2D HSDP mesh."""
-    if (
-        getattr(args, "use_torch_fsdp2", False)
-        and getattr(args, "num_distributed_optimizer_instances", 1) > 1
-        and ckpt_format == "torch_dist"
-    ):
+def _validate_torch_fsdp2_checkpoint_format(args, ckpt_format: Optional[str]) -> None:
+    """Reject checkpoint formats that cannot represent the active FSDP2 meshes."""
+    if not getattr(args, "use_torch_fsdp2", False):
+        return
+    if getattr(args, "expert_model_parallel_size", 1) > 1 and ckpt_format in {
+        "torch_dist",
+        "torch_dcp",
+    }:
+        raise RuntimeError(
+            f"Torch FSDP2 expert-parallel checkpointing with {ckpt_format} is not "
+            "supported yet; saving and loading require a global-expert-aware state mapping."
+        )
+    if getattr(args, "num_distributed_optimizer_instances", 1) > 1 and ckpt_format == "torch_dist":
         raise RuntimeError(
             "Torch FSDP2 HSDP checkpointing with torch_dist is not supported yet; "
             "use --ckpt-format torch_dcp."
@@ -598,9 +604,13 @@ def save_checkpoint(
     start_ckpt = time()
     args = get_args()
 
-    if not non_persistent_ckpt:
+    if non_persistent_ckpt and args.non_persistent_ckpt_type == 'global':
+        effective_ckpt_format = args.ckpt_format
+    elif non_persistent_ckpt:
+        effective_ckpt_format = "torch"
+    else:
         effective_ckpt_format = args.ckpt_format if args.use_dist_ckpt else "torch"
-        _validate_torch_fsdp2_hsdp_checkpoint_format(args, effective_ckpt_format)
+    _validate_torch_fsdp2_checkpoint_format(args, effective_ckpt_format)
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0(
@@ -623,7 +633,6 @@ def save_checkpoint(
     if non_persistent_ckpt:
         if args.non_persistent_ckpt_type == 'global':
             ckpt_type = CheckpointType.GLOBAL
-            _validate_torch_fsdp2_hsdp_checkpoint_format(args, args.ckpt_format)
             save_dir = (
                 args.non_persistent_global_ckpt_dir
                 if args.non_persistent_global_ckpt_dir
@@ -1955,7 +1964,7 @@ def load_checkpoint(
         else:
             raise NotImplementedError(f"checkpoint format {ckpt_format} not supported")
 
-    _validate_torch_fsdp2_hsdp_checkpoint_format(args, ckpt_format)
+    _validate_torch_fsdp2_checkpoint_format(args, ckpt_format)
 
     load_kwargs = {}
     ignore_rng_state = False

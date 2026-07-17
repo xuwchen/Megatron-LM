@@ -23,7 +23,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
-    _validate_torch_fsdp2_hsdp_checkpoint_format,
+    _validate_torch_fsdp2_checkpoint_format,
     get_checkpoint_tracker_filename,
     load_checkpoint,
     read_metadata,
@@ -204,7 +204,60 @@ def test_checkpoint_format_guard_allows_torch_dcp_for_torch_fsdp2_hsdp():
     """Do not reject a DCP checkpoint when the CLI requested auto-detection."""
     args = SimpleNamespace(use_torch_fsdp2=True, num_distributed_optimizer_instances=2)
 
-    _validate_torch_fsdp2_hsdp_checkpoint_format(args, "torch_dcp")
+    _validate_torch_fsdp2_checkpoint_format(args, "torch_dcp")
+
+
+@pytest.mark.parametrize("ckpt_format", ["torch_dist", "torch_dcp"])
+@pytest.mark.parametrize("non_persistent_ckpt", [False, True])
+def test_save_checkpoint_rejects_torch_fsdp2_expert_parallel_formats(
+    create_args, ckpt_format, non_persistent_ckpt
+):
+    """Reject EP formats before persistent or non-persistent save side effects."""
+    args = create_args
+    args.use_torch_fsdp2 = True
+    args.expert_model_parallel_size = 2
+    args.num_distributed_optimizer_instances = 1
+    args.ckpt_format = ckpt_format
+    args.use_dist_ckpt = True
+    if non_persistent_ckpt:
+        args.non_persistent_ckpt_type = "global"
+    set_args(args)
+
+    with mock.patch(
+        "megatron.training.checkpointing.on_save_checkpoint_start",
+        side_effect=AssertionError("save side effects must not start"),
+    ):
+        with pytest.raises(RuntimeError, match="expert-parallel checkpointing"):
+            save_checkpoint(0, [], None, None, 0, non_persistent_ckpt=non_persistent_ckpt)
+
+
+@pytest.mark.parametrize(
+    ("detected_type", "detected_format"),
+    [(CheckpointType.GLOBAL, "torch_dist"), (CheckpointType.TORCH_DCP, "torch_dcp")],
+)
+def test_load_checkpoint_rejects_detected_torch_fsdp2_expert_parallel_formats(
+    create_ckpt_load_args, detected_type, detected_format
+):
+    """Guard the detected on-disk EP format before building a load state dict."""
+    args = create_ckpt_load_args
+    args.use_torch_fsdp2 = True
+    args.expert_model_parallel_size = 2
+    args.num_distributed_optimizer_instances = 1
+    args.ckpt_format = "torch_dist"
+    args.auto_detect_ckpt_format = True
+    args.load = "unused"
+    args.pretrained_checkpoint = None
+    set_args(args)
+    model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(None, None, False, detected_type),
+    ):
+        with pytest.raises(
+            RuntimeError, match=f"expert-parallel checkpointing with {detected_format}"
+        ):
+            load_checkpoint([model], None, None)
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch_dcp"])
