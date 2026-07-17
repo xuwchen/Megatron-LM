@@ -35,14 +35,14 @@ from megatron.core.package_info import __version__ as mcore_version
 
 try:
     from torch.distributed._tensor import DTensor
-    from torch.distributed.tensor.placement_types import Shard
+    from torch.distributed.tensor.placement_types import Replicate, Shard
 
     HAVE_DTENSOR = True
 except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
@@ -1028,9 +1028,16 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     is_data_parallel_fully_sharded = HAVE_DTENSOR and isinstance(tensor, DTensor)
     if is_data_parallel_fully_sharded:
+        if _dtensor_requires_full_tensor(tensor):
+            if replica_id is None:
+                replica_id = (0, get_pg_rank(tp_group), dp_rank)
+            return _make_replicated_dtensor_factory(
+                tensor, key, prepend_offsets, replica_id, kwargs
+            )
+
         # FSDP2 sharding
         dp_replica_id = 0
-        tensor = get_full_tensor_if_necessary(tensor)
+        tensor = tensor._local_tensor
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
@@ -1050,20 +1057,76 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     return sharded_tensor
 
 
+def _dtensor_requires_full_tensor(tensor):
+    """Return whether a sharded DTensor has ranks with an empty local shard."""
+    return any(
+        isinstance(placement, Shard)
+        and tensor.device_mesh.shape[mesh_dim] > tensor.shape[placement.dim]
+        for mesh_dim, placement in enumerate(tensor.placements)
+    )
+
+
 def get_full_tensor_if_necessary(tensor):
     """For DTensor gets full tensor if some ranks will not have a local copy"""
-    need_full_tensor = False
-    for i in range(tensor.device_mesh.ndim):
-        if (
-            isinstance(tensor.placements[i], Shard)
-            and tensor.device_mesh.shape[i] > tensor.shape[tensor.placements[i].dim]
-        ):
-            need_full_tensor = True
-            break
+    return tensor.full_tensor() if _dtensor_requires_full_tensor(tensor) else tensor._local_tensor
 
-    tensor = tensor.full_tensor() if need_full_tensor else tensor._local_tensor
 
-    return tensor
+def _make_replicated_dtensor_factory(tensor, key, prepend_offsets, replica_id, kwargs):
+    """Checkpoint a DTensor with empty local shards as one replicated full tensor.
+
+    The factory keeps the stable local-tensor identity required by optimizer
+    checkpoint mapping. Its build function reconstructs the original DTensor
+    layout for model parameters and optimizer states, materializes the full
+    tensor, and checkpoints it as a DP replica. The merge function reverses the
+    transformation so ranks that originally owned an empty shard get one again.
+    """
+    device_mesh = tensor.device_mesh
+    placements = tensor.placements
+    global_shape = tuple(tensor.shape)
+    global_stride = tuple(tensor.stride())
+    prepend_axis_num = len(prepend_offsets)
+    sharded_tensor_kwargs = dict(kwargs)
+    factory_flattened_range = sharded_tensor_kwargs.pop('flattened_range', None)
+
+    @torch.no_grad()
+    def build_fn(key, local_tensor, replica_id, flattened_range):
+        local_dtensor = DTensor.from_local(
+            local_tensor,
+            device_mesh=device_mesh,
+            placements=placements,
+            shape=global_shape,
+            stride=global_stride,
+            run_check=False,
+        )
+        full_tensor = local_dtensor.full_tensor()
+        return ShardedTensor.from_rank_offsets(
+            key,
+            full_tensor,
+            *prepend_offsets,
+            replica_id=replica_id,
+            prepend_axis_num=prepend_axis_num,
+            flattened_range=flattened_range,
+            **sharded_tensor_kwargs,
+        )
+
+    @torch.no_grad()
+    def merge_fn(full_tensor):
+        replicated_dtensor = DTensor.from_local(
+            full_tensor,
+            device_mesh=device_mesh,
+            placements=tuple(Replicate() for _ in placements),
+            run_check=False,
+        )
+        return replicated_dtensor.redistribute(placements=placements).to_local()
+
+    return ShardedTensorFactory(
+        key,
+        tensor._local_tensor,
+        build_fn,
+        merge_fn,
+        replica_id,
+        flattened_range=factory_flattened_range,
+    )
 
 
 def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
