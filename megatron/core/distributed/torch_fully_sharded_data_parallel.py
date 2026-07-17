@@ -22,6 +22,7 @@ from megatron.core.fp8_utils import is_float8tensor
 from .. import parallel_state, tensor_parallel
 from ..models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from ..models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from ..process_groups_config import ProcessGroupCollection
 from ..transformer.transformer_config import TransformerConfig
 from ..transformer.transformer_layer import TransformerLayer
 from ..utils import is_torch_min_version
@@ -117,6 +118,86 @@ def _clone_fsdp_output_views(
     return _apply_to_tensors(clone_view, output)
 
 
+def _build_fsdp_device_mesh(
+    process_group: ProcessGroup,
+    pg_collection: Optional[ProcessGroupCollection],
+    num_distributed_optimizer_instances: int,
+) -> "DeviceMesh":
+    """Build and validate the FSDP2 data-parallel device mesh."""
+    if num_distributed_optimizer_instances < 1:
+        raise ValueError(
+            "num_distributed_optimizer_instances must be at least 1, got "
+            f"{num_distributed_optimizer_instances}."
+        )
+    if num_distributed_optimizer_instances == 1:
+        return DeviceMesh.from_group(process_group, device_type="cuda")
+
+    if pg_collection is None:
+        raise ValueError(
+            "Torch FSDP2 HSDP requires pg_collection with dp_cp, intra_dp_cp, "
+            "and inter_dist_opt process groups."
+        )
+    shard_group = getattr(pg_collection, "intra_dp_cp", None)
+    replicate_group = getattr(pg_collection, "inter_dist_opt", None)
+    if shard_group is None or replicate_group is None:
+        raise ValueError(
+            "Torch FSDP2 HSDP requires both pg_collection.intra_dp_cp (shard) "
+            "and pg_collection.inter_dist_opt (replicate)."
+        )
+
+    full_ranks = torch.distributed.get_process_group_ranks(process_group)
+    shard_ranks = torch.distributed.get_process_group_ranks(shard_group)
+    replicate_ranks = torch.distributed.get_process_group_ranks(replicate_group)
+    replicate_size = len(replicate_ranks)
+    shard_size = len(shard_ranks)
+
+    if replicate_size != num_distributed_optimizer_instances:
+        raise ValueError(
+            "Torch FSDP2 HSDP replicate group size does not match "
+            "num_distributed_optimizer_instances: "
+            f"{replicate_size} != {num_distributed_optimizer_instances}."
+        )
+    if replicate_size * shard_size != len(full_ranks):
+        raise ValueError(
+            "Torch FSDP2 HSDP topology does not cover the full dp_cp group: "
+            f"replicate_size ({replicate_size}) * shard_size ({shard_size}) != "
+            f"dp_cp_size ({len(full_ranks)})."
+        )
+    if len(set(full_ranks)) != len(full_ranks):
+        raise ValueError(f"Torch FSDP2 HSDP dp_cp ranks must be unique, got {full_ranks}.")
+
+    global_rank = torch.distributed.get_rank()
+    if full_ranks.count(global_rank) != 1:
+        raise ValueError(
+            f"Current rank {global_rank} must occur exactly once in dp_cp ranks {full_ranks}."
+        )
+
+    rank_index = full_ranks.index(global_rank)
+    replica_index, shard_index = divmod(rank_index, shard_size)
+    expected_shard_ranks = full_ranks[replica_index * shard_size : (replica_index + 1) * shard_size]
+    expected_replicate_ranks = full_ranks[shard_index::shard_size]
+    if shard_ranks != expected_shard_ranks:
+        raise ValueError(
+            "Torch FSDP2 HSDP shard group does not match the current dp_cp mesh row: "
+            f"expected {expected_shard_ranks}, got {shard_ranks}."
+        )
+    if replicate_ranks != expected_replicate_ranks:
+        raise ValueError(
+            "Torch FSDP2 HSDP replicate group does not match the current dp_cp mesh column: "
+            f"expected {expected_replicate_ranks}, got {replicate_ranks}."
+        )
+
+    mesh = [
+        full_ranks[offset : offset + shard_size] for offset in range(0, len(full_ranks), shard_size)
+    ]
+    return DeviceMesh.from_group(
+        [replicate_group, shard_group],
+        device_type="cuda",
+        mesh=mesh,
+        mesh_dim_names=("replicate", "shard"),
+    )
+
+
 class TorchFullyShardedDataParallel(_BaseDataParallel):
     """
     Enables fully sharded data parallelism by wrapping the given model with
@@ -139,9 +220,10 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
             User can set _fsdp_modules attribute on submodules to set additional
             submodules to shard with FSDP.
-        process_group: Optional ProcessGroup to use for distributed operations.
-            If None (default), the data parallel process group will be obtained from
-            parallel_state.get_data_parallel_group(with_context_parallel=True).
+        process_group: Optional ProcessGroup to use for distributed operations. This is a
+            backward-compatible 1D FSDP path and cannot be combined with pg_collection.
+        pg_collection: Optional ProcessGroupCollection used to build the data-parallel mesh.
+            HSDP requires dp_cp, intra_dp_cp, and inter_dist_opt groups.
     """
 
     def __init__(
@@ -157,6 +239,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         },
         disable_bucketing: bool = False,
         process_group: Optional[ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
 
         assert (
@@ -165,12 +248,25 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
         super().__init__(config=config, module=module)
 
-        if process_group is None:
-            self.process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        else:
+        if process_group is not None and pg_collection is not None:
+            raise ValueError("Specify only one of process_group and pg_collection for Torch FSDP2.")
+        if pg_collection is not None:
+            self.process_group = getattr(pg_collection, "dp_cp", None)
+            if self.process_group is None:
+                raise ValueError("Torch FSDP2 requires pg_collection.dp_cp.")
+        elif process_group is not None:
             self.process_group = process_group
+        else:
+            # Backward-compatible fallback for direct wrapper callers.
+            self.process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
-        self.device_mesh = DeviceMesh.from_group(self.process_group, "cuda")
+        self.num_distributed_optimizer_instances = ddp_config.num_distributed_optimizer_instances
+        self.is_hsdp = self.num_distributed_optimizer_instances > 1
+        self.device_mesh = _build_fsdp_device_mesh(
+            self.process_group, pg_collection, self.num_distributed_optimizer_instances
+        )
+        self.shard_process_group = pg_collection.intra_dp_cp if self.is_hsdp else self.process_group
+        self.replicate_process_group = pg_collection.inter_dist_opt if self.is_hsdp else None
         reshard_after_forward = _resolve_fsdp_reshard_after_forward(
             getattr(ddp_config, "reshard_after_forward", None)
         )

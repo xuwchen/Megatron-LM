@@ -4,14 +4,17 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from torch.distributed.tensor import Replicate, Shard
 
 import megatron.core.distributed.torch_fully_sharded_data_parallel as torch_fsdp2
+import megatron.core.utils as core_utils
 from megatron.core import parallel_state
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.torch_fully_sharded_data_parallel import (
     TorchFullyShardedDataParallel,
+    _build_fsdp_device_mesh,
     _build_fsdp_wrap_plan,
     _clone_fsdp_output_views,
 )
@@ -22,6 +25,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
@@ -195,6 +199,114 @@ def init_model_parallel():
     yield  # Run the actual test.
     Utils.destroy_model_parallel()
     unset_num_microbatches_calculator()
+
+
+@pytest.fixture
+def init_hsdp_model_parallel():
+    """Initialize the exact 2x4 HSDP topology used by the 8-rank gate."""
+    if Utils.world_size != 8:
+        pytest.skip("This HSDP numerical test requires exactly 8 ranks.")
+    Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+    init_num_microbatches_calculator(
+        rank=Utils.rank, global_batch_size=16, micro_batch_size=1, data_parallel_size=8
+    )
+    model_parallel_cuda_manual_seed(123)
+    yield
+    Utils.destroy_model_parallel()
+    unset_num_microbatches_calculator()
+
+
+def test_fsdp2_builds_hsdp_mesh_from_existing_process_groups(monkeypatch):
+    """Reuse MCore's orthogonal groups without creating new communicators."""
+    full_group = object()
+    shard_group = object()
+    replicate_group = object()
+    fake_mesh = object()
+    calls = []
+    group_ranks = {full_group: list(range(8)), shard_group: [0, 1, 2, 3], replicate_group: [0, 4]}
+
+    class _FakeDeviceMesh:
+        @staticmethod
+        def from_group(groups, device_type, mesh=None, mesh_dim_names=None):
+            calls.append((groups, device_type, mesh, mesh_dim_names))
+            return fake_mesh
+
+    monkeypatch.setattr(torch_fsdp2, "DeviceMesh", _FakeDeviceMesh)
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda group: group_ranks[group]
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    pg_collection = ProcessGroupCollection(
+        dp_cp=full_group, intra_dp_cp=shard_group, inter_dist_opt=replicate_group
+    )
+
+    result = _build_fsdp_device_mesh(full_group, pg_collection, 2)
+
+    assert result is fake_mesh
+    assert calls == [
+        (
+            [replicate_group, shard_group],
+            "cuda",
+            [[0, 1, 2, 3], [4, 5, 6, 7]],
+            ("replicate", "shard"),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("shard_ranks", "replicate_ranks", "error"),
+    [
+        ([1, 2, 3, 4], [0, 4], "mesh row"),
+        ([0, 1, 2, 3], [0, 5], "mesh column"),
+        ([0, 1], [0, 2], "does not cover"),
+    ],
+)
+def test_fsdp2_rejects_invalid_hsdp_topology(monkeypatch, shard_ranks, replicate_ranks, error):
+    """Fail before fully_shard when MCore groups do not form the requested mesh."""
+    full_group = object()
+    shard_group = object()
+    replicate_group = object()
+    group_ranks = {
+        full_group: list(range(8)),
+        shard_group: shard_ranks,
+        replicate_group: replicate_ranks,
+    }
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda group: group_ranks[group]
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    pg_collection = ProcessGroupCollection(
+        dp_cp=full_group, intra_dp_cp=shard_group, inter_dist_opt=replicate_group
+    )
+
+    with pytest.raises(ValueError, match=error):
+        _build_fsdp_device_mesh(full_group, pg_collection, 2)
+
+
+def test_dtensor_norm_group_uses_only_hsdp_shard_dimension(monkeypatch):
+    """Do not count replicated HSDP shards twice in norms and clipping."""
+    shard_group = object()
+    requested_mesh_dims = []
+
+    class _FakeMesh:
+        ndim = 2
+
+        @staticmethod
+        def get_group(mesh_dim=None):
+            requested_mesh_dims.append(mesh_dim)
+            return shard_group
+
+    class _FakeDTensor:
+        device_mesh = _FakeMesh()
+        placements = (Replicate(), Shard(0))
+
+    monkeypatch.setattr(core_utils, "HAVE_DTENSOR", True)
+    monkeypatch.setattr(core_utils, "DTensor", _FakeDTensor)
+
+    result = core_utils.get_data_parallel_group_if_dtensor(_FakeDTensor())
+
+    assert result is shard_group
+    assert requested_mesh_dims == [1]
 
 
 @pytest.mark.parametrize("force_all_reduce", [False, True])
@@ -612,6 +724,72 @@ def test_fsdp2_clones_output_views_before_registering_backward_hook(init_model_p
         rtol=1e-5,
         atol=1e-6,
     )
+
+
+def test_fsdp2_hsdp_mesh_and_no_sync_match_global_reference(init_hsdp_model_parallel):
+    """Validate the real 2x4 mesh and classic accumulation against full DP."""
+    if not is_torch_min_version("2.6.0"):
+        pytest.skip("FSDP2 is not supported on this version of PyTorch.")
+
+    config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
+    ddp_config = TorchFullyShardedDataParallelConfig(num_distributed_optimizer_instances=2)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    reference_model = _NestedWrapRoot().cuda()
+    with torch.no_grad():
+        for param in reference_model.parameters():
+            torch.distributed.broadcast(param, src=0, group=pg_collection.dp_cp)
+    model = _NestedWrapRoot().cuda()
+    model.load_state_dict(reference_model.state_dict())
+
+    fsdp_model = TorchFullyShardedDataParallel(
+        config,
+        ddp_config,
+        model,
+        sub_modules_to_wrap={_WrapParent, _WrapLeaf, torch.nn.Linear},
+        pg_collection=pg_collection,
+    )
+    assert fsdp_model.is_hsdp
+    assert fsdp_model.process_group is pg_collection.dp_cp
+    assert fsdp_model.shard_process_group is pg_collection.intra_dp_cp
+    assert fsdp_model.replicate_process_group is pg_collection.inter_dist_opt
+    assert tuple(fsdp_model.device_mesh.mesh.shape) == (2, 4)
+    assert fsdp_model.device_mesh.mesh_dim_names == ("replicate", "shard")
+    assert fsdp_model.device_mesh.get_group("replicate") is pg_collection.inter_dist_opt
+    assert fsdp_model.device_mesh.get_group("shard") is pg_collection.intra_dp_cp
+    fsdp_param = next(fsdp_model.module.parameters())
+    assert isinstance(fsdp_param.placements[0], Replicate)
+    assert isinstance(fsdp_param.placements[1], Shard)
+
+    group = fsdp_model.process_group
+    rank = torch.distributed.get_rank(group)
+    world_size = torch.distributed.get_world_size(group)
+    for accumulation_cycle in range(2):
+        fsdp_model.zero_grad(set_to_none=True)
+        reference_model.zero_grad(set_to_none=True)
+        microbatch_inputs = [
+            torch.full(
+                (2, 8), (rank + 1) * (microbatch + 1) * (accumulation_cycle + 1) / 10, device="cuda"
+            )
+            for microbatch in range(2)
+        ]
+
+        with fsdp_model.no_sync():
+            fsdp_model(microbatch_inputs[0]).square().mean().backward()
+        fsdp_model(microbatch_inputs[1]).square().mean().backward()
+
+        for microbatch_input in microbatch_inputs:
+            reference_model(microbatch_input).square().mean().backward()
+        for param in reference_model.parameters():
+            torch.distributed.all_reduce(param.grad, group=group)
+            param.grad.div_(world_size)
+
+        fsdp_params = dict(fsdp_model.module.named_parameters())
+        for name, reference_param in reference_model.named_parameters():
+            fsdp_grad = fsdp_params[name].grad
+            assert fsdp_grad is not None
+            torch.testing.assert_close(
+                fsdp_grad.full_tensor(), reference_param.grad, rtol=1e-5, atol=1e-6
+            )
 
 
 def test_fsdp2_no_sync_accumulates_and_reduces_gradients(init_model_parallel):

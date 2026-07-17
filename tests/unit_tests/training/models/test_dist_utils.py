@@ -711,6 +711,7 @@ class TestDdpWrapFullParamLayout:
         _ddp_wrap([chunk], False, ddp_config, False, use_torch_fsdp2=True, pg_collection=self.pg)
         self._opt.compute_full_param_layout.assert_not_called()
         assert "full_param_layout" not in mock_torch_fsdp.call_args.kwargs
+        assert mock_torch_fsdp.call_args.kwargs["pg_collection"] is self.pg
 
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")

@@ -2021,8 +2021,7 @@ def wrap_model_chunks_with_ddp(
         model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
     ):
         chunk_kwargs = {}
-        # TorchFSDP takes process_group, not pg_collection.
-        if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
+        if pg_collection is not None:
             chunk_kwargs["pg_collection"] = pg_collection
         if layout is not None:
             chunk_kwargs["full_param_layout"] = layout
@@ -2231,7 +2230,11 @@ def get_model(
                     args, 'use_layer_wise_distributed_optimizer', False
                 ),
                 DP=DP,
-                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                pg_collection=(
+                    pg_collection
+                    if args.use_megatron_fsdp or args.use_torch_fsdp2
+                    else None
+                ),
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
@@ -2329,6 +2332,9 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         )
         clone_output_views = getattr(args, "torch_fsdp2_clone_output_views", False)
         return TorchFullyShardedDataParallelConfig(
+            num_distributed_optimizer_instances=getattr(
+                args, "num_distributed_optimizer_instances", 1
+            ),
             reshard_after_forward=reshard_after_forward,
             reduce_scatter_unused_params=reduce_scatter_unused_params,
             clone_output_views=clone_output_views,
