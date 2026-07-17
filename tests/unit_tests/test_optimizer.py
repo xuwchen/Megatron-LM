@@ -15,6 +15,7 @@ from transformer_engine.pytorch.fp8 import fp8_autocast
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import (
     ChainedOptimizer,
+    FP32Optimizer,
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
@@ -364,6 +365,53 @@ def test_chained_optimizer_file_state_dict_round_trip(tmp_path):
 
     assert torch.load(checkpoint_path) == state_dicts
     assert restored.state_dict() == state_dicts
+
+
+@pytest.mark.parametrize('num_optimizers', [1, 2])
+def test_chained_optimizer_state_dict_forwards_is_loading(num_optimizers):
+    """Every child materializes its lazy state before a DCP load."""
+
+    class MockOptimizer:
+        config = None
+        model_chunks = []
+        is_stub_optimizer = False
+
+        def __init__(self, value):
+            self.value = value
+            self.is_loading_calls = []
+
+        def state_dict(self, is_loading=False):
+            self.is_loading_calls.append(is_loading)
+            return {'value': self.value}
+
+    optimizers = [MockOptimizer(i) for i in range(num_optimizers)]
+    state_dict = ChainedOptimizer(optimizers).state_dict(is_loading=True)
+
+    expected = (
+        {'value': 0} if num_optimizers == 1 else [{'value': i} for i in range(num_optimizers)]
+    )
+    assert state_dict == expected
+    assert all(optimizer.is_loading_calls == [True] for optimizer in optimizers)
+
+
+def test_fp32_optimizer_state_dict_initializes_state_for_loading():
+    """FP32 state templates are materialized before a DCP load."""
+
+    class MockInnerOptimizer:
+        def state_dict(self):
+            return {'state': {'initialized': True}}
+
+    optimizer = object.__new__(FP32Optimizer)
+    optimizer.optimizer = MockInnerOptimizer()
+    optimizer.config = object()
+    optimizer.is_stub_optimizer = False
+    init_calls = []
+    optimizer.init_state_fn = lambda inner_optimizer, config: init_calls.append(
+        (inner_optimizer, config)
+    )
+
+    assert optimizer.state_dict(is_loading=True) == {'state': {'initialized': True}}
+    assert init_calls == [(optimizer.optimizer, optimizer.config)]
 
 
 def test_chained_optimizer_get_parameters():
