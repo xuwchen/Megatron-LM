@@ -1,6 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -8,6 +11,7 @@ from torch.distributed.tensor import Replicate, Shard
 
 import megatron.core.distributed.torch_fully_sharded_data_parallel as torch_fsdp2
 import megatron.core.utils as core_utils
+import megatron.training.utils as training_utils
 from megatron.core import parallel_state
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
@@ -103,6 +107,23 @@ class _ViewOutputRoot(torch.nn.Module):
     def forward(self, inputs):
         """Return a view to exercise FSDP's output-hook safety requirement."""
         return (inputs @ self.weight).view(-1, 8)
+
+
+class _MixedDenseExpertRoot(torch.nn.Module):
+    """One FSDP unit with dense and routed-expert parameters."""
+
+    def __init__(self):
+        super().__init__()
+        self.dense_weight = torch.nn.Parameter(torch.empty(8, 8))
+        self.expert_weight = torch.nn.Parameter(torch.empty(8, 8))
+        self.expert_weight.allreduce = False
+
+    def forward(self, inputs, use_expert=True):
+        """Optionally leave the expert parameter unused on a subset of ranks."""
+        output = inputs @ self.dense_weight
+        if use_expert:
+            output = output + inputs @ self.expert_weight
+        return output
 
 
 @dataclass
@@ -243,6 +264,23 @@ def init_hsdp_model_parallel():
     unset_num_microbatches_calculator()
 
 
+@pytest.fixture
+def init_ep_hsdp_model_parallel():
+    """Initialize dense 2x4 and routed-expert 2x2 HSDP meshes on eight ranks."""
+    if Utils.world_size != 8:
+        pytest.skip("This EP HSDP numerical test requires exactly 8 ranks.")
+    Utils.initialize_model_parallel(
+        1, 1, expert_model_parallel_size=2, num_distributed_optimizer_instances=2
+    )
+    init_num_microbatches_calculator(
+        rank=Utils.rank, global_batch_size=16, micro_batch_size=1, data_parallel_size=8
+    )
+    model_parallel_cuda_manual_seed(123)
+    yield
+    Utils.destroy_model_parallel()
+    unset_num_microbatches_calculator()
+
+
 def test_fsdp2_builds_hsdp_mesh_from_existing_process_groups(monkeypatch):
     """Reuse MCore's orthogonal groups without creating new communicators."""
     full_group = object()
@@ -277,6 +315,38 @@ def test_fsdp2_builds_hsdp_mesh_from_existing_process_groups(monkeypatch):
             [[0, 1, 2, 3], [4, 5, 6, 7]],
             ("replicate", "shard"),
         )
+    ]
+
+
+def test_fsdp2_builds_expert_hsdp_mesh_from_existing_process_groups(monkeypatch):
+    """Lay out sparse expert-DP ranks as two shard rows sharing dense replica columns."""
+    full_group = object()
+    shard_group = object()
+    replicate_group = object()
+    fake_mesh = object()
+    calls = []
+    group_ranks = {full_group: [0, 2, 4, 6], shard_group: [0, 2], replicate_group: [0, 4]}
+
+    class _FakeDeviceMesh:
+        @staticmethod
+        def from_group(groups, device_type, mesh=None, mesh_dim_names=None):
+            calls.append((groups, device_type, mesh, mesh_dim_names))
+            return fake_mesh
+
+    monkeypatch.setattr(torch_fsdp2, "DeviceMesh", _FakeDeviceMesh)
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda group: group_ranks[group]
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    pg_collection = ProcessGroupCollection(
+        expt_dp=full_group, intra_expt_dp=shard_group, inter_dist_opt=replicate_group
+    )
+
+    result = _build_fsdp_device_mesh(full_group, pg_collection, 2, expert_parallel=True)
+
+    assert result is fake_mesh
+    assert calls == [
+        ([replicate_group, shard_group], "cuda", [[0, 2], [4, 6]], ("replicate", "shard"))
     ]
 
 
@@ -920,6 +990,116 @@ def test_fsdp2_hsdp_mesh_and_no_sync_match_global_reference(
             torch.testing.assert_close(
                 fsdp_grad.full_tensor(), reference_param.grad, rtol=1e-5, atol=1e-6
             )
+
+
+@pytest.mark.parametrize(
+    ("gradient_accumulation_mode", "calculate_per_token_loss"),
+    [("classic", False), ("partial_reduce_scatter", True)],
+)
+def test_fsdp2_ep_hsdp_uses_distinct_meshes_and_matches_reference(
+    init_ep_hsdp_model_parallel, gradient_accumulation_mode, calculate_per_token_loss
+):
+    """Reduce dense grads over DP8 and expert grads over expert-DP4 with a global divisor."""
+    if not is_torch_min_version("2.13.0"):
+        pytest.skip("Per-parameter FSDP2 meshes require PyTorch >= 2.13.")
+
+    config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
+    config.expert_model_parallel_size = 2
+    config.calculate_per_token_loss = calculate_per_token_loss
+    ddp_config = TorchFullyShardedDataParallelConfig(
+        num_distributed_optimizer_instances=2,
+        gradient_accumulation_mode=gradient_accumulation_mode,
+        reduce_scatter_unused_params=True,
+    )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    reference_model = _MixedDenseExpertRoot().cuda()
+    ep_rank = pg_collection.ep.rank()
+    with torch.no_grad():
+        dense_values = torch.arange(64, device="cuda", dtype=torch.float32).view(8, 8)
+        reference_model.dense_weight.copy_(dense_values / 100)
+        reference_model.expert_weight.copy_(torch.eye(8, device="cuda") * (ep_rank + 1) / 10)
+    model = _MixedDenseExpertRoot().cuda()
+    model.load_state_dict(reference_model.state_dict())
+
+    fsdp_model = TorchFullyShardedDataParallel(
+        config, ddp_config, model, sub_modules_to_wrap=set(), pg_collection=pg_collection
+    )
+    params = dict(fsdp_model.module.named_parameters())
+    dense_param = params["dense_weight"]
+    expert_param = params["expert_weight"]
+    assert tuple(dense_param.device_mesh.mesh.shape) == (2, 4)
+    assert tuple(expert_param.device_mesh.mesh.shape) == (2, 2)
+    assert isinstance(dense_param.placements[0], Replicate)
+    assert isinstance(dense_param.placements[1], Shard)
+    assert isinstance(expert_param.placements[0], Replicate)
+    assert isinstance(expert_param.placements[1], Shard)
+    assert getattr(dense_param, "allreduce", True)
+    assert not expert_param.allreduce
+
+    fsdp_state = torch_fsdp2.fully_shard.state(fsdp_model.module)
+    assert len(fsdp_state._fsdp_param_groups) == 2
+    mesh_sizes = sorted(
+        (group.mesh_info.replicate_process_group.size(), group.mesh_info.shard_process_group.size())
+        for group in fsdp_state._fsdp_param_groups
+    )
+    assert mesh_sizes == [(2, 2), (2, 4)]
+
+    dense_rank = pg_collection.dp_cp.rank()
+    fsdp_model.zero_grad(set_to_none=True)
+    reference_model.zero_grad(set_to_none=True)
+    for microbatch in range(2):
+        inputs = torch.full((2, 8), (dense_rank + 1) * (microbatch + 1) / 10, device="cuda")
+        use_expert = (dense_rank // 2 + microbatch) % 2 == 0
+        sync_context = fsdp_model.no_sync() if microbatch == 0 else nullcontext()
+        with sync_context:
+            fsdp_model(inputs, use_expert).square().mean().backward()
+        reference_model(inputs, use_expert).square().mean().backward()
+
+    torch.distributed.all_reduce(reference_model.dense_weight.grad, group=pg_collection.dp_cp)
+    torch.distributed.all_reduce(reference_model.expert_weight.grad, group=pg_collection.expt_dp)
+    if calculate_per_token_loss:
+        scale = 1.0 / 16
+        fsdp_model.scale_gradients(scale)
+        reference_model.dense_weight.grad.mul_(scale)
+        reference_model.expert_weight.grad.mul_(scale)
+    else:
+        reference_model.dense_weight.grad.div_(pg_collection.dp_cp.size())
+        reference_model.expert_weight.grad.div_(pg_collection.dp_cp.size())
+
+    torch.testing.assert_close(
+        dense_param.grad.full_tensor(), reference_model.dense_weight.grad, rtol=1e-5, atol=1e-6
+    )
+    torch.testing.assert_close(
+        expert_param.grad.full_tensor(), reference_model.expert_weight.grad, rtol=1e-5, atol=1e-6
+    )
+
+
+def test_fsdp2_ep_hsdp_params_norm_counts_each_global_parameter_once(init_ep_hsdp_model_parallel):
+    """Combine dense and expert shard meshes without counting HSDP replicas."""
+    if not is_torch_min_version("2.13.0"):
+        pytest.skip("Per-parameter FSDP2 meshes require PyTorch >= 2.13.")
+
+    config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
+    config.expert_model_parallel_size = 2
+    ddp_config = TorchFullyShardedDataParallelConfig(
+        num_distributed_optimizer_instances=2, reduce_scatter_unused_params=True
+    )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model = _MixedDenseExpertRoot().cuda()
+    with torch.no_grad():
+        model.dense_weight.fill_(1.0)
+        model.expert_weight.fill_(pg_collection.ep.rank() + 2.0)
+
+    fsdp_model = TorchFullyShardedDataParallel(
+        config, ddp_config, model, sub_modules_to_wrap=set(), pg_collection=pg_collection
+    )
+    mock_args = SimpleNamespace(use_megatron_fsdp=False, bf16=True)
+    with mock.patch("megatron.training.utils.common_utils.get_args", return_value=mock_args):
+        actual_norm = training_utils.calc_params_l2_norm(fsdp_model, force_create_fp32_copy=True)
+
+    # One dense weight of ones plus one global expert per EP rank, filled with 2 and 3.
+    expected_norm = (64 * (1.0**2 + 2.0**2 + 3.0**2)) ** 0.5
+    assert actual_norm == pytest.approx(expected_norm)
 
 
 def test_fsdp2_no_sync_accumulates_and_reduces_gradients(init_model_parallel):

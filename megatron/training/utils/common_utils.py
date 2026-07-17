@@ -74,16 +74,23 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     params_data = []
     moe_params_data = []
     sharded_params_data = []
-    data_parallel_group = None
+    dense_shard_group = None
+    expert_shard_group = None
 
     for model_chunk in model:
         for param in model_chunk.parameters():
-            data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            is_expert = not getattr(param, 'allreduce', True)
+            if is_expert:
+                expert_shard_group = get_data_parallel_group_if_dtensor(param, expert_shard_group)
+                tp_group = mpu.get_expert_tensor_parallel_group()
+            else:
+                dense_shard_group = get_data_parallel_group_if_dtensor(param, dense_shard_group)
+                tp_group = mpu.get_tensor_model_parallel_group()
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
             if not is_not_tp_duplicate:
                 continue
             assert is_not_tp_duplicate
-            if not getattr(param, 'allreduce', True):
+            if is_expert:
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
                 if args.bf16:
@@ -126,9 +133,9 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     else:
         norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
 
-    if data_parallel_group is not None:
+    if dense_shard_group is not None:
         torch.distributed.all_reduce(
-            norm_2, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
+            norm_2, op=torch.distributed.ReduceOp.SUM, group=dense_shard_group
         )
 
     # Add norm contribution from params with sharded main_params. These norms need to be
@@ -169,6 +176,11 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
     else:
         moe_norm_2 = torch.zeros_like(norm_2)
+
+    if expert_shard_group is not None:
+        torch.distributed.all_reduce(
+            moe_norm_2, op=torch.distributed.ReduceOp.SUM, group=expert_shard_group
+        )
 
     # Reduce norm across model parallel groups (dense and expert).
     # Dense params should sum across all model-parallel GPUs (tensor + pipeline).
@@ -561,9 +573,9 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         def _broadcast_cu_seqlens(cu_seqlens):
             if getattr(args, 'cuda_graph_impl', 'none') == 'full_iteration':
-                assert cu_seqlens is None, (
-                    "cu_seqlens is not supported with cuda_graph_impl=full_iteration"
-                )
+                assert (
+                    cu_seqlens is None
+                ), "cu_seqlens is not supported with cuda_graph_impl=full_iteration"
                 return
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())

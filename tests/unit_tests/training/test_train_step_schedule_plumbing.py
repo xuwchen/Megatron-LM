@@ -276,6 +276,52 @@ def test_validate_torch_fsdp2_gradient_accumulation_rejects_invalid_programmatic
         arguments_mod._validate_torch_fsdp2_gradient_accumulation(args)
 
 
+def test_validate_torch_fsdp2_expert_parallelism_accepts_supported_configuration(monkeypatch):
+    """Accept EP only with the PyTorch per-parameter mesh and unused-param APIs."""
+    monkeypatch.setattr(arguments_mod, "is_torch_min_version", lambda version: True)
+    args = SimpleNamespace(
+        use_torch_fsdp2=True,
+        expert_model_parallel_size=2,
+        torch_fsdp2_reduce_scatter_unused_params=True,
+    )
+
+    arguments_mod._validate_torch_fsdp2_expert_parallelism(args)
+
+
+@pytest.mark.parametrize(
+    ("torch_supported", "unused_params", "error"),
+    [
+        (False, True, "requires PyTorch >= 2.13"),
+        (True, False, "requires --torch-fsdp2-reduce-scatter-unused-params"),
+    ],
+)
+def test_validate_torch_fsdp2_expert_parallelism_rejects_missing_prerequisite(
+    monkeypatch, torch_supported, unused_params, error
+):
+    """Reject unsafe EP configurations before model construction."""
+    monkeypatch.setattr(arguments_mod, "is_torch_min_version", lambda version: torch_supported)
+    args = SimpleNamespace(
+        use_torch_fsdp2=True,
+        expert_model_parallel_size=2,
+        torch_fsdp2_reduce_scatter_unused_params=unused_params,
+    )
+
+    with pytest.raises(AssertionError, match=error):
+        arguments_mod._validate_torch_fsdp2_expert_parallelism(args)
+
+
+def test_validate_torch_fsdp2_expert_parallelism_ignores_non_ep_launches(monkeypatch):
+    """Keep EP1 and non-FSDP argument parsing compatible with older PyTorch."""
+    monkeypatch.setattr(arguments_mod, "is_torch_min_version", lambda version: False)
+
+    arguments_mod._validate_torch_fsdp2_expert_parallelism(
+        SimpleNamespace(use_torch_fsdp2=True, expert_model_parallel_size=1)
+    )
+    arguments_mod._validate_torch_fsdp2_expert_parallelism(
+        SimpleNamespace(use_torch_fsdp2=False, expert_model_parallel_size=2)
+    )
+
+
 def test_validate_args_checks_partial_gradient_accumulation_prerequisites_first():
     """Fail on partial-mode misuse before unrelated validation fields are accessed."""
     args = SimpleNamespace(

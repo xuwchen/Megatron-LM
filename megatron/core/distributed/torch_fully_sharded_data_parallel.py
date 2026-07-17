@@ -15,6 +15,17 @@ try:
 except ImportError:
     HAVE_FSDP = False
 
+try:
+    from torch.distributed.fsdp._fully_shard._fsdp_common import (
+        FSDPMeshInfo,
+        HSDPMeshInfo,
+        ShardPlacementResult,
+    )
+
+    HAVE_FSDP_EXPERT_PARALLEL = True
+except ImportError:
+    HAVE_FSDP_EXPERT_PARALLEL = False
+
 from torch.distributed import ProcessGroup
 
 from megatron.core.fp8_utils import is_float8tensor
@@ -60,13 +71,15 @@ def _build_fsdp_wrap_plan(
     return forward_order, bottom_up_order
 
 
-def _configure_fsdp_sum_gradient_reduction(module: torch.nn.Module) -> None:
-    """Configure true SUM reduction without using BF16 NCCL PREMUL_SUM."""
+def _configure_fsdp_sum_gradient_reduction(
+    module: torch.nn.Module, divide_factor: float = 1.0
+) -> None:
+    """Configure SUM plus post-division without using BF16 NCCL PREMUL_SUM."""
     module.set_force_sum_reduction_for_comms(True)
     if setter := getattr(module, "set_gradient_divide_factor", None):
-        setter(1.0)
+        setter(divide_factor)
     else:
-        module.set_reduce_scatter_divide_factor(1.0)
+        module.set_reduce_scatter_divide_factor(divide_factor)
 
 
 def _resolve_fsdp_reshard_after_forward(
@@ -151,8 +164,10 @@ def _build_fsdp_device_mesh(
     process_group: ProcessGroup,
     pg_collection: Optional[ProcessGroupCollection],
     num_distributed_optimizer_instances: int,
+    *,
+    expert_parallel: bool = False,
 ) -> "DeviceMesh":
-    """Build and validate the FSDP2 data-parallel device mesh."""
+    """Build and validate a dense or routed-expert FSDP2 device mesh."""
     if num_distributed_optimizer_instances < 1:
         raise ValueError(
             "num_distributed_optimizer_instances must be at least 1, got "
@@ -162,15 +177,21 @@ def _build_fsdp_device_mesh(
         return DeviceMesh.from_group(process_group, device_type="cuda")
 
     if pg_collection is None:
-        raise ValueError(
-            "Torch FSDP2 HSDP requires pg_collection with dp_cp, intra_dp_cp, "
-            "and inter_dist_opt process groups."
+        group_names = (
+            "expt_dp, intra_expt_dp, and inter_dist_opt"
+            if expert_parallel
+            else "dp_cp, intra_dp_cp, and inter_dist_opt"
         )
-    shard_group = getattr(pg_collection, "intra_dp_cp", None)
+        raise ValueError(
+            f"Torch FSDP2 HSDP requires pg_collection with {group_names} process groups."
+        )
+    shard_group_name = "intra_expt_dp" if expert_parallel else "intra_dp_cp"
+    full_group_name = "expt_dp" if expert_parallel else "dp_cp"
+    shard_group = getattr(pg_collection, shard_group_name, None)
     replicate_group = getattr(pg_collection, "inter_dist_opt", None)
     if shard_group is None or replicate_group is None:
         raise ValueError(
-            "Torch FSDP2 HSDP requires both pg_collection.intra_dp_cp (shard) "
+            f"Torch FSDP2 HSDP requires both pg_collection.{shard_group_name} (shard) "
             "and pg_collection.inter_dist_opt (replicate)."
         )
 
@@ -188,17 +209,20 @@ def _build_fsdp_device_mesh(
         )
     if replicate_size * shard_size != len(full_ranks):
         raise ValueError(
-            "Torch FSDP2 HSDP topology does not cover the full dp_cp group: "
+            f"Torch FSDP2 HSDP topology does not cover the full {full_group_name} group: "
             f"replicate_size ({replicate_size}) * shard_size ({shard_size}) != "
-            f"dp_cp_size ({len(full_ranks)})."
+            f"{full_group_name}_size ({len(full_ranks)})."
         )
     if len(set(full_ranks)) != len(full_ranks):
-        raise ValueError(f"Torch FSDP2 HSDP dp_cp ranks must be unique, got {full_ranks}.")
+        raise ValueError(
+            f"Torch FSDP2 HSDP {full_group_name} ranks must be unique, got {full_ranks}."
+        )
 
     global_rank = torch.distributed.get_rank()
     if full_ranks.count(global_rank) != 1:
         raise ValueError(
-            f"Current rank {global_rank} must occur exactly once in dp_cp ranks {full_ranks}."
+            f"Current rank {global_rank} must occur exactly once in "
+            f"{full_group_name} ranks {full_ranks}."
         )
 
     rank_index = full_ranks.index(global_rank)
@@ -207,12 +231,14 @@ def _build_fsdp_device_mesh(
     expected_replicate_ranks = full_ranks[shard_index::shard_size]
     if shard_ranks != expected_shard_ranks:
         raise ValueError(
-            "Torch FSDP2 HSDP shard group does not match the current dp_cp mesh row: "
+            f"Torch FSDP2 HSDP shard group does not match the current "
+            f"{full_group_name} mesh row: "
             f"expected {expected_shard_ranks}, got {shard_ranks}."
         )
     if replicate_ranks != expected_replicate_ranks:
         raise ValueError(
-            "Torch FSDP2 HSDP replicate group does not match the current dp_cp mesh column: "
+            f"Torch FSDP2 HSDP replicate group does not match the current "
+            f"{full_group_name} mesh column: "
             f"expected {expected_replicate_ranks}, got {replicate_ranks}."
         )
 
@@ -225,6 +251,18 @@ def _build_fsdp_device_mesh(
         mesh=mesh,
         mesh_dim_names=("replicate", "shard"),
     )
+
+
+def _build_fsdp_mesh_info(device_mesh: "DeviceMesh", is_hsdp: bool):
+    """Build PyTorch's per-parameter mesh descriptor for routed experts."""
+    if not HAVE_FSDP_EXPERT_PARALLEL:
+        raise RuntimeError(
+            "Torch FSDP2 expert parallelism requires PyTorch >= 2.13 with "
+            "ShardPlacementResult and FSDPMeshInfo support."
+        )
+    if is_hsdp:
+        return HSDPMeshInfo(device_mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
+    return FSDPMeshInfo(device_mesh, shard_mesh_dim=0)
 
 
 class TorchFullyShardedDataParallel(_BaseDataParallel):
@@ -304,10 +342,47 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         )
         self.shard_process_group = pg_collection.intra_dp_cp if self.is_hsdp else self.process_group
         self.replicate_process_group = pg_collection.inter_dist_opt if self.is_hsdp else None
+        self.expert_parallel = config.expert_model_parallel_size > 1
+        self.expert_process_group = None
+        self.expert_device_mesh = None
+        shard_placement_fn = None
+        if self.expert_parallel:
+            if not is_torch_min_version("2.13.0") or not HAVE_FSDP_EXPERT_PARALLEL:
+                raise RuntimeError(
+                    "Torch FSDP2 expert parallelism requires PyTorch >= 2.13 with "
+                    "per-parameter mesh support."
+                )
+            if pg_collection is None:
+                raise ValueError(
+                    "Torch FSDP2 expert parallelism requires pg_collection with expt_dp."
+                )
+            self.expert_process_group = getattr(pg_collection, "expt_dp", None)
+            if self.expert_process_group is None:
+                raise ValueError("Torch FSDP2 expert parallelism requires pg_collection.expt_dp.")
+            if not getattr(ddp_config, "reduce_scatter_unused_params", False):
+                raise ValueError(
+                    "Torch FSDP2 expert parallelism requires "
+                    "reduce_scatter_unused_params=True for rank-divergent expert usage."
+                )
+            self.expert_device_mesh = _build_fsdp_device_mesh(
+                self.expert_process_group,
+                pg_collection,
+                self.num_distributed_optimizer_instances,
+                expert_parallel=True,
+            )
+            expert_mesh_info = _build_fsdp_mesh_info(self.expert_device_mesh, self.is_hsdp)
+
+            def shard_placement_fn(param: torch.nn.Parameter):
+                if not getattr(param, "allreduce", True):
+                    return ShardPlacementResult(placement=None, mesh_info=expert_mesh_info)
+                return None
+
         reshard_after_forward = _resolve_fsdp_reshard_after_forward(
             getattr(ddp_config, "reshard_after_forward", None)
         )
         kwargs = {"mesh": self.device_mesh, "reshard_after_forward": reshard_after_forward}
+        if shard_placement_fn is not None:
+            kwargs["shard_placement_fn"] = shard_placement_fn
 
         self.ddp_config = ddp_config
         self._no_sync_depth = 0
@@ -388,8 +463,28 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                     "PyTorch FSDP controls: " + ", ".join(missing_controls)
                 )
 
-        if config.calculate_per_token_loss:
-            fsdp_modules = [*bottom_up_order, self.module]
+        fsdp_modules = [*bottom_up_order, self.module]
+        if self.expert_parallel:
+            missing_controls = [
+                type(fsdp_module).__name__
+                for fsdp_module in fsdp_modules
+                if not callable(getattr(fsdp_module, "set_force_sum_reduction_for_comms", None))
+                or not (
+                    callable(getattr(fsdp_module, "set_gradient_divide_factor", None))
+                    or callable(getattr(fsdp_module, "set_reduce_scatter_divide_factor", None))
+                )
+            ]
+            if missing_controls:
+                raise RuntimeError(
+                    "Torch FSDP2 expert parallelism requires SUM and post-division "
+                    "controls on every FSDP module; missing on: " + ", ".join(missing_controls)
+                )
+            divide_factor = (
+                1.0 if config.calculate_per_token_loss else float(self.process_group.size())
+            )
+            for fsdp_module in fsdp_modules:
+                _configure_fsdp_sum_gradient_reduction(fsdp_module, divide_factor)
+        elif config.calculate_per_token_loss:
             if all(
                 getattr(fsdp_module, "set_force_sum_reduction_for_comms", None) is not None
                 for fsdp_module in fsdp_modules
