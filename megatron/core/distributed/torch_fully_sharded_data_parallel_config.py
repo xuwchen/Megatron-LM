@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Union
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 
@@ -10,12 +9,15 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 class TorchFullyShardedDataParallelConfig(DistributedDataParallelConfig):
     """Configuration for TorchFullyShardedDataParallel."""
 
-    reshard_after_forward: Union[bool, int] = True
+    reshard_after_forward: bool | int | None = None
     """
-    Controls the parameter behavior after forward.
+    Controls the parameter behavior after forward. ``None`` selects PyTorch's
+    automatic policy: reshard non-root modules and keep the root unsharded.
+    On PyTorch 2.6 and 2.7, which predate the explicit automatic policy, MCore
+    passes ``True`` to preserve their equivalent root-special-casing behavior.
 
     See PyTorch for complete documentation:
-    https://github.com/pytorch/pytorch/blob/ac8ddf115065106f038865389a07f2d0c9ed5e11/torch/distributed/fsdp/_fully_shard/_fully_shard.py#L97C31-L97C49 # pylint: disable=line-too-long 
+    https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html
     """
 
     reduce_scatter_unused_params: bool = False

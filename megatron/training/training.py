@@ -2323,7 +2323,7 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
     """Return an MCore DDPConfig from the argparse arguments."""
 
     if getattr(args, "use_torch_fsdp2", False):
-        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
+        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", None)
         reduce_scatter_unused_params = getattr(
             args, "torch_fsdp2_reduce_scatter_unused_params", False
         )
