@@ -78,6 +78,10 @@ def model_provider(
     )
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
+    # Vision modules use the runtime TP process group even though their
+    # sequence and context parallelism remain disabled. Keep the config's
+    # TP metadata consistent with that process group.
+    vision_config.tensor_model_parallel_size = language_config.tensor_model_parallel_size
 
     if getattr(args, "recompute_vision", False):
         vision_config.recompute_granularity = "full"
