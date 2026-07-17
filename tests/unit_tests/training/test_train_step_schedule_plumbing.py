@@ -107,15 +107,20 @@ def test_configure_torch_fsdp2_no_sync_rejects_mixed_wrappers(monkeypatch):
 
 
 @pytest.mark.parametrize("reduce_scatter_unused_params", [False, True])
-def test_get_megatron_ddp_config_forwards_torch_fsdp2_options(reduce_scatter_unused_params):
+@pytest.mark.parametrize("clone_output_views", [False, True])
+def test_get_megatron_ddp_config_forwards_torch_fsdp2_options(
+    reduce_scatter_unused_params, clone_output_views
+):
     """Forward all Torch FSDP2-specific CLI options into its config."""
     args = SimpleNamespace(
         use_torch_fsdp2=True,
         torch_fsdp2_reshard_after_forward=False,
         torch_fsdp2_reduce_scatter_unused_params=reduce_scatter_unused_params,
+        torch_fsdp2_clone_output_views=clone_output_views,
     )
 
     config = training_mod.get_megatron_ddp_config(args)
 
     assert config.reshard_after_forward is False
     assert config.reduce_scatter_unused_params is reduce_scatter_unused_params
+    assert config.clone_output_views is clone_output_views

@@ -2327,9 +2327,11 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         reduce_scatter_unused_params = getattr(
             args, "torch_fsdp2_reduce_scatter_unused_params", False
         )
+        clone_output_views = getattr(args, "torch_fsdp2_clone_output_views", False)
         return TorchFullyShardedDataParallelConfig(
             reshard_after_forward=reshard_after_forward,
             reduce_scatter_unused_params=reduce_scatter_unused_params,
+            clone_output_views=clone_output_views,
         )
     else:
         kwargs = {}
