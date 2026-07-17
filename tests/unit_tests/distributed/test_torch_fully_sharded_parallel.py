@@ -6,6 +6,7 @@ import megatron.core.distributed.torch_fully_sharded_data_parallel as torch_fsdp
 from megatron.core import parallel_state
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.torch_fully_sharded_data_parallel import (
     TorchFullyShardedDataParallel,
     _build_fsdp_wrap_plan,
@@ -197,6 +198,28 @@ def test_fsdp2_no_sync_supports_older_fsdp2_controls():
     assert fsdp_model._no_sync_depth == 0
 
 
+def test_fsdp2_scale_gradients_scales_shared_parameter_once():
+    """Scale tied gradients once and leave missing gradients untouched."""
+
+    class _SharedParameterModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            shared = torch.nn.Parameter(torch.ones(4))
+            self.weight = shared
+            self.tied_weight = shared
+            self.unused = torch.nn.Parameter(torch.ones(4))
+
+    module = _SharedParameterModule()
+    module.weight.grad = torch.full_like(module.weight, 4.0)
+    fsdp_model = object.__new__(TorchFullyShardedDataParallel)
+    object.__setattr__(fsdp_model, "module", module)
+
+    fsdp_model.scale_gradients(torch.tensor(0.25))
+
+    torch.testing.assert_close(module.weight.grad, torch.ones_like(module.weight))
+    assert module.unused.grad is None
+
+
 def test_fsdp2_wrap_plan_is_bottom_up_and_deduplicated():
     """Wrap nested modules once, excluding the root and preserving forward order."""
     model = _WrapRoot()
@@ -254,6 +277,73 @@ def test_fsdp2_constructor_uses_bottom_up_wrap_plan(monkeypatch, reshard_after_f
     assert prefetch_calls == [(model.parent, []), (model.parent.leaf, [model.parent])]
 
 
+@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+@pytest.mark.parametrize("force_sum_supported", [False, True])
+@pytest.mark.parametrize(
+    "setter_name", ["set_gradient_divide_factor", "set_reduce_scatter_divide_factor"]
+)
+def test_fsdp2_constructor_configures_per_token_reduction(
+    monkeypatch, calculate_per_token_loss, force_sum_supported, setter_name
+):
+    """Use true SUM when supported and compensate legacy AVG in per-token mode."""
+    model = _WrapRoot()
+    fake_mesh = object()
+
+    class _FakeProcessGroup:
+        @staticmethod
+        def size():
+            return 8
+
+    fake_process_group = _FakeProcessGroup()
+    shard_calls = []
+    divide_factor_calls = []
+    force_sum_calls = []
+
+    class _FakeDeviceMesh:
+        @staticmethod
+        def from_group(process_group, device_type):
+            assert process_group is fake_process_group
+            assert device_type == "cuda"
+            return fake_mesh
+
+    def fake_fully_shard(module, **kwargs):
+        shard_calls.append(module)
+        setattr(
+            module,
+            setter_name,
+            lambda factor, module=module: divide_factor_calls.append((module, factor)),
+        )
+        if force_sum_supported:
+            setattr(
+                module,
+                "set_force_sum_reduction_for_comms",
+                lambda force_sum, module=module: force_sum_calls.append((module, force_sum)),
+            )
+
+    monkeypatch.setattr(torch_fsdp2, "DeviceMesh", _FakeDeviceMesh)
+    monkeypatch.setattr(torch_fsdp2, "fully_shard", fake_fully_shard)
+
+    config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
+    config.calculate_per_token_loss = calculate_per_token_loss
+    ddp_config = DistributedDataParallelConfig()
+
+    fsdp_model = TorchFullyShardedDataParallel(
+        config, ddp_config, model, sub_modules_to_wrap=_WRAP_TYPES, process_group=fake_process_group
+    )
+
+    expected_modules = [model.parent.leaf, model.parent, model]
+    assert shard_calls == expected_modules
+    use_true_sum = calculate_per_token_loss and force_sum_supported
+    expected_divide_calls = [(module, 1.0) for module in expected_modules] if use_true_sum else []
+    expected_force_sum_calls = (
+        [(module, True) for module in expected_modules] if use_true_sum else []
+    )
+    expected_correction = 8.0 if calculate_per_token_loss and not force_sum_supported else 1.0
+    assert divide_factor_calls == expected_divide_calls
+    assert force_sum_calls == expected_force_sum_calls
+    assert fsdp_model._gradient_scale_correction == expected_correction
+
+
 def test_fsdp2_constructor_wraps_nested_modules(init_model_parallel):
     """Run forward and backward with real nested FSDP2 groups."""
     if not is_torch_min_version("2.6.0"):
@@ -282,8 +372,9 @@ def test_fsdp2_no_sync_accumulates_and_reduces_gradients(init_model_parallel):
     config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
     ddp_config = DistributedDataParallelConfig()
     reference_model = _NestedWrapRoot().cuda()
-    for param in reference_model.parameters():
-        torch.distributed.broadcast(param, src=0)
+    with torch.no_grad():
+        for param in reference_model.parameters():
+            torch.distributed.broadcast(param, src=0)
     model = _NestedWrapRoot().cuda()
     model.load_state_dict(reference_model.state_dict())
 
@@ -320,6 +411,86 @@ def test_fsdp2_no_sync_accumulates_and_reduces_gradients(init_model_parallel):
             torch.testing.assert_close(
                 fsdp_grad.full_tensor(), reference_param.grad, rtol=1e-5, atol=1e-6
             )
+
+
+@pytest.mark.parametrize("all_zero_tokens", [False, True])
+@pytest.mark.parametrize("model_dtype", [torch.float32, torch.bfloat16])
+def test_fsdp2_per_token_gradient_scaling_matches_global_reference(
+    init_model_parallel, all_zero_tokens, model_dtype
+):
+    """Normalize SUM-reduced FSDP2 gradients by the global valid-token count."""
+    if not is_torch_min_version("2.6.0"):
+        pytest.skip("FSDP2 is not supported on this version of PyTorch.")
+    if torch.distributed.get_world_size() != 8:
+        pytest.skip("This numerical test requires exactly 8 ranks.")
+
+    config = TransformerConfig(
+        num_layers=1, kv_channels=1, bf16=True, calculate_per_token_loss=True
+    )
+    ddp_config = DistributedDataParallelConfig(average_in_collective=False)
+    reference_model = _NestedWrapRoot().cuda().to(model_dtype)
+    with torch.no_grad():
+        for param in reference_model.parameters():
+            torch.distributed.broadcast(param, src=0)
+    model = _NestedWrapRoot().cuda().to(model_dtype)
+    model.load_state_dict(reference_model.state_dict())
+
+    fsdp_model = TorchFullyShardedDataParallel(
+        config, ddp_config, model, sub_modules_to_wrap={_WrapParent, _WrapLeaf, torch.nn.Linear}
+    )
+    group = fsdp_model.process_group
+    rank = torch.distributed.get_rank(group)
+    token_counts = [0, 0] if all_zero_tokens else [rank % 4, (3 * rank + 1) % 5]
+    token_ids = torch.arange(4, device="cuda")
+    base_inputs = torch.arange(32, dtype=torch.float32, device="cuda").view(4, 8)
+    microbatch_inputs = [
+        (base_inputs + 1 + rank * 0.125 + microbatch * 0.25) / 50 for microbatch in range(2)
+    ]
+    microbatch_inputs = [inputs.to(model_dtype) for inputs in microbatch_inputs]
+
+    def token_sum_loss(module, inputs, num_valid_tokens):
+        output = module(inputs)
+        valid_mask = (token_ids < num_valid_tokens).to(output.dtype)
+        return (output.square().sum(dim=-1) * valid_mask).sum()
+
+    fsdp_model.zero_grad(set_to_none=True)
+    reference_model.zero_grad(set_to_none=True)
+    with fsdp_model.no_sync():
+        token_sum_loss(fsdp_model, microbatch_inputs[0], token_counts[0]).backward()
+    token_sum_loss(fsdp_model, microbatch_inputs[1], token_counts[1]).backward()
+
+    for microbatch_input, token_count in zip(microbatch_inputs, token_counts):
+        token_sum_loss(reference_model, microbatch_input, token_count).backward()
+
+    local_num_tokens = torch.tensor(sum(token_counts), dtype=torch.int, device="cuda")
+    expected_num_tokens = local_num_tokens.clone()
+    torch.distributed.all_reduce(expected_num_tokens, group=group)
+
+    finalized_num_tokens = local_num_tokens.clone()
+    finalize_model_grads([fsdp_model], num_tokens=finalized_num_tokens)
+
+    assert torch.equal(finalized_num_tokens, expected_num_tokens)
+    assert expected_num_tokens.item() == (0 if all_zero_tokens else 29)
+
+    safe_num_tokens = torch.clamp(expected_num_tokens, min=1)
+    for param in reference_model.parameters():
+        assert param.grad is not None
+        torch.distributed.all_reduce(param.grad, group=group)
+        param.grad.div_(safe_num_tokens)
+
+    fsdp_params = dict(fsdp_model.module.named_parameters())
+    for name, reference_param in reference_model.named_parameters():
+        fsdp_grad = fsdp_params[name].grad
+        assert fsdp_grad is not None
+        actual_grad = fsdp_grad.full_tensor()
+        assert torch.isfinite(actual_grad).all()
+        # FSDP reduce-scatter and the reference all-reduce use different NCCL
+        # reduction trees, so allow a few BF16 ULPs after microbatch accumulation.
+        rtol = 2e-2 if model_dtype == torch.bfloat16 else 1e-5
+        atol = 1e-2 if model_dtype == torch.bfloat16 else 1e-6
+        torch.testing.assert_close(actual_grad, reference_param.grad, rtol=rtol, atol=atol)
+        if all_zero_tokens:
+            assert torch.count_nonzero(actual_grad) == 0
 
 
 def test_fsdp2_constructor(init_model_parallel):
