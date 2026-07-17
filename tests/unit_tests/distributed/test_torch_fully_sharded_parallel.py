@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.torch_fully_sharded_data_parallel import (
     TorchFullyShardedDataParallel,
@@ -46,6 +47,20 @@ def init_model_parallel():
     yield  # Run the actual test.
     Utils.destroy_model_parallel()
     unset_num_microbatches_calculator()
+
+
+@pytest.mark.parametrize("force_all_reduce", [False, True])
+def test_fsdp2_finish_grad_sync_accepts_force_all_reduce(monkeypatch, force_all_reduce):
+    """Test compatibility with finalize_model_grads' keyword argument."""
+    calls = []
+    monkeypatch.setattr(
+        _BaseDataParallel, "finish_grad_sync", lambda instance: calls.append(instance)
+    )
+    fsdp_model = object.__new__(TorchFullyShardedDataParallel)
+
+    fsdp_model.finish_grad_sync(force_all_reduce=force_all_reduce)
+
+    assert calls == [fsdp_model]
 
 
 def test_fsdp2_constructor(init_model_parallel):
