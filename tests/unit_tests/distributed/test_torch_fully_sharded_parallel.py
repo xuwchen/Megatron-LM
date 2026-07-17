@@ -76,6 +76,29 @@ class _WrapRoot(torch.nn.Module):
         self.shared_leaf = self.parent.leaf
 
 
+class _SyncControlSpy:
+    """Record calls to the FSDP2 gradient synchronization controls."""
+
+    def __init__(self):
+        self.calls = []
+
+    def set_is_last_backward(self, is_last_backward):
+        self.calls.append(("last_backward", is_last_backward))
+
+    def set_requires_gradient_sync(self, requires_gradient_sync, recurse):
+        self.calls.append(("gradient_sync", requires_gradient_sync, recurse))
+
+
+class _GradientSyncOnlySpy:
+    """Emulate an older FSDP2 root without set_is_last_backward."""
+
+    def __init__(self):
+        self.calls = []
+
+    def set_requires_gradient_sync(self, requires_gradient_sync, recurse):
+        self.calls.append(("gradient_sync", requires_gradient_sync, recurse))
+
+
 _WRAP_TYPES = {_WrapRoot, _WrapParent, _WrapLeaf, torch.nn.Linear}
 
 
@@ -106,6 +129,74 @@ def test_fsdp2_finish_grad_sync_accepts_force_all_reduce(monkeypatch, force_all_
     assert calls == [fsdp_model]
 
 
+@pytest.mark.parametrize("raise_in_context", [False, True])
+def test_fsdp2_no_sync_restores_control_flags(raise_in_context):
+    """Restore FSDP2 synchronization controls on normal and exceptional exits."""
+    root_module = _SyncControlSpy()
+    fsdp_model = object.__new__(TorchFullyShardedDataParallel)
+    object.__setattr__(fsdp_model, "module", root_module)
+    object.__setattr__(fsdp_model, "_no_sync_depth", 0)
+
+    if raise_in_context:
+        with pytest.raises(RuntimeError, match="microbatch failure"):
+            with fsdp_model.no_sync():
+                root_module.calls.append("body")
+                raise RuntimeError("microbatch failure")
+    else:
+        with fsdp_model.no_sync():
+            root_module.calls.append("body")
+
+    assert root_module.calls == [
+        ("last_backward", False),
+        ("gradient_sync", False, True),
+        "body",
+        ("gradient_sync", True, True),
+        ("last_backward", True),
+    ]
+    assert fsdp_model._no_sync_depth == 0
+
+
+def test_fsdp2_no_sync_is_reentrant():
+    """Keep synchronization disabled until the outermost no_sync context exits."""
+    root_module = _SyncControlSpy()
+    fsdp_model = object.__new__(TorchFullyShardedDataParallel)
+    object.__setattr__(fsdp_model, "module", root_module)
+    object.__setattr__(fsdp_model, "_no_sync_depth", 0)
+
+    with fsdp_model.no_sync():
+        root_module.calls.append("outer body")
+        with fsdp_model.no_sync():
+            root_module.calls.append("inner body")
+
+    assert root_module.calls == [
+        ("last_backward", False),
+        ("gradient_sync", False, True),
+        "outer body",
+        "inner body",
+        ("gradient_sync", True, True),
+        ("last_backward", True),
+    ]
+    assert fsdp_model._no_sync_depth == 0
+
+
+def test_fsdp2_no_sync_supports_older_fsdp2_controls():
+    """Fall back to the synchronization control available since FSDP2 debuted."""
+    root_module = _GradientSyncOnlySpy()
+    fsdp_model = object.__new__(TorchFullyShardedDataParallel)
+    object.__setattr__(fsdp_model, "module", root_module)
+    object.__setattr__(fsdp_model, "_no_sync_depth", 0)
+
+    with fsdp_model.no_sync():
+        root_module.calls.append("body")
+
+    assert root_module.calls == [
+        ("gradient_sync", False, True),
+        "body",
+        ("gradient_sync", True, True),
+    ]
+    assert fsdp_model._no_sync_depth == 0
+
+
 def test_fsdp2_wrap_plan_is_bottom_up_and_deduplicated():
     """Wrap nested modules once, excluding the root and preserving forward order."""
     model = _WrapRoot()
@@ -121,7 +212,7 @@ def test_fsdp2_wrap_plan_is_bottom_up_and_deduplicated():
 @pytest.mark.parametrize("reshard_after_forward", [True, False, 2])
 def test_fsdp2_constructor_uses_bottom_up_wrap_plan(monkeypatch, reshard_after_forward):
     """Wrap children before parents while preserving forward-order prefetching."""
-    if not is_torch_min_version("2.4.0"):
+    if not is_torch_min_version("2.6.0"):
         pytest.skip("FSDP2 is not supported on this version of PyTorch.")
 
     model = _WrapRoot()
@@ -165,7 +256,7 @@ def test_fsdp2_constructor_uses_bottom_up_wrap_plan(monkeypatch, reshard_after_f
 
 def test_fsdp2_constructor_wraps_nested_modules(init_model_parallel):
     """Run forward and backward with real nested FSDP2 groups."""
-    if not is_torch_min_version("2.4.0"):
+    if not is_torch_min_version("2.6.0"):
         pytest.skip("FSDP2 is not supported on this version of PyTorch.")
 
     config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
@@ -183,9 +274,57 @@ def test_fsdp2_constructor_wraps_nested_modules(init_model_parallel):
     assert fsdp_model.module.parent.leaf.__class__.__name__.startswith("FSDP")
 
 
+def test_fsdp2_no_sync_accumulates_and_reduces_gradients(init_model_parallel):
+    """Match two-microbatch FSDP2 accumulation against an all-reduced reference."""
+    if not is_torch_min_version("2.6.0"):
+        pytest.skip("FSDP2 is not supported on this version of PyTorch.")
+
+    config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
+    ddp_config = DistributedDataParallelConfig()
+    reference_model = _NestedWrapRoot().cuda()
+    for param in reference_model.parameters():
+        torch.distributed.broadcast(param, src=0)
+    model = _NestedWrapRoot().cuda()
+    model.load_state_dict(reference_model.state_dict())
+
+    fsdp_model = TorchFullyShardedDataParallel(
+        config, ddp_config, model, sub_modules_to_wrap={_WrapParent, _WrapLeaf, torch.nn.Linear}
+    )
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size(fsdp_model.process_group)
+
+    for accumulation_cycle in range(2):
+        fsdp_model.zero_grad(set_to_none=True)
+        reference_model.zero_grad(set_to_none=True)
+        microbatch_inputs = [
+            torch.full(
+                (2, 8), (rank + 1) * (microbatch + 1) * (accumulation_cycle + 1) / 10, device="cuda"
+            )
+            for microbatch in range(2)
+        ]
+
+        with fsdp_model.no_sync():
+            fsdp_model(microbatch_inputs[0]).square().mean().backward()
+        fsdp_model(microbatch_inputs[1]).square().mean().backward()
+
+        for microbatch_input in microbatch_inputs:
+            reference_model(microbatch_input).square().mean().backward()
+        for param in reference_model.parameters():
+            torch.distributed.all_reduce(param.grad, group=fsdp_model.process_group)
+            param.grad.div_(world_size)
+
+        fsdp_params = dict(fsdp_model.module.named_parameters())
+        for name, reference_param in reference_model.named_parameters():
+            fsdp_grad = fsdp_params[name].grad
+            assert fsdp_grad is not None
+            torch.testing.assert_close(
+                fsdp_grad.full_tensor(), reference_param.grad, rtol=1e-5, atol=1e-6
+            )
+
+
 def test_fsdp2_constructor(init_model_parallel):
     """Test the FSDP2 constructor."""
-    if not is_torch_min_version("2.4.0"):
+    if not is_torch_min_version("2.6.0"):
         pytest.skip("FSDP2 is not supported on this version of PyTorch.")
 
     # Create a dummy model and configs.
@@ -213,7 +352,7 @@ def test_fsdp2_constructor(init_model_parallel):
 
 def test_fsdp2_constructor_with_process_group(init_model_parallel):
     """Test the FSDP2 constructor with explicit process group parameter."""
-    if not is_torch_min_version("2.4.0"):
+    if not is_torch_min_version("2.6.0"):
         pytest.skip("FSDP2 is not supported on this version of PyTorch.")
 
     # Create a dummy model and configs.

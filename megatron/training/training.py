@@ -2187,7 +2187,7 @@ def get_model(
 
     if wrap_with_ddp:
         if args.use_torch_fsdp2:
-            assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
+            assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.6.0"
             DP = torch_FSDP
         elif args.use_megatron_fsdp:
             DP = megatron_FSDP
@@ -3637,6 +3637,23 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def _configure_torch_fsdp2_no_sync(model, config) -> bool:
+    """Configure FSDP2 gradient accumulation callbacks for the training schedule."""
+    if not (HAVE_FSDP2 and isinstance(model[0], torch_FSDP)):
+        return False
+
+    assert all(
+        isinstance(model_chunk, torch_FSDP) for model_chunk in model
+    ), 'Torch FSDP2 requires all model chunks to use the same data-parallel wrapper'
+    assert (
+        config.no_sync_func is None
+    ), 'Torch FSDP2 requires config.no_sync_func to be unset before training'
+
+    no_sync_funcs = [model_chunk.no_sync for model_chunk in model]
+    config.no_sync_func = no_sync_funcs[0] if len(no_sync_funcs) == 1 else no_sync_funcs
+    return True
+
+
 def train(
     forward_step_func,
     model,
@@ -3810,7 +3827,12 @@ def train(
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
-    if isinstance(model[0], (megatron_FSDP, DDP)) and args.overlap_grad_reduce:
+    torch_fsdp2_uses_no_sync = _configure_torch_fsdp2_no_sync(model, config)
+    if (
+        not torch_fsdp2_uses_no_sync
+        and isinstance(model[0], (megatron_FSDP, DDP))
+        and args.overlap_grad_reduce
+    ):
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'

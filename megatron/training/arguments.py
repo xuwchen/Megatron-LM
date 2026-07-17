@@ -1116,7 +1116,7 @@ def validate_args(args, defaults={}):
         ), 'Must use --overlap-param-gather with --overlap-grad-reduce'
 
     if args.use_torch_fsdp2:
-        assert is_torch_min_version("2.4.0"), 'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
+        assert is_torch_min_version("2.6.0"), 'FSDP2 requires PyTorch >= 2.6.0 with FSDP 2 support.'
         assert (
             args.pipeline_model_parallel_size == 1
         ), '--use-torch-fsdp2 is not supported with pipeline parallelism'
