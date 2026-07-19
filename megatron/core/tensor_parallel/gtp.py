@@ -12,6 +12,7 @@ so no core module uses GTP symbols without TE.
 
 try:
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        GTP_UNAVAILABLE_REASON,
         HAVE_TE,
         GTPChain,
         GTPEmbeddingWeight,
@@ -32,14 +33,16 @@ try:
     )
 
     HAVE_GTP = HAVE_TE
-except ImportError:
+except ImportError as _gtp_import_error:
     # Defensive fallback for any unexpected inner-import failure; consumers import
     # the other symbols lazily under an ``if HAVE_GTP:`` guard, so no stubs needed.
     HAVE_GTP = False
+    GTP_UNAVAILABLE_REASON = str(_gtp_import_error)
 
 
 __all__ = [
     "HAVE_GTP",
+    "GTP_UNAVAILABLE_REASON",
     "GTPChain",
     "GTPEmbeddingWeight",
     "attach_gtp_to_presharded_module",
