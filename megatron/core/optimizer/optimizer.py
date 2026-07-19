@@ -797,7 +797,7 @@ def _backfill_gtp_sharded_param_map(
          to the live FP8 param, so the model's OWN entry is reused here (identity first, tagged
          ``_debug_name`` second) -- preserving its full offsets (expert axes included) and
          replica_id.
-      2. Gathered+split factory params (Mamba ``in_proj``): the model entry exposes the *gathered*
+      2. Gathered+split factory params (Mamba/GDN ``in_proj``): the model entry exposes the *gathered*
          tensor, so nothing matches the per-shard GTP param. Rebuild the same per-shard
          ShardedTensor every other GTP_remat weight gets. The rebuild is NOT expert-parallel
          aware (no expert offsets/replica), so expert params must resolve via case 1; refuse
@@ -854,7 +854,7 @@ def _backfill_gtp_sharded_param_map(
             name = _strip_module_prefix(getattr(p, '_debug_name', '') or '')
             candidate = key_to_entry.get(name)
             # Reuse only a plain ShardedTensor with this shard's local shape; a factory
-            # (gathered data, e.g. Mamba in_proj) must take the per-shard rebuild below.
+            # (gathered data, e.g. Mamba/GDN in_proj) must take the per-shard rebuild below.
             if (
                 candidate is not None
                 and isinstance(candidate, ShardedTensor)
