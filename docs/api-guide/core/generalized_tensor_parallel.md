@@ -13,6 +13,8 @@ This is **ZeRO-3-on-the-weight, on top of TP**. Per-GPU weight (and optimizer/gr
 
 Core implementation: `megatron/core/tensor_parallel/generalized_tensor_parallelism.py`. The public surface is re-exported from `megatron/core/tensor_parallel/gtp.py`. Low-precision tensor primitives (FP8 / MXFP8 / NVFP4) remain in TransformerEngine and are imported by `generalized_tensor_parallelism.py`.
 
+GTP requires TransformerEngine 2.17.0.dev0 or newer **and** the distributed-weight hook registry. Two independent gates enforce this at import time: a version comparison (which `MEGATRON_GTP_FORCE_ENABLE=1` can bypass for custom builds) and a hook-registry validation that always runs — a new-enough version string alone cannot admit a build that lacks the hooks. When either gate fails, `HAVE_GTP` is `False` and `gtp.GTP_UNAVAILABLE_REASON` records why.
+
 **Outline:**
 
 1. [Features](#1-features)

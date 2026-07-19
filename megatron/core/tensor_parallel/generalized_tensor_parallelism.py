@@ -35,24 +35,75 @@ from enum import Enum
 from typing import Dict, List, Optional
 
 import torch
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
-_GTP_TE_MIN_VERSION = Version("2.17")
+_GTP_TE_MIN_VERSION = Version("2.17.0.dev0")
+
+# The distributed-weight hook protocol GTP requires from the TransformerEngine build. A version
+# check alone is insufficient: development branches can advance their version before merging the
+# companion GTP protocol, so the hooks are validated at import time as well.
+_GTP_TE_REQUIRED_HOOKS = (
+    "DistributedWeight",
+    "finalize_weight_grads",
+    "is_distributed_weight",
+    "materialize_weights_for_backward",
+    "materialize_weights_for_forward",
+)
+
+
+def _validate_te_gtp_protocol(distributed_weight_module):
+    """Raise ImportError unless the TE build exposes every required GTP hook."""
+    missing = [
+        hook for hook in _GTP_TE_REQUIRED_HOOKS if not hasattr(distributed_weight_module, hook)
+    ]
+    if missing:
+        raise ImportError(
+            "TransformerEngine build lacks required GTP distributed-weight hooks: "
+            + ", ".join(missing)
+        )
+
+
+def _validate_te_gtp_version(version_string):
+    """Raise ImportError unless the TE version parses and satisfies the GTP minimum.
+
+    ``MEGATRON_GTP_FORCE_ENABLE=1`` skips this gate entirely at the call site — custom builds
+    (including ones with non-PEP440 version tags) are then admitted on the strength of the
+    hook-registry validation alone.
+    """
+    try:
+        parsed = Version(str(version_string))
+    except InvalidVersion as bad_version:
+        raise ImportError(
+            f"Cannot parse TransformerEngine version {version_string!r}: {bad_version}. "
+            "Set MEGATRON_GTP_FORCE_ENABLE=1 to skip the version gate for custom builds "
+            "that carry the GTP hook registry."
+        ) from bad_version
+    if parsed < _GTP_TE_MIN_VERSION:
+        raise ImportError(
+            f"megatron.core.tensor_parallel.gtp requires TransformerEngine "
+            f">= {_GTP_TE_MIN_VERSION} (found {parsed}). Set MEGATRON_GTP_FORCE_ENABLE=1 "
+            "to skip the version gate for custom builds that carry the GTP hook registry."
+        )
+
+
+# Why GTP was disabled (version gate or hook validation); surfaced via gtp.py for diagnostics
+# and by configure_gtp_remat_from_recipe when a GTP run starts without a usable TE.
+GTP_UNAVAILABLE_REASON: Optional[str] = None
 
 try:
     import transformer_engine as te  # noqa: F401
 
-    _te_version = Version(te.__version__)
-    if _te_version < _GTP_TE_MIN_VERSION and not os.environ.get("MEGATRON_GTP_FORCE_ENABLE"):
-        raise ImportError(
-            f"megatron.core.tensor_parallel.gtp requires TransformerEngine "
-            f">= {_GTP_TE_MIN_VERSION} (found {_te_version}). Set MEGATRON_GTP_FORCE_ENABLE=1 "
-            "to bypass this check when using a custom TE build with the GTP hook registry."
-        )
+    if not os.environ.get("MEGATRON_GTP_FORCE_ENABLE"):
+        _validate_te_gtp_version(getattr(te, "__version__", None))
+
+    # Never bypassed (not even by MEGATRON_GTP_FORCE_ENABLE): the hooks are what GTP calls.
+    from transformer_engine.pytorch import distributed_weight as _te_distributed_weight
+
+    _validate_te_gtp_protocol(_te_distributed_weight)
 
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.constants import (
@@ -76,11 +127,15 @@ try:
     )
 
     HAVE_TE = True
-except (ImportError, ModuleNotFoundError):
+except (ImportError, ModuleNotFoundError) as _te_gtp_import_error:
     # TE unavailable/too old -> stub the TE-backed names so this module still imports,
     # and flag GTP unusable via HAVE_TE (gtp.py surfaces this as HAVE_GTP=False). No
     # GTP path runs without TE. The `annotations` future-import keeps the lone
     # module-level TE reference (a dataclass field annotation) from being evaluated.
+    # Keep the reason (which hook/version failed) instead of swallowing the diagnostic.
+    GTP_UNAVAILABLE_REASON = str(_te_gtp_import_error)
+    logger.debug("GTP disabled: %s", GTP_UNAVAILABLE_REASON)
+
     from unittest.mock import MagicMock
 
     te = tex = MagicMock()
@@ -350,6 +405,14 @@ def configure_gtp_remat_from_recipe(
     Configure GTP weight-remat (padding + loss reduction) from the quantization recipe.
     Must be called once BEFORE model construction.
     """
+    # Callers reach this only when GTP is requested (is_gtp_remat_active), so a missing/
+    # incompatible TE must fail HERE with the recorded reason — otherwise the run dies later
+    # inside stubbed TE symbols with an unrelated-looking error.
+    if not HAVE_TE:
+        raise RuntimeError(
+            "GTP weight-remat requested but TransformerEngine support is unavailable: "
+            f"{GTP_UNAVAILABLE_REASON}"
+        )
     # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
     # check_param_states=False: GTP buffer reuse (notably under CUDA-graph capture) trips the
     # param-state debug asserts, so keep them off for GTP runs.
