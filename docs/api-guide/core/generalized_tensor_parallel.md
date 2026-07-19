@@ -277,6 +277,13 @@ TransformerEngine owns the linear primitives (`Linear` / `LayerNormLinear` / `La
 **TE construction is fully GTP-agnostic — TE takes no GTP argument and carries no GTP construction hooks.** Mcore builds the plain TE module with an already-sharded `out_features` (`_gtp_pre_init`), so TE's `reset_parameters` initializes exactly this rank's shard, and all GTP wiring is attached *after* construction (`extensions/transformer_engine.py:_gtp_attach_post_init`). The two are bridged by exactly two things:
 
 1. **Post-init attach only.** `_gtp_attach_post_init` stamps `module.gtp_remat_size` (the forward/backward all-gather gate that TE's `_Linear` reads) and attaches the `GTPShardedParam` scheduling surface (`all_gather_and_prefetch` etc.) onto the weight. TE itself never slices, gathers, or even names GTP.
+   Because the reduced constructor width also sizes TE's bias, the same post-init path restores
+   each bias to its logical TP-local width, preserving the Parameter object, its TE metadata,
+   and TE's zero initialization; biases remain ordinary GTP-replicated parameters while the
+   weight stays sharded end to end. Bias-disabled TE modules can expose a zero-length Tensor
+   placeholder; post-init checks `use_bias` and leaves that non-parameter object untouched.
+   Indexed grouped biases (`bias0..N`) restore the same way; TE's special `single_grouped_bias`
+   storage and `parameters_split` bias layouts are rejected explicitly.
 2. The `_register_gtp_side_streams` / drain calls that synchronize TE's GEMM kernels with the side stream that owns the AG/RS NCCL ops.
 
 **One init path, all precisions.** Because `out_features` is pre-sharded, plain TE builds this rank's shard directly — a **native `MXFP8Tensor`** (`mxfp8` + `--fp8-param-gather`) or **native `NVFP4Tensor`** (`--fp4-param-gather`) under `fp8_model_init`, or a plain **BF16** shard otherwise — with **no full weight ever materialized** in any case. `_gtp_attach_post_init` then, via `attach_gtp_to_presharded_module`: for a native quantized shard, reclasses it in place to a cached `GTP_<QuantTensorClass>` subclass (keeps `is_float8tensor` / `is_nvfp4tensor(param)` True → buffer-resident, distributed-optimizer quantized path); for BF16, re-registers the shard as a `GTPShardedParam` (no slice — it is already shard-sized). The optimizer then maintains the shard end-to-end and the forward all-gathers it with **no per-microbatch re-quantize** (see §1.3).
