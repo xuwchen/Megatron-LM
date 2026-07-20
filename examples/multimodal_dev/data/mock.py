@@ -26,6 +26,7 @@ class MockQwen35VLDataset(Dataset):
         seq_length: Total sequence length (text + image tokens).
         image_seq_length: Number of image tokens per sample.
         vocab_size: Vocabulary size for random text tokens.
+        random_seed: Base seed combined with the sample index for deterministic data.
         image_token_id: Token ID for image placeholders.
         video_token_id: Token ID for video placeholders.
         vision_start_token_id: Token ID marking start of a vision region.
@@ -41,6 +42,7 @@ class MockQwen35VLDataset(Dataset):
         seq_length: int = 1024,
         image_seq_length: int = 256,
         vocab_size: int = 248320,
+        random_seed: int = 1234,
         image_token_id: int = QWEN35_VL_IMAGE_TOKEN_ID,
         video_token_id: int = QWEN35_VL_VIDEO_TOKEN_ID,
         vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
@@ -52,6 +54,7 @@ class MockQwen35VLDataset(Dataset):
         self.num_samples = num_samples
         self.seq_length = seq_length
         self.vocab_size = vocab_size
+        self.random_seed = random_seed
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
@@ -66,46 +69,36 @@ class MockQwen35VLDataset(Dataset):
         self.grid_thw = torch.tensor([[t_patches, h_patches, w_patches]])
 
         self.num_merged_tokens = (
-            t_patches
-            * (h_patches // spatial_merge_size)
-            * (w_patches // spatial_merge_size)
+            t_patches * (h_patches // spatial_merge_size) * (w_patches // spatial_merge_size)
         )
-        self.image_seq_length = min(
-            image_seq_length, self.num_merged_tokens,
-        )
+        self.image_seq_length = min(image_seq_length, self.num_merged_tokens)
         self.total_patches = t_patches * h_patches * w_patches
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
+        generator = torch.Generator()
+        generator.manual_seed((self.random_seed + int(idx)) % 2**63)
         # Reserve 1 slot for the vision_start sentinel before image tokens.
         text_length = self.seq_length - self.image_seq_length - 1
         text_tokens = torch.randint(
-            1, self.vocab_size, (text_length,), dtype=torch.long,
+            1, self.vocab_size, (text_length,), dtype=torch.long, generator=generator
         )
-        special_ids = {
-            self.image_token_id,
-            self.video_token_id,
-            self.vision_start_token_id,
-        }
+        special_ids = {self.image_token_id, self.video_token_id, self.vision_start_token_id}
         for sid in special_ids:
             text_tokens[text_tokens == sid] = 1
 
         prefix_len = text_length // 2
         suffix_len = text_length - prefix_len
-        input_ids = torch.cat([
-            text_tokens[:prefix_len],
-            torch.tensor(
-                [self.vision_start_token_id], dtype=torch.long,
-            ),
-            torch.full(
-                (self.image_seq_length,),
-                self.image_token_id,
-                dtype=torch.long,
-            ),
-            text_tokens[prefix_len: prefix_len + suffix_len],
-        ])
+        input_ids = torch.cat(
+            [
+                text_tokens[:prefix_len],
+                torch.tensor([self.vision_start_token_id], dtype=torch.long),
+                torch.full((self.image_seq_length,), self.image_token_id, dtype=torch.long),
+                text_tokens[prefix_len : prefix_len + suffix_len],
+            ]
+        )
 
         labels = input_ids.clone()
         labels[:-1] = input_ids[1:]
@@ -114,13 +107,8 @@ class MockQwen35VLDataset(Dataset):
         loss_mask = (input_ids != self.image_token_id).float()
         loss_mask[-1] = 0
 
-        pixel_dim = (
-            3
-            * self.temporal_patch_size
-            * self.patch_size
-            * self.patch_size
-        )
-        pixel_values = torch.randn(self.total_patches, pixel_dim)
+        pixel_dim = 3 * self.temporal_patch_size * self.patch_size * self.patch_size
+        pixel_values = torch.randn(self.total_patches, pixel_dim, generator=generator)
 
         image_grid_thw = self.grid_thw.clone()
 
@@ -139,9 +127,7 @@ class MockQwen35VLDataset(Dataset):
             "labels": labels,
             "loss_mask": loss_mask,
             "cu_seqlens": torch.tensor([0, self.seq_length], dtype=torch.int32),
-            "cu_seqlens_padded": torch.tensor(
-                [0, self.seq_length], dtype=torch.int32,
-            ),
+            "cu_seqlens_padded": torch.tensor([0, self.seq_length], dtype=torch.int32),
             "max_seqlen": torch.tensor(self.seq_length, dtype=torch.int32),
             "position_ids": position_ids,
             "pixel_values": pixel_values,
@@ -177,16 +163,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         vocab_size=getattr(args, "padded_vocab_size", 248320),
         image_token_id=getattr(args, "image_token_id", 248056),
         image_size=getattr(args, "image_size", 224),
+        random_seed=getattr(args, "seed", 1234),
     )
 
-    train_ds = MockQwen35VLDataset(
-        num_samples=train_val_test_num_samples[0], **kwargs,
-    )
-    val_ds = MockQwen35VLDataset(
-        num_samples=train_val_test_num_samples[1], **kwargs,
-    )
-    test_ds = MockQwen35VLDataset(
-        num_samples=train_val_test_num_samples[2], **kwargs,
-    )
+    train_ds = MockQwen35VLDataset(num_samples=train_val_test_num_samples[0], **kwargs)
+    val_ds = MockQwen35VLDataset(num_samples=train_val_test_num_samples[1], **kwargs)
+    test_ds = MockQwen35VLDataset(num_samples=train_val_test_num_samples[2], **kwargs)
 
     return train_ds, val_ds, test_ds
