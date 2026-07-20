@@ -21,12 +21,25 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 def _apply_rope_fp32(
-    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    mla_rotary_interleaved=None,
+    inverse=False,
+    mla_output_remove_interleaving=False,
+    max_seqlen=None,
 ):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
 
     Mirrors ``Qwen3VLSelfAttention.apply_rotary_pos_emb_absolute`` in Megatron-Bridge
     with ``apply_rotary_pos_emb_in_fp32=True``.
+
+    The MLA/inverse/de-interleaving options are accepted explicitly and forwarded so
+    that callers cannot silently lose them; ``mla_rotary_interleaved=None`` defers to
+    the model config, which is what ``apply_rotary_pos_emb`` itself does.
     """
     from megatron.core.models.common.embeddings import rope_utils
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
@@ -38,6 +51,11 @@ def _apply_rope_fp32(
         and getattr(config, "mrope_section", None) is not None
         and getattr(config, "rotary_interleaved", False) is False
         and getattr(config, "multi_latent_attention", False) is False
+        # The fused mRoPE kernel implements none of these options, so it must be
+        # skipped whenever a caller asks for them instead of ignoring them.
+        and not mla_rotary_interleaved
+        and inverse is False
+        and mla_output_remove_interleaving is False
         and mscale == 1.0
         and t.dim() == 3
         and freqs.dim() == 4
@@ -75,14 +93,25 @@ def _apply_rope_fp32(
         cu_seqlens=cu_seqlens,
         mscale=mscale,
         cp_group=cp_group,
-        mla_rotary_interleaved=getattr(config, 'multi_latent_attention', False),
+        mla_rotary_interleaved=mla_rotary_interleaved,
+        inverse=inverse,
+        mla_output_remove_interleaving=mla_output_remove_interleaving,
         max_seqlen=max_seqlen,
     )
     return out.to(orig_dtype)
 
 
 def _apply_rope_fp32_no_cp(
-    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    mla_rotary_interleaved=None,
+    inverse=False,
+    mla_output_remove_interleaving=False,
+    max_seqlen=None,
 ):
     """Same as ``_apply_rope_fp32`` but forces CP-size=1.
 
@@ -90,6 +119,9 @@ def _apply_rope_fp32_no_cp(
     images.  When the language model uses CP>1, the global CP group would
     incorrectly split the vision seqlens.  This wrapper substitutes a
     trivial group so the vision RoPE sees the full packed sequence.
+
+    The caller's ``cp_group`` is deliberately discarded; every other option is
+    forwarded unchanged.
     """
     range_name = "qwen35_vl.vision_encoder.rope_apply"
     nvtx_range_push(range_name)
@@ -101,6 +133,9 @@ def _apply_rope_fp32_no_cp(
             cu_seqlens,
             mscale,
             cp_group=_NO_CP_GROUP,
+            mla_rotary_interleaved=mla_rotary_interleaved,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
             max_seqlen=max_seqlen,
         )
     finally:
