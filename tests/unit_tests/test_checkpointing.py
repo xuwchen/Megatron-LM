@@ -23,6 +23,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _validate_torch_fsdp2_hsdp_checkpoint_format,
     get_checkpoint_tracker_filename,
     load_checkpoint,
     read_metadata,
@@ -242,6 +243,49 @@ def init_model_parallel():
     yield  # Run the actual test.
     Utils.destroy_model_parallel()
     unset_num_microbatches_calculator()
+
+
+def test_save_checkpoint_rejects_torch_fsdp2_hsdp_torch_dist(create_args):
+    """Fail before save-side effects can write an invalid 1D shard mapping."""
+    args = create_args
+    args.use_torch_fsdp2 = True
+    args.num_distributed_optimizer_instances = 2
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    set_args(args)
+
+    with mock.patch(
+        "megatron.training.checkpointing.on_save_checkpoint_start",
+        side_effect=AssertionError("save side effects must not start"),
+    ):
+        with pytest.raises(RuntimeError, match="use --ckpt-format torch_dcp"):
+            save_checkpoint(0, [], None, None, 0)
+
+
+def test_load_checkpoint_rejects_detected_torch_fsdp2_hsdp_torch_dist(create_ckpt_load_args):
+    """Apply the HSDP guard to the detected on-disk format, not only the CLI."""
+    args = create_ckpt_load_args
+    args.use_torch_fsdp2 = True
+    args.num_distributed_optimizer_instances = 2
+    args.ckpt_format = "torch_dist"
+    args.load = "unused"
+    args.pretrained_checkpoint = None
+    set_args(args)
+    model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(None, None, False, CheckpointType.GLOBAL),
+    ):
+        with pytest.raises(RuntimeError, match="use --ckpt-format torch_dcp"):
+            load_checkpoint([model], None, None)
+
+
+def test_checkpoint_format_guard_allows_torch_dcp_for_torch_fsdp2_hsdp():
+    """Do not reject a DCP checkpoint when the CLI requested auto-detection."""
+    args = SimpleNamespace(use_torch_fsdp2=True, num_distributed_optimizer_instances=2)
+
+    _validate_torch_fsdp2_hsdp_checkpoint_format(args, "torch_dcp")
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch_dcp"])

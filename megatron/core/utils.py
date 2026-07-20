@@ -1198,9 +1198,27 @@ def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
 def get_data_parallel_group_if_dtensor(
     tensor: Union[torch.Tensor, "DTensor"], data_parallel_group: "ProcessGroup" = None
 ) -> Optional["ProcessGroup"]:
-    """Gets the data parallel group of the given tensor if it is a DTensor."""
+    """Get the sharding process group of a DTensor used for norm reduction.
+
+    A 2D HSDP DTensor is replicated on one mesh dimension and sharded on the
+    other. Norms must only reduce across the sharding dimension; reducing over
+    the replicate dimension would count the same parameter shard more than once.
+    """
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        current_group = tensor.device_mesh.get_group()
+        if tensor.device_mesh.ndim == 1:
+            current_group = tensor.device_mesh.get_group()
+        else:
+            shard_mesh_dims = [
+                mesh_dim
+                for mesh_dim, placement in enumerate(tensor.placements)
+                if isinstance(placement, Shard)
+            ]
+            if len(shard_mesh_dims) != 1:
+                raise ValueError(
+                    "Expected exactly one sharded mesh dimension for DTensor norm "
+                    f"reduction, got placements {tensor.placements}."
+                )
+            current_group = tensor.device_mesh.get_group(shard_mesh_dims[0])
         assert data_parallel_group is None or current_group == data_parallel_group
         return current_group
     return None

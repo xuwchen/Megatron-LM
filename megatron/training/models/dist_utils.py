@@ -337,9 +337,7 @@ def _ddp_wrap(
     ddp_stream = torch.cuda.Stream()
     ddp_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(ddp_stream):
-        dp_init_kwargs = {}
-        if not use_torch_fsdp2:
-            dp_init_kwargs["pg_collection"] = pg_collection
+        dp_init_kwargs = {"pg_collection": pg_collection}
 
         wrapped_model = []
         for model_chunk_idx, model_chunk in enumerate(model):
