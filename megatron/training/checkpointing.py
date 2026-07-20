@@ -477,18 +477,11 @@ def _validate_torch_fsdp2_checkpoint_format(args, ckpt_format: Optional[str]) ->
     """Reject checkpoint formats that cannot represent the active FSDP2 meshes."""
     if not getattr(args, "use_torch_fsdp2", False):
         return
-    if getattr(args, "expert_model_parallel_size", 1) > 1 and ckpt_format in {
-        "torch_dist",
-        "torch_dcp",
-    }:
+    if getattr(args, "expert_model_parallel_size", 1) > 1 and ckpt_format == "torch_dcp":
         raise RuntimeError(
             f"Torch FSDP2 expert-parallel checkpointing with {ckpt_format} is not "
-            "supported yet; saving and loading require a global-expert-aware state mapping."
-        )
-    if getattr(args, "num_distributed_optimizer_instances", 1) > 1 and ckpt_format == "torch_dist":
-        raise RuntimeError(
-            "Torch FSDP2 HSDP checkpointing with torch_dist is not supported yet; "
-            "use --ckpt-format torch_dcp."
+            "supported because raw model FQNs and optimizer parameter IDs are rank-local; "
+            "use --ckpt-format torch_dist for global-expert-aware checkpointing."
         )
 
 
@@ -2046,9 +2039,10 @@ def load_checkpoint(
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
         parameters and buffers in model.
-    skip_load_to_model_and_opt (bool): whether to call `load_state_dict`
-        for :attr:`model` and :attr:`optimizer`. In case of running FSDP2 with mcore distributed
-        checkpointing, the tensors are already loaded in-place by `_load_base_checkpoint`.
+    skip_load_to_model_and_opt (bool): whether to skip full `load_state_dict`
+        calls for :attr:`model` and :attr:`optimizer`. When running FSDP2 with MCore
+        distributed checkpointing, tensors are already loaded in-place by
+        `_load_base_checkpoint`; optimizer common state is finalized separately.
     dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
     dp_group: Data parallel group (default: None, falls back to mpu API)
     expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
@@ -2402,12 +2396,11 @@ def load_checkpoint(
                     os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt"
                 )
                 optimizer.load_state_dict_from_file(optim_checkpoint_name)
-            elif (
-                not skip_load_to_model_and_opt
-                and optimizer is not None
-                and not optimizer.is_stub_optimizer
-            ):
-                optimizer.load_state_dict(state_dict['optimizer'])
+            elif optimizer is not None and not optimizer.is_stub_optimizer:
+                if skip_load_to_model_and_opt:
+                    optimizer.load_common_state_dict(state_dict['optimizer'])
+                else:
+                    optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
