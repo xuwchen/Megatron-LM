@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from unittest.mock import patch
@@ -428,11 +428,7 @@ def test_float16_optimizer_load_common_state_dict_preserves_live_tensors():
     exp_avg = torch.full_like(param, 2.0)
     exp_avg_sq = torch.full_like(param, 3.0)
     step = torch.tensor(1.0)
-    inner_optimizer.state[param] = {
-        'step': step,
-        'exp_avg': exp_avg,
-        'exp_avg_sq': exp_avg_sq,
-    }
+    inner_optimizer.state[param] = {'step': step, 'exp_avg': exp_avg, 'exp_avg_sq': exp_avg_sq}
     tensor_metadata = torch.tensor(0.1)
     inner_optimizer.param_groups[0]['tensor_metadata'] = tensor_metadata
 
@@ -450,18 +446,10 @@ def test_float16_optimizer_load_common_state_dict_preserves_live_tensors():
 
     loaded_group = dict(inner_optimizer.param_groups[0])
     loaded_group.update(
-        {
-            'params': [123],
-            'lr': 0.25,
-            'step': 9,
-            'tensor_metadata': torch.tensor(0.25),
-        }
+        {'params': [123], 'lr': 0.25, 'step': 9, 'tensor_metadata': torch.tensor(0.25)}
     )
     loaded_state = {
-        'optimizer': {
-            'state': {'common_step': torch.tensor(9.0)},
-            'param_groups': [loaded_group],
-        },
+        'optimizer': {'state': {'common_step': torch.tensor(9.0)}, 'param_groups': [loaded_group]},
         'grad_scaler': {'scale': 128.0},
         'fp32_from_fp16_params': [[torch.full_like(param, 99.0)]],
     }
@@ -507,6 +495,117 @@ def test_chained_optimizer_load_common_state_dict_delegates_in_key_order():
 
     assert optimizers[0].loaded_states == [state_0]
     assert optimizers[1].loaded_states == [state_1]
+
+
+def _make_common_group(*, is_expert_parallel, lr=0.25, step=7, params=None):
+    group = {
+        'wd_mult': 1.0,
+        'lr_mult': 1.0,
+        'is_expert_parallel': is_expert_parallel,
+        'is_decoupled_lr': False,
+        'lr': lr,
+        'betas': (0.9, 0.95),
+        'step': step,
+    }
+    if params is not None:
+        group['params'] = params
+    return group
+
+
+class _RecordingCommonOptimizer:
+    config = None
+    model_chunks = []
+    is_stub_optimizer = False
+
+    def __init__(self, *, is_expert_parallel):
+        self.optimizer = self
+        self.param = nn.Parameter(torch.ones(1))
+        self.param_groups = [
+            _make_common_group(
+                is_expert_parallel=is_expert_parallel, lr=0.01, step=0, params=[self.param]
+            )
+        ]
+        self.loaded_states = []
+
+    def load_common_state_dict(self, state_dict):
+        self.loaded_states.append(state_dict)
+
+
+def _make_common_child(*, is_expert_parallel, lr=0.25):
+    return {
+        'optimizer': {
+            'state': {'common_step': torch.tensor(7.0)},
+            'param_groups': [_make_common_group(is_expert_parallel=is_expert_parallel, lr=lr)],
+        },
+        'grad_scaler': {'scale': 128.0},
+    }
+
+
+def test_chained_optimizer_load_common_state_dict_collapses_source_children():
+    """EP2 dense/expert common metadata is projected onto one EP1 child."""
+    destination = _RecordingCommonOptimizer(is_expert_parallel=False)
+    mixed_dcp_state = {
+        0: _make_common_child(is_expert_parallel=False),
+        1: _make_common_child(is_expert_parallel=True),
+        'optimizer': {'param_groups': [{'params': [123]}]},
+    }
+
+    ChainedOptimizer([destination]).load_common_state_dict(mixed_dcp_state)
+
+    assert len(destination.loaded_states) == 1
+    loaded_state = destination.loaded_states[0]
+    loaded_group = loaded_state['optimizer']['param_groups'][0]
+    assert loaded_group['params'] is destination.param_groups[0]['params']
+    assert loaded_group['is_expert_parallel'] is False
+    assert loaded_group['lr'] == 0.25
+    assert loaded_group['step'] == 7
+    torch.testing.assert_close(loaded_state['optimizer']['state']['common_step'], torch.tensor(7.0))
+    assert loaded_state['grad_scaler'] == {'scale': 128.0}
+
+
+def test_chained_optimizer_load_common_state_dict_splits_source_child():
+    """EP1 common metadata is duplicated across EP2 dense/expert children."""
+    dense_destination = _RecordingCommonOptimizer(is_expert_parallel=False)
+    expert_destination = _RecordingCommonOptimizer(is_expert_parallel=True)
+    mixed_dcp_state = _make_common_child(is_expert_parallel=False)
+    mixed_dcp_state.update(
+        {
+            0: {'optimizer': {'param_groups': [{'params': [123]}]}},
+            1: {'optimizer': {'param_groups': [{'params': [456]}]}},
+        }
+    )
+
+    ChainedOptimizer([dense_destination, expert_destination]).load_common_state_dict(
+        mixed_dcp_state
+    )
+
+    for destination, expected_expert_flag in (
+        (dense_destination, False),
+        (expert_destination, True),
+    ):
+        assert len(destination.loaded_states) == 1
+        loaded_state = destination.loaded_states[0]
+        loaded_group = loaded_state['optimizer']['param_groups'][0]
+        assert loaded_group['params'] is destination.param_groups[0]['params']
+        assert loaded_group['is_expert_parallel'] is expected_expert_flag
+        assert loaded_group['lr'] == 0.25
+        assert loaded_group['step'] == 7
+        torch.testing.assert_close(
+            loaded_state['optimizer']['state']['common_step'], torch.tensor(7.0)
+        )
+        assert loaded_state['grad_scaler'] == {'scale': 128.0}
+
+
+def test_chained_optimizer_load_common_state_dict_rejects_lossy_collapse():
+    """Dense/expert scheduler metadata must agree before EP2 can collapse to EP1."""
+    destination = _RecordingCommonOptimizer(is_expert_parallel=False)
+    source_state = {
+        0: _make_common_child(is_expert_parallel=False, lr=0.25),
+        1: _make_common_child(is_expert_parallel=True, lr=0.5),
+    }
+
+    with pytest.raises(RuntimeError, match="Conflicting fields: .*'lr'"):
+        ChainedOptimizer([destination]).load_common_state_dict(source_state)
 
 
 def test_chained_optimizer_get_parameters():

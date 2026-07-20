@@ -43,7 +43,9 @@ class _TinyDenseExpertModel(MegatronModule):
             ]
         )
         for expert_weight in self.local_experts:
-            expert_weight.allreduce = False
+            # Match real MoE parameter grouping: with EP1 experts share the dense
+            # optimizer, while EP>1 places them in a separate expert optimizer.
+            expert_weight.allreduce = self.ep_group.size() == 1
 
         first_global_expert = self.ep_group.rank() * num_local_experts
         with torch.no_grad():
@@ -51,9 +53,7 @@ class _TinyDenseExpertModel(MegatronModule):
             self.dense_weight.copy_((dense_values + init_shift) / 100)
             for local_idx, expert_weight in enumerate(self.local_experts):
                 global_idx = first_global_expert + local_idx
-                expert_weight.copy_(
-                    (dense_values + 64 * (global_idx + 1) + init_shift) / 100
-                )
+                expert_weight.copy_((dense_values + 64 * (global_idx + 1) + init_shift) / 100)
 
     def forward(self, inputs):
         output = inputs @ self.dense_weight
@@ -82,36 +82,25 @@ class _TinyDenseExpertModel(MegatronModule):
                 *sharded_offsets,
                 (len(sharded_offsets), global_idx, self.num_global_experts),
             )
-            state_dict[f"{prefix}local_experts.{local_idx}"] = (
-                make_sharded_tensor_for_checkpoint(
-                    expert_weight,
-                    f"{prefix}experts.weight",
-                    prepend_offsets=expert_offsets,
-                    tp_group=self.tp_group,
-                    dp_cp_group=metadata["dp_cp_group"],
-                )
+            state_dict[f"{prefix}local_experts.{local_idx}"] = make_sharded_tensor_for_checkpoint(
+                expert_weight,
+                f"{prefix}experts.weight",
+                prepend_offsets=expert_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata["dp_cp_group"],
             )
         return state_dict
 
 
 def _build_model_and_optimizer(expert_parallel_size, *, init_shift):
     Utils.initialize_model_parallel(
-        1,
-        1,
-        expert_model_parallel_size=expert_parallel_size,
-        num_distributed_optimizer_instances=2,
+        1, 1, expert_model_parallel_size=expert_parallel_size, num_distributed_optimizer_instances=2
     )
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=8,
-        num_attention_heads=1,
-        bf16=True,
-    )
+    config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1, bf16=True)
     config.expert_model_parallel_size = expert_parallel_size
     ddp_config = TorchFullyShardedDataParallelConfig(
-        num_distributed_optimizer_instances=2,
-        reduce_scatter_unused_params=True,
+        num_distributed_optimizer_instances=2, reduce_scatter_unused_params=True
     )
     model = TorchFullyShardedDataParallel(
         config,
@@ -135,7 +124,8 @@ def _build_model_and_optimizer(expert_parallel_size, *, init_shift):
         pg_collection=pg_collection,
     )
     assert isinstance(optimizer, ChainedOptimizer)
-    assert len(optimizer.chained_optimizers) == 2
+    expected_num_optimizers = 1 if expert_parallel_size == 1 else 2
+    assert len(optimizer.chained_optimizers) == expected_num_optimizers
     return model, optimizer, pg_collection
 
 
@@ -151,6 +141,17 @@ def _run_step(model, optimizer):
             assert {"exp_avg", "exp_avg_sq"} <= state.keys()
 
 
+def _optimizer_tensor_objects(optimizer):
+    """Collect live optimizer tensors whose identity DCP common loading must preserve."""
+    tensors = []
+    for sub_optimizer in optimizer.chained_optimizers:
+        for state in sub_optimizer.optimizer.state.values():
+            tensors.extend(value for value in state.values() if isinstance(value, torch.Tensor))
+        for group in getattr(sub_optimizer, "fp32_from_float16_groups", ()):
+            tensors.extend(group)
+    return tensors
+
+
 def _sharded_training_state(model, optimizer, pg_collection, *, is_loading=False):
     metadata = {
         "chained_optim_avoid_prefix": True,
@@ -164,7 +165,9 @@ def _sharded_training_state(model, optimizer, pg_collection, *, is_loading=False
     return state_dict
 
 
-@pytest.mark.parametrize(("source_ep_size", "destination_ep_size"), [(2, 2), (1, 2), (2, 1)])
+@pytest.mark.parametrize(
+    ("source_ep_size", "destination_ep_size"), [(1, 1), (2, 2), (1, 2), (2, 1)]
+)
 def test_fsdp2_ep_hsdp_model_and_optimizer_roundtrip(
     tmp_path_dist_ckpt, source_ep_size, destination_ep_size
 ):
@@ -198,10 +201,34 @@ def test_fsdp2_ep_hsdp_model_and_optimizer_roundtrip(
                     model, optimizer, pg_collection, is_loading=True
                 )
                 loaded_state = load(load_template, ckpt_dir_a)
+                tensor_objects_before_common = _optimizer_tensor_objects(optimizer)
                 optimizer.load_common_state_dict(loaded_state["optimizer"])
-                assert not torch.equal(
-                    dense_before_load, model.module.dense_weight._local_tensor
+                tensor_objects_after_common = _optimizer_tensor_objects(optimizer)
+                assert len(tensor_objects_before_common) == len(tensor_objects_after_common)
+                assert all(
+                    before is after
+                    for before, after in zip(
+                        tensor_objects_before_common, tensor_objects_after_common
+                    )
                 )
+                restored_steps = []
+                for sub_optimizer in optimizer.chained_optimizers:
+                    restored_steps.extend(
+                        group["step"]
+                        for group in sub_optimizer.optimizer.param_groups
+                        if "step" in group
+                    )
+                    restored_steps.extend(
+                        state["step"]
+                        for state in sub_optimizer.optimizer.state.values()
+                        if "step" in state
+                    )
+                assert restored_steps
+                assert all(
+                    (step.item() if isinstance(step, torch.Tensor) else step) == 1
+                    for step in restored_steps
+                )
+                assert not torch.equal(dense_before_load, model.module.dense_weight._local_tensor)
                 save(_sharded_training_state(model, optimizer, pg_collection), ckpt_dir_b)
                 model = optimizer = pg_collection = load_template = loaded_state = None
                 gc.collect()
@@ -222,8 +249,12 @@ def test_fsdp2_ep_hsdp_model_and_optimizer_roundtrip(
                 }
                 assert expected_tensor_keys <= plain_state_dict_a.keys()
                 assert not any("chained_" in key for key in plain_state_dict_a)
-                diffs = diff(plain_state_dict_a, plain_state_dict_b)
-                assert not any(map(bool, diffs)), diffs
+                if source_ep_size == destination_ep_size:
+                    diffs = diff(plain_state_dict_a, plain_state_dict_b)
+                    assert not any(map(bool, diffs)), diffs
+                else:
+                    for key in expected_tensor_keys:
+                        torch.testing.assert_close(plain_state_dict_a[key], plain_state_dict_b[key])
             finally:
                 Utils.destroy_model_parallel()
 
@@ -237,16 +268,10 @@ def test_fsdp2_ep_hsdp_resume_step_parity(tmp_path_dist_ckpt):
 
     Utils.initialize_distributed()
     with TempNamedDir(tmp_path_dist_ckpt / "fsdp2_resume_start", sync=True) as start_dir:
-        with TempNamedDir(
-            tmp_path_dist_ckpt / "fsdp2_resume_expected", sync=True
-        ) as expected_dir:
-            with TempNamedDir(
-                tmp_path_dist_ckpt / "fsdp2_resume_actual", sync=True
-            ) as actual_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / "fsdp2_resume_expected", sync=True) as expected_dir:
+            with TempNamedDir(tmp_path_dist_ckpt / "fsdp2_resume_actual", sync=True) as actual_dir:
                 try:
-                    model, optimizer, pg_collection = _build_model_and_optimizer(
-                        2, init_shift=0
-                    )
+                    model, optimizer, pg_collection = _build_model_and_optimizer(2, init_shift=0)
                     _run_step(model, optimizer)
                     save(_sharded_training_state(model, optimizer, pg_collection), start_dir)
                     _run_step(model, optimizer)

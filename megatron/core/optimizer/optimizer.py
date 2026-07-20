@@ -1869,7 +1869,19 @@ class ChainedOptimizer(MegatronOptimizer):
         self._synchronize_steps()
 
     def load_common_state_dict(self, state_dict):
-        """Restore common state for each child without replacing sharded tensors."""
+        """Restore common state for each child without replacing sharded tensors.
+
+        Fully reshardable distributed checkpoints use global model keys for optimizer
+        tensors, but common state keeps the source ChainedOptimizer nesting. EP changes
+        can therefore turn one child into dense/expert children (or collapse them back
+        into one). Reproject the source common groups onto the runtime topology before
+        delegating to the children.
+        """
+        source_children = self._extract_common_child_states(state_dict)
+        if source_children is not None and len(source_children) != len(self.chained_optimizers):
+            self._load_resharded_common_state_dict(source_children)
+            return
+
         if len(self.chained_optimizers) == 1:
             self.chained_optimizers[0].load_common_state_dict(state_dict)
             return
@@ -1882,6 +1894,227 @@ class ChainedOptimizer(MegatronOptimizer):
             state_dict = (value for _, value in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             optimizer.load_common_state_dict(state)
+        self._synchronize_steps()
+
+    @staticmethod
+    def _common_child_optimizer_state(state_dict):
+        """Return the inner optimizer common state, if state_dict is a child state."""
+        if not isinstance(state_dict, dict):
+            return None
+        for optimizer_key in ('optimizer', 'optimizer_state_dict'):
+            optimizer_state = state_dict.get(optimizer_key)
+            if isinstance(optimizer_state, dict) and isinstance(
+                optimizer_state.get('param_groups'), (list, tuple)
+            ):
+                return optimizer_state
+        if isinstance(state_dict.get('param_groups'), (list, tuple)):
+            return state_dict
+        return None
+
+    @classmethod
+    def _is_saved_common_child_state(cls, state_dict):
+        """Distinguish saved group metadata from destination-only DCP templates."""
+        optimizer_state = cls._common_child_optimizer_state(state_dict)
+        if optimizer_state is None or not optimizer_state['param_groups']:
+            return False
+        return all(
+            all(key in group or f'pre_{key}' in group for key in param_group_identifier_keys)
+            for group in optimizer_state['param_groups']
+        )
+
+    @classmethod
+    def _extract_common_child_states(cls, state_dict):
+        """Extract source common children from a possibly mixed DCP load result."""
+        direct_child = state_dict if cls._is_saved_common_child_state(state_dict) else None
+        indexed_children = []
+        if isinstance(state_dict, (list, tuple)):
+            indexed_children = [
+                child for child in state_dict if cls._is_saved_common_child_state(child)
+            ]
+        elif isinstance(state_dict, dict):
+            indexed_children = [
+                state_dict[key]
+                for key in sorted(key for key in state_dict if isinstance(key, int))
+                if cls._is_saved_common_child_state(state_dict[key])
+            ]
+
+        if direct_child is not None and indexed_children:
+            raise RuntimeError(
+                'Ambiguous chained optimizer common state: found saved metadata in both '
+                'the direct child and indexed children.'
+            )
+        if indexed_children:
+            return indexed_children
+        if direct_child is not None:
+            return [direct_child]
+        return None
+
+    @staticmethod
+    def _common_values_equal(left, right):
+        """Compare checkpoint metadata values, including nested tensors."""
+        if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+            if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+                return False
+            return (
+                left.dtype == right.dtype and left.shape == right.shape and torch.equal(left, right)
+            )
+        if isinstance(left, dict) or isinstance(right, dict):
+            if not isinstance(left, dict) or not isinstance(right, dict):
+                return False
+            return left.keys() == right.keys() and all(
+                ChainedOptimizer._common_values_equal(left[key], right[key]) for key in left
+            )
+        if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+            if not isinstance(left, (list, tuple)) or not isinstance(right, (list, tuple)):
+                return False
+            return len(left) == len(right) and all(
+                ChainedOptimizer._common_values_equal(left_value, right_value)
+                for left_value, right_value in zip(left, right)
+            )
+        try:
+            result = left == right
+            if isinstance(result, torch.Tensor):
+                return bool(torch.all(result).item())
+            return bool(result)
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _param_group_identifier(group, key):
+        """Read a native or NeMo-prefixed optimizer group identifier."""
+        if key in group:
+            return group[key]
+        prefixed_key = f'pre_{key}'
+        if prefixed_key in group:
+            return group[prefixed_key]
+        raise KeyError(f"Optimizer parameter group is missing '{key}' (or '{prefixed_key}').")
+
+    @classmethod
+    def _topology_independent_group_key(cls, group):
+        """Return identifiers whose meaning is stable when EP groups split or merge."""
+        return tuple(
+            cls._param_group_identifier(group, key)
+            for key in param_group_identifier_keys
+            if key != 'is_expert_parallel'
+        )
+
+    @classmethod
+    def _assert_groups_can_collapse(cls, logical_key, groups):
+        """Reject a lossy dense/expert metadata merge."""
+        ignored_keys = {'params', 'is_expert_parallel', 'pre_is_expert_parallel'}
+        reference = groups[0]
+        reference_keys = set(reference) - ignored_keys
+        for candidate in groups[1:]:
+            candidate_keys = set(candidate) - ignored_keys
+            differing_keys = reference_keys ^ candidate_keys
+            for key in reference_keys & candidate_keys:
+                if not cls._common_values_equal(reference[key], candidate[key]):
+                    differing_keys.add(key)
+            if differing_keys:
+                raise RuntimeError(
+                    'Cannot reshard chained optimizer common state without losing '
+                    f'parameter-group metadata for logical group {logical_key}. '
+                    f'Conflicting fields: {sorted(differing_keys)}.'
+                )
+
+    @classmethod
+    def _collapse_optional_common_value(cls, source_children, name, getter):
+        """Collapse a child-wide value, requiring all source children to agree."""
+        missing = object()
+        values = [getter(child, missing) for child in source_children]
+        present_values = [value for value in values if value is not missing]
+        if not present_values:
+            return False, None
+        if len(present_values) != len(values):
+            raise RuntimeError(
+                f"Cannot reshard chained optimizer common state: '{name}' is present "
+                'for only some source optimizer children.'
+            )
+        reference = present_values[0]
+        if any(
+            not cls._common_values_equal(reference, candidate) for candidate in present_values[1:]
+        ):
+            raise RuntimeError(
+                f"Cannot reshard chained optimizer common state: source '{name}' values differ."
+            )
+        return True, copy.deepcopy(reference)
+
+    def _load_resharded_common_state_dict(self, source_children):
+        """Project source common metadata onto the current optimizer child topology."""
+        source_groups_by_key = {}
+        for child_state in source_children:
+            optimizer_state = self._common_child_optimizer_state(child_state)
+            for group in optimizer_state['param_groups']:
+                logical_key = self._topology_independent_group_key(group)
+                source_groups_by_key.setdefault(logical_key, []).append(group)
+
+        for logical_key, groups in source_groups_by_key.items():
+            self._assert_groups_can_collapse(logical_key, groups)
+
+        destination_keys = {
+            self._topology_independent_group_key(group)
+            for optimizer in self.chained_optimizers
+            for group in optimizer.optimizer.param_groups
+        }
+        unused_source_keys = set(source_groups_by_key) - destination_keys
+        if unused_source_keys:
+            raise RuntimeError(
+                'Cannot reshard chained optimizer common state: source parameter groups '
+                f'{sorted(unused_source_keys)} do not exist in the destination topology.'
+            )
+
+        has_common_step, common_step = self._collapse_optional_common_value(
+            source_children,
+            'common_step',
+            lambda child, missing: (
+                self._common_child_optimizer_state(child)
+                .get('state', {})
+                .get('common_step', missing)
+            ),
+        )
+        has_grad_scaler, grad_scaler = self._collapse_optional_common_value(
+            source_children, 'grad_scaler', lambda child, missing: child.get('grad_scaler', missing)
+        )
+
+        for optimizer in self.chained_optimizers:
+            projected_groups = []
+            for current_group in optimizer.optimizer.param_groups:
+                logical_key = self._topology_independent_group_key(current_group)
+                if logical_key not in source_groups_by_key:
+                    raise RuntimeError(
+                        'Cannot reshard chained optimizer common state: no source '
+                        f'parameter group matches destination logical group {logical_key}. '
+                        f'Available groups: {sorted(source_groups_by_key)}.'
+                    )
+
+                projected_group = copy.deepcopy(source_groups_by_key[logical_key][0])
+                projected_group.pop('params', None)
+                for identifier_key in param_group_identifier_keys:
+                    projected_group.pop(identifier_key, None)
+                    projected_group.pop(f'pre_{identifier_key}', None)
+                    destination_key = (
+                        identifier_key
+                        if identifier_key in current_group
+                        else f'pre_{identifier_key}'
+                    )
+                    projected_group[destination_key] = self._param_group_identifier(
+                        current_group, identifier_key
+                    )
+                projected_group['params'] = current_group['params']
+                projected_groups.append(projected_group)
+
+            projected_optimizer_state = {'param_groups': projected_groups}
+            if has_common_step:
+                projected_optimizer_state['state'] = {'common_step': copy.deepcopy(common_step)}
+
+            if isinstance(optimizer, FP32Optimizer):
+                projected_child_state = projected_optimizer_state
+            else:
+                projected_child_state = {'optimizer': projected_optimizer_state}
+                if has_grad_scaler:
+                    projected_child_state['grad_scaler'] = copy.deepcopy(grad_scaler)
+            optimizer.load_common_state_dict(projected_child_state)
+
         self._synchronize_steps()
 
     @override
