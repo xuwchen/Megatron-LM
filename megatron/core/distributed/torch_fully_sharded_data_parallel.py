@@ -1,13 +1,14 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import contextmanager
-from typing import Iterator, List, Optional, Set, Tuple, Type
+from typing import Iterator, List, Optional, Set, Tuple, Type, Union
 
 import torch
 
 try:
     from torch.distributed import DeviceMesh
     from torch.distributed.fsdp import fully_shard
+    from torch.distributed.tensor import DTensor
 
     HAVE_FSDP = True
 except ImportError:
@@ -54,6 +55,15 @@ def _build_fsdp_wrap_plan(
 
     visit(root_module)
     return forward_order, bottom_up_order
+
+
+def _configure_fsdp_sum_gradient_reduction(module: torch.nn.Module) -> None:
+    """Configure true SUM reduction without using BF16 NCCL PREMUL_SUM."""
+    module.set_force_sum_reduction_for_comms(True)
+    if setter := getattr(module, "set_gradient_divide_factor", None):
+        setter(1.0)
+    else:
+        module.set_reduce_scatter_divide_factor(1.0)
 
 
 class TorchFullyShardedDataParallel(_BaseDataParallel):
@@ -117,6 +127,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
         self.ddp_config = ddp_config
         self._no_sync_depth = 0
+        self._gradient_scale_correction = 1.0
 
         def save_custom_attrs(module):
             custom_attrs = {}
@@ -175,6 +186,22 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         # See https://github.com/pytorch/pytorch/issues/114299.
         fully_shard(self.module, **kwargs)
 
+        if config.calculate_per_token_loss:
+            fsdp_modules = [*bottom_up_order, self.module]
+            if all(
+                getattr(fsdp_module, "set_force_sum_reduction_for_comms", None) is not None
+                for fsdp_module in fsdp_modules
+            ):
+                # The setters are not recursive. Force true SUM for every communication
+                # group since divide-factor 1 alone uses NCCL PREMUL_SUM, which is unsafe
+                # for BF16 on older NCCL/PyTorch combinations.
+                for fsdp_module in fsdp_modules:
+                    _configure_fsdp_sum_gradient_reduction(fsdp_module)
+            else:
+                # PyTorch 2.6/2.7 cannot force pure SUM. Keep its default AVG and undo
+                # the DP division when applying the final global-token normalization.
+                self._gradient_scale_correction = float(self.process_group.size())
+
         restore_custom_attrs(self.module, attrs)
 
     @contextmanager
@@ -204,6 +231,21 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                         # The next backward runs outside this context and completes reductions,
                         # waits for backward-prefetch communication, and clears iteration state.
                         set_is_last_backward(True)
+
+    def scale_gradients(self, scaling_factor: Union[float, torch.Tensor]) -> None:
+        """Scale each local FSDP2 gradient shard by the given factor."""
+        gradient_scale_correction = getattr(self, "_gradient_scale_correction", 1.0)
+        if gradient_scale_correction != 1.0:
+            scaling_factor = scaling_factor * gradient_scale_correction
+
+        with torch.no_grad():
+            for param in self.module.parameters():
+                grad = param.grad
+                if grad is None:
+                    continue
+                if isinstance(grad, DTensor):
+                    grad = grad.to_local()
+                grad.mul_(scaling_factor)
 
     def finish_grad_sync(self, force_all_reduce=False):
         """
