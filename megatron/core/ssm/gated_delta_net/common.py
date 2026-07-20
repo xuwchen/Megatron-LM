@@ -549,13 +549,12 @@ class _GDNBase(MegatronModule):
             sharded_state_dict.update(module_sharded_sd)
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
-        # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
-
+        # tensors must be additionally split into separate parts.
+        #
+        # The local shard is deliberately not checked against the TP-local fused size here:
+        # Torch FSDP2 may shard that fused tensor again across data-parallel ranks, so a rank
+        # can legitimately hold only part of it. `_split_tensor_factory` validates the layout
+        # from the global checkpoint metadata instead.
         sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
             sharded_state_dict[f"{prefix}in_proj.weight"],
             list(self.in_proj_split_sections),
@@ -564,14 +563,8 @@ class _GDNBase(MegatronModule):
         )
 
         conv_layer_name_list = ["conv1d.weight"]
-        assert (
-            sharded_state_dict[f"{prefix}conv1d.weight"].data.size(0) == self.conv_dim_local_tp
-        ), (self.conv_dim_local_tp, sharded_state_dict[f"{prefix}conv1d.weight"])
         if self.conv_bias:
             conv_layer_name_list.append("conv1d.bias")
-            assert (
-                sharded_state_dict[f"{prefix}conv1d.bias"].data.size(0) == self.conv_dim_local_tp
-            ), (self.conv_dim_local_tp, sharded_state_dict[f"{prefix}conv1d.bias"])
         for conv_layer_name in conv_layer_name_list:
             sharded_state_dict[f"{prefix}{conv_layer_name}"] = _split_tensor_factory(
                 sharded_state_dict[f"{prefix}{conv_layer_name}"],

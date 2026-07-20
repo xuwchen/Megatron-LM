@@ -1,12 +1,11 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Protocol, cast
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -366,7 +365,7 @@ class MLP(MegatronModule):
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
                         sub_sd[k] = apply_swiglu_sharded_factory(
-                            v, sharded_offsets, singleton_local_shards
+                            v, sharded_offsets, singleton_local_shards, tp_size=self.tp_group.size()
                         )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
@@ -405,7 +404,10 @@ class MLP(MegatronModule):
 
 # pylint: disable=missing-function-docstring
 def apply_swiglu_sharded_factory(
-    original_sh_ten, sharded_offsets, singleton_local_shards: bool = False
+    original_sh_ten,
+    sharded_offsets,
+    singleton_local_shards: bool = False,
+    tp_size: Optional[int] = None,
 ):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
@@ -413,16 +415,114 @@ def apply_swiglu_sharded_factory(
 
     swiglu_shard_axis = 0
     prepend_axis_num = len(sharded_offsets)
-    original_shape = original_sh_ten.local_shape
-    original_numel = int(np.prod(original_shape))
-    local_axis_size = original_shape[swiglu_shard_axis]
+    original_split_axis = swiglu_shard_axis + original_sh_ten.prepend_axis_num
+    local_axis_size = original_sh_ten.local_shape[swiglu_shard_axis]
+    if original_sh_ten.axis_fragmentations is None:
+        raise ValueError("SwiGLU factory requires regular input sharding metadata")
+    axis_frag = original_sh_ten.axis_fragmentations[original_split_axis]
+    if tp_size is None:
+        # Legacy direct callers provide TP-only input shards.
+        tp_size = axis_frag
+    if axis_frag % tp_size != 0:
+        raise ValueError(f"Combined fragmentation {axis_frag} is not divisible by {tp_size=}")
+    dp_size = axis_frag // tp_size
+
+    if dp_size > 1:
+        global_axis_size = original_sh_ten.global_shape[original_split_axis]
+        if global_axis_size % tp_size != 0:
+            raise ValueError(
+                f"SwiGLU global dimension {global_axis_size} is not divisible by {tp_size=}"
+            )
+        tp_local_size = global_axis_size // tp_size
+        if tp_local_size % 2 != 0:
+            raise ValueError(f"SwiGLU TP-local dimension must be even, got {tp_local_size}")
+        if original_sh_ten.global_offset[original_split_axis] % local_axis_size != 0:
+            raise ValueError("SwiGLU FSDP shard must use a regular physical grid")
+
+        combined_rank = original_sh_ten.global_offset[original_split_axis] // local_axis_size
+        tp_rank, dp_rank = divmod(combined_rank, dp_size)
+        local_start = dp_rank * local_axis_size
+        local_stop = local_start + local_axis_size
+        if tp_rank >= tp_size or local_stop > tp_local_size:
+            raise ValueError(
+                "A SwiGLU FSDP shard must fit in one TP-local fused tensor, got "
+                f"{combined_rank=}, {local_axis_size=}, {tp_local_size=}, "
+                f"{tp_size=}, {dp_size=}"
+            )
+        section_size = tp_local_size // 2
+
+        @torch.no_grad()
+        def fsdp_sh_ten_build_fn(
+            key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
+        ):
+            base_sh_ten = ShardedTensor.from_rank_offsets(
+                key,
+                t,
+                *sharded_offsets,
+                (swiglu_shard_axis + prepend_axis_num, combined_rank, axis_frag),
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            )
+            chunks = []
+            for section_idx, section_name in enumerate(("w", "v")):
+                section_start = section_idx * section_size
+                section_stop = section_start + section_size
+                overlap_start = max(local_start, section_start)
+                overlap_stop = min(local_stop, section_stop)
+                if overlap_start >= overlap_stop:
+                    continue
+
+                overlap_size = overlap_stop - overlap_start
+                chunk_data = t.narrow(swiglu_shard_axis, overlap_start - local_start, overlap_size)
+                chunk_global_shape = list(base_sh_ten.global_shape)
+                chunk_global_offset = list(base_sh_ten.global_offset)
+                split_axis = swiglu_shard_axis + prepend_axis_num
+                if singleton_local_shards:
+                    chunk_key = f"{key}_{section_name}"
+                    chunk_global_shape[split_axis] = section_size * tp_size
+                    chunk_global_offset[split_axis] = (
+                        tp_rank * section_size + overlap_start - section_start
+                    )
+                else:
+                    chunk_key = key
+                    chunk_global_shape[split_axis] = tp_local_size * tp_size
+                    chunk_global_offset[split_axis] = (
+                        section_idx * section_size * tp_size
+                        + tp_rank * section_size
+                        + overlap_start
+                        - section_start
+                    )
+                chunks.append(
+                    replace(
+                        base_sh_ten,
+                        key=chunk_key,
+                        data=chunk_data,
+                        local_shape=tuple(chunk_data.shape),
+                        global_shape=tuple(chunk_global_shape),
+                        global_offset=tuple(chunk_global_offset),
+                        axis_fragmentations=None,
+                        flattened_range=flattened_range,
+                    )
+                )
+
+            assert sum(chunk.data.numel() for chunk in chunks) == t.numel(), (chunks, t.shape)
+            return chunks
+
+        return ShardedTensorFactory(
+            original_sh_ten.key,
+            original_sh_ten.data,
+            fsdp_sh_ten_build_fn,
+            cat_with_oom_fallback,
+            original_sh_ten.replica_id,
+            flattened_range=original_sh_ten.flattened_range,
+        )
+
     assert (
         original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
     )
     rank_offset = (
         original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] // local_axis_size
     )
-    axis_frag = original_sh_ten.axis_fragmentations[swiglu_shard_axis + prepend_axis_num]
 
     @torch.no_grad()
     def sh_ten_build_fn(
