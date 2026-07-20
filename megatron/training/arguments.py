@@ -304,6 +304,30 @@ def _parse_torch_fsdp2_reshard_after_forward(value: str) -> bool | int | None:
     return shard_world_size
 
 
+_TORCH_FSDP2_GRADIENT_ACCUMULATION_MODES = ("classic", "partial_reduce_scatter")
+
+
+def _validate_torch_fsdp2_gradient_accumulation(args) -> None:
+    """Validate prerequisites for partial FSDP2 gradient synchronization."""
+    mode = getattr(args, "torch_fsdp2_gradient_accumulation_mode", "classic")
+    assert mode in _TORCH_FSDP2_GRADIENT_ACCUMULATION_MODES, (
+        "--torch-fsdp2-gradient-accumulation-mode must be one of "
+        f"{_TORCH_FSDP2_GRADIENT_ACCUMULATION_MODES}, got {mode!r}"
+    )
+    if mode == "classic":
+        return
+
+    option = "--torch-fsdp2-gradient-accumulation-mode partial_reduce_scatter"
+    assert getattr(args, "use_torch_fsdp2", False), f"{option} requires --use-torch-fsdp2"
+    assert is_torch_min_version("2.13.0"), f"{option} requires PyTorch >= 2.13"
+    assert (
+        getattr(args, "num_distributed_optimizer_instances", 1) > 1
+    ), f"{option} requires --num-distributed-optimizer-instances > 1"
+    assert getattr(
+        args, "torch_fsdp2_reduce_scatter_unused_params", False
+    ), f"{option} requires --torch-fsdp2-reduce-scatter-unused-params"
+
+
 def _normalize_cuda_graph_modules_args(args):
     """Normalize cuda_graph_modules to enums and apply deprecated scope migrations."""
     normalized_scopes, deprecated_scopes, used_full_scope = normalize_cuda_graph_modules(
@@ -450,6 +474,8 @@ def tuple_type(x):
 
 
 def validate_args(args, defaults={}):
+
+    _validate_torch_fsdp2_gradient_accumulation(args)
 
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
@@ -4329,6 +4355,16 @@ def _add_distributed_args(parser):
         type=int,
         default=1,
         help='Number of Distributed Optimizer copies across Data Parallel domain.',
+    )
+    group.add_argument(
+        '--torch-fsdp2-gradient-accumulation-mode',
+        choices=_TORCH_FSDP2_GRADIENT_ACCUMULATION_MODES,
+        default='classic',
+        help='Controls intermediate-microbatch gradient communication for PyTorch FSDP2. '
+        'classic disables gradient synchronization; partial_reduce_scatter keeps HSDP '
+        'reduce-scatter enabled and defers the replica all-reduce until the final microbatch. '
+        'All ranks and microbatches must execute the same FSDP module groups in the same '
+        'order.',
     )
     torch_fsdp2_reshard_group = group.add_mutually_exclusive_group()
     torch_fsdp2_reshard_group.add_argument(

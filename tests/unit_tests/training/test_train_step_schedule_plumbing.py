@@ -722,11 +722,127 @@ def test_torch_fsdp2_reshard_cli_rejects_conflicting_flags(cli_args):
         parser.parse_args(cli_args)
 
 
+@pytest.mark.parametrize(
+    ("cli_args", "expected"),
+    [
+        ([], "classic"),
+        (["--torch-fsdp2-gradient-accumulation-mode", "classic"], "classic"),
+        (
+            ["--torch-fsdp2-gradient-accumulation-mode", "partial_reduce_scatter"],
+            "partial_reduce_scatter",
+        ),
+    ],
+)
+def test_torch_fsdp2_gradient_accumulation_mode_cli(cli_args, expected):
+    """Expose a conservative classic default and the opt-in partial mode."""
+    parser = argparse.ArgumentParser()
+    arguments_mod._add_distributed_args(parser)
+
+    assert parser.parse_args(cli_args).torch_fsdp2_gradient_accumulation_mode == expected
+
+
+def test_torch_fsdp2_gradient_accumulation_mode_cli_rejects_invalid_choice():
+    """Let argparse reject unsupported gradient-accumulation policies."""
+    parser = argparse.ArgumentParser()
+    arguments_mod._add_distributed_args(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--torch-fsdp2-gradient-accumulation-mode", "partial"])
+
+
+def test_validate_torch_fsdp2_gradient_accumulation_classic_needs_no_prerequisites(monkeypatch):
+    """Keep the default mode compatible with old PyTorch and non-FSDP launches."""
+    monkeypatch.setattr(arguments_mod, "is_torch_min_version", lambda version: False)
+
+    arguments_mod._validate_torch_fsdp2_gradient_accumulation(
+        SimpleNamespace(torch_fsdp2_gradient_accumulation_mode="classic")
+    )
+
+
+def test_validate_torch_fsdp2_gradient_accumulation_accepts_supported_partial_mode(monkeypatch):
+    """Accept partial reduce-scatter only when every runtime prerequisite is met."""
+    monkeypatch.setattr(arguments_mod, "is_torch_min_version", lambda version: True)
+    args = SimpleNamespace(
+        torch_fsdp2_gradient_accumulation_mode="partial_reduce_scatter",
+        use_torch_fsdp2=True,
+        num_distributed_optimizer_instances=2,
+        torch_fsdp2_reduce_scatter_unused_params=True,
+    )
+
+    arguments_mod._validate_torch_fsdp2_gradient_accumulation(args)
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "error"),
+    [
+        ("use_torch_fsdp2", False, "requires --use-torch-fsdp2"),
+        (
+            "num_distributed_optimizer_instances",
+            1,
+            "requires --num-distributed-optimizer-instances > 1",
+        ),
+        (
+            "torch_fsdp2_reduce_scatter_unused_params",
+            False,
+            "requires --torch-fsdp2-reduce-scatter-unused-params",
+        ),
+    ],
+)
+def test_validate_torch_fsdp2_gradient_accumulation_rejects_missing_prerequisite(
+    monkeypatch, attribute, value, error
+):
+    """Reject each unsupported partial-mode combination with an actionable error."""
+    monkeypatch.setattr(arguments_mod, "is_torch_min_version", lambda version: True)
+    args = SimpleNamespace(
+        torch_fsdp2_gradient_accumulation_mode="partial_reduce_scatter",
+        use_torch_fsdp2=True,
+        num_distributed_optimizer_instances=2,
+        torch_fsdp2_reduce_scatter_unused_params=True,
+    )
+    setattr(args, attribute, value)
+
+    with pytest.raises(AssertionError, match=error):
+        arguments_mod._validate_torch_fsdp2_gradient_accumulation(args)
+
+
+def test_validate_torch_fsdp2_gradient_accumulation_requires_torch_2_13(monkeypatch):
+    """Reject partial reduce-scatter when the runtime lacks the required FSDP2 API."""
+    monkeypatch.setattr(arguments_mod, "is_torch_min_version", lambda version: False)
+    args = SimpleNamespace(
+        torch_fsdp2_gradient_accumulation_mode="partial_reduce_scatter", use_torch_fsdp2=True
+    )
+
+    with pytest.raises(AssertionError, match="requires PyTorch >= 2.13"):
+        arguments_mod._validate_torch_fsdp2_gradient_accumulation(args)
+
+
+def test_validate_torch_fsdp2_gradient_accumulation_rejects_invalid_programmatic_value():
+    """Validate programmatic namespaces as strictly as argparse-created namespaces."""
+    args = SimpleNamespace(torch_fsdp2_gradient_accumulation_mode="invalid")
+
+    with pytest.raises(AssertionError, match="must be one of"):
+        arguments_mod._validate_torch_fsdp2_gradient_accumulation(args)
+
+
+def test_validate_args_checks_partial_gradient_accumulation_prerequisites_first():
+    """Fail on partial-mode misuse before unrelated validation fields are accessed."""
+    args = SimpleNamespace(
+        torch_fsdp2_gradient_accumulation_mode="partial_reduce_scatter", use_torch_fsdp2=False
+    )
+
+    with pytest.raises(AssertionError, match="requires --use-torch-fsdp2"):
+        arguments_mod.validate_args(args)
+
+
+@pytest.mark.parametrize("gradient_accumulation_mode", ["classic", "partial_reduce_scatter"])
 @pytest.mark.parametrize("reduce_scatter_unused_params", [False, True])
 @pytest.mark.parametrize("clone_output_views", [False, True])
 @pytest.mark.parametrize("reshard_after_forward", [None, True, False, 2])
 def test_get_megatron_ddp_config_forwards_torch_fsdp2_options(
-    reduce_scatter_unused_params, clone_output_views, reshard_after_forward
+    gradient_accumulation_mode,
+    reduce_scatter_unused_params,
+    clone_output_views,
+    reshard_after_forward,
 ):
     """Forward all Torch FSDP2-specific CLI options into its config."""
     args = SimpleNamespace(
@@ -734,6 +850,7 @@ def test_get_megatron_ddp_config_forwards_torch_fsdp2_options(
         num_distributed_optimizer_instances=3,
         torch_fsdp2_reshard_after_forward=reshard_after_forward,
         torch_fsdp2_reduce_scatter_unused_params=reduce_scatter_unused_params,
+        torch_fsdp2_gradient_accumulation_mode=gradient_accumulation_mode,
         torch_fsdp2_clone_output_views=clone_output_views,
     )
 
@@ -743,6 +860,7 @@ def test_get_megatron_ddp_config_forwards_torch_fsdp2_options(
     assert type(config.reshard_after_forward) is type(reshard_after_forward)
     assert config.reduce_scatter_unused_params is reduce_scatter_unused_params
     assert config.clone_output_views is clone_output_views
+    assert config.gradient_accumulation_mode == gradient_accumulation_mode
     assert config.num_distributed_optimizer_instances == 3
 
 
@@ -752,3 +870,4 @@ def test_get_megatron_ddp_config_defaults_torch_fsdp2_to_auto_reshard():
 
     assert config.reshard_after_forward is None
     assert config.num_distributed_optimizer_instances == 1
+    assert config.gradient_accumulation_mode == "classic"

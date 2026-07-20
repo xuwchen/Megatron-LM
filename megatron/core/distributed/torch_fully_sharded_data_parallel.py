@@ -83,6 +83,35 @@ def _resolve_fsdp_reshard_after_forward(
     return reshard_after_forward
 
 
+def _validate_fsdp_gradient_accumulation_mode(
+    gradient_accumulation_mode: str, is_hsdp: bool, reduce_scatter_unused_params: bool
+) -> None:
+    """Validate the FSDP2 communication policy used for gradient accumulation."""
+    supported_modes = {"classic", "partial_reduce_scatter"}
+    if gradient_accumulation_mode not in supported_modes:
+        raise ValueError(
+            "Torch FSDP2 gradient_accumulation_mode must be one of "
+            f"{sorted(supported_modes)}, got {gradient_accumulation_mode!r}."
+        )
+    if gradient_accumulation_mode == "classic":
+        return
+    if not is_torch_min_version("2.13.0"):
+        raise RuntimeError(
+            "Torch FSDP2 partial_reduce_scatter gradient accumulation requires " "PyTorch >= 2.13."
+        )
+    if not is_hsdp:
+        raise ValueError(
+            "Torch FSDP2 partial_reduce_scatter gradient accumulation requires HSDP "
+            "with num_distributed_optimizer_instances > 1."
+        )
+    if not reduce_scatter_unused_params:
+        raise ValueError(
+            "Torch FSDP2 partial_reduce_scatter gradient accumulation requires "
+            "reduce_scatter_unused_params=True so every rank reduce-scatters the same "
+            "parameter list."
+        )
+
+
 def _clone_fsdp_output_views(
     _module: torch.nn.Module, _inputs: Tuple[Any, ...], output: Any
 ) -> Any:
@@ -262,6 +291,14 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
         self.num_distributed_optimizer_instances = ddp_config.num_distributed_optimizer_instances
         self.is_hsdp = self.num_distributed_optimizer_instances > 1
+        self.gradient_accumulation_mode = getattr(
+            ddp_config, "gradient_accumulation_mode", "classic"
+        )
+        _validate_fsdp_gradient_accumulation_mode(
+            self.gradient_accumulation_mode,
+            self.is_hsdp,
+            getattr(ddp_config, "reduce_scatter_unused_params", False),
+        )
         self.device_mesh = _build_fsdp_device_mesh(
             self.process_group, pg_collection, self.num_distributed_optimizer_instances
         )
@@ -339,6 +376,18 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         # See https://github.com/pytorch/pytorch/issues/114299.
         fully_shard(self.module, **kwargs)
 
+        if self.gradient_accumulation_mode == "partial_reduce_scatter":
+            missing_controls = [
+                control
+                for control in ("set_is_last_backward", "set_requires_all_reduce")
+                if not callable(getattr(self.module, control, None))
+            ]
+            if missing_controls:
+                raise RuntimeError(
+                    "Torch FSDP2 partial_reduce_scatter gradient accumulation requires "
+                    "PyTorch FSDP controls: " + ", ".join(missing_controls)
+                )
+
         if config.calculate_per_token_loss:
             fsdp_modules = [*bottom_up_order, self.module]
             if all(
@@ -370,26 +419,46 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
     @contextmanager
     def no_sync(self) -> Iterator[None]:
-        """Disable FSDP2 gradient synchronization for intermediate microbatches.
+        """Control FSDP2 synchronization for intermediate microbatches.
+
+        Classic mode disables both reduce-scatter and replica all-reduce. The HSDP-only
+        partial_reduce_scatter mode keeps reduce-scatter enabled and defers only the
+        replica all-reduce, reducing peak unsharded gradient memory.
 
         This context restores only FSDP2 synchronization controls. If a forward or
         backward raises, callers must discard the accumulated gradients, reset the
         root FSDP module's iteration state, and restart the accumulation cycle.
         """
+        gradient_accumulation_mode = getattr(self, "gradient_accumulation_mode", "classic")
+        set_is_last_backward = getattr(self.module, "set_is_last_backward", None)
+        set_requires_all_reduce = getattr(self.module, "set_requires_all_reduce", None)
+        if gradient_accumulation_mode == "partial_reduce_scatter" and (
+            set_is_last_backward is None or set_requires_all_reduce is None
+        ):
+            raise RuntimeError(
+                "Torch FSDP2 partial_reduce_scatter gradient accumulation requires "
+                "set_is_last_backward and set_requires_all_reduce controls."
+            )
+
         is_outermost = self._no_sync_depth == 0
         self._no_sync_depth += 1
-        set_is_last_backward = getattr(self.module, "set_is_last_backward", None)
         try:
             if is_outermost:
                 if set_is_last_backward is not None:
                     set_is_last_backward(False)
-                self.module.set_requires_gradient_sync(False, recurse=True)
+                if gradient_accumulation_mode == "partial_reduce_scatter":
+                    set_requires_all_reduce(False, recurse=True)
+                else:
+                    self.module.set_requires_gradient_sync(False, recurse=True)
             yield
         finally:
             self._no_sync_depth -= 1
             if is_outermost:
                 try:
-                    self.module.set_requires_gradient_sync(True, recurse=True)
+                    if gradient_accumulation_mode == "partial_reduce_scatter":
+                        set_requires_all_reduce(True, recurse=True)
+                    else:
+                        self.module.set_requires_gradient_sync(True, recurse=True)
                 finally:
                     if set_is_last_backward is not None:
                         # The next backward runs outside this context and completes reductions,
