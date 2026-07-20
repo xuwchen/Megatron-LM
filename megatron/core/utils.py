@@ -1018,7 +1018,7 @@ def make_tp_sharded_tensor_for_checkpoint(
     is_data_parallel_fully_sharded = HAVE_DTENSOR and isinstance(tensor, DTensor)
     if is_data_parallel_fully_sharded:
         # TP + FSDP2 sharding
-        dp_replica_id = 0
+        dp_rank, dp_size, dp_replica_id = _get_dtensor_checkpoint_shard_info(tensor)
         tensor = tensor._local_tensor
 
         if tp_axis == 0:
@@ -1088,15 +1088,19 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     is_data_parallel_fully_sharded = HAVE_DTENSOR and isinstance(tensor, DTensor)
     if is_data_parallel_fully_sharded:
+        dp_rank, dp_size, dp_replica_id = _get_dtensor_checkpoint_shard_info(tensor)
         if _dtensor_requires_full_tensor(tensor):
             if replica_id is None:
-                replica_id = (0, get_pg_rank(tp_group), dp_rank)
+                replica_id = (
+                    0,
+                    get_pg_rank(tp_group),
+                    _get_dtensor_checkpoint_full_tensor_replica_id(tensor),
+                )
             return _make_replicated_dtensor_factory(
                 tensor, key, prepend_offsets, replica_id, kwargs
             )
 
         # FSDP2 sharding
-        dp_replica_id = 0
         tensor = tensor._local_tensor
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
@@ -1115,6 +1119,77 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     if is_data_parallel_fully_sharded:
         sharded_tensor.is_data_parallel_fully_shard = True
     return sharded_tensor
+
+
+def _get_dtensor_checkpoint_shard_info(tensor):
+    """Return the FSDP shard rank, shard size, and HSDP replica rank for a DTensor.
+
+    FSDP2 parameters may use a different mesh per parameter. In particular,
+    expert parameters use the expert-data-parallel mesh, which can be smaller
+    than the dense data-parallel mesh. Checkpoint metadata must therefore come
+    from the DTensor itself instead of a caller-provided dense process group.
+
+    The supported FSDP2 layouts have exactly one ``Shard(0)`` placement and
+    zero or more ``Replicate`` placements. Multiple replicate coordinates are
+    flattened in mesh-dimension order to form a stable replica identifier.
+    """
+    placements = tensor.placements
+    mesh = tensor.device_mesh
+    coordinate = mesh.get_coordinate()
+    if coordinate is None:
+        raise ValueError("Current rank is not part of the DTensor device mesh")
+    if len(placements) != len(mesh.shape) or len(coordinate) != len(mesh.shape):
+        raise ValueError(
+            "DTensor checkpoint layout has inconsistent mesh metadata: "
+            f"{mesh.shape=}, {placements=}, {coordinate=}."
+        )
+
+    shard_mesh_dims = [
+        mesh_dim for mesh_dim, placement in enumerate(placements) if isinstance(placement, Shard)
+    ]
+    if len(shard_mesh_dims) != 1:
+        raise ValueError(
+            "FSDP2 checkpointing requires exactly one sharded mesh dimension, "
+            f"got placements {placements}."
+        )
+
+    shard_mesh_dim = shard_mesh_dims[0]
+    shard_placement = placements[shard_mesh_dim]
+    if shard_placement.dim != 0:
+        raise ValueError(
+            "FSDP2 checkpointing requires the DTensor to be sharded on tensor "
+            f"dimension 0, got {shard_placement}."
+        )
+
+    replica_rank = 0
+    for mesh_dim, placement in enumerate(placements):
+        if isinstance(placement, Shard):
+            continue
+        if not isinstance(placement, Replicate):
+            raise ValueError(
+                "FSDP2 checkpointing only supports Shard and Replicate placements, "
+                f"got {placement} in {placements}."
+            )
+        replica_rank = replica_rank * mesh.shape[mesh_dim] + coordinate[mesh_dim]
+
+    return coordinate[shard_mesh_dim], mesh.shape[shard_mesh_dim], replica_rank
+
+
+def _get_dtensor_checkpoint_full_tensor_replica_id(tensor):
+    """Flatten the full mesh coordinate after a DTensor is materialized.
+
+    ``DTensor.full_tensor()`` replicates across both the original replicate
+    dimensions and the original shard dimension. Every mesh coordinate must
+    therefore have a distinct replica ID so only rank zero of the flattened
+    mesh writes the materialized tensor.
+    """
+    coordinate = tensor.device_mesh.get_coordinate()
+    if coordinate is None:
+        raise ValueError("Current rank is not part of the DTensor device mesh")
+    replica_rank = 0
+    for mesh_dim, mesh_dim_size in enumerate(tensor.device_mesh.shape):
+        replica_rank = replica_rank * mesh_dim_size + coordinate[mesh_dim]
+    return replica_rank
 
 
 def _dtensor_requires_full_tensor(tensor):
