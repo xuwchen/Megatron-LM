@@ -545,8 +545,12 @@ class MegatronOptimizer(ABC):
         pass
 
     @abstractmethod
-    def state_dict(self):
-        """Return state_dict."""
+    def state_dict(self, is_loading: bool = False):
+        """Return the optimizer state dict.
+
+        Args:
+            is_loading: Initialize lazily allocated optimizer state before returning it.
+        """
         pass
 
     @abstractmethod
@@ -1397,7 +1401,10 @@ class FP32Optimizer(MegatronOptimizer):
     def reload_model_params(self, state_dict=None):
         pass
 
-    def state_dict(self):
+    def state_dict(self, is_loading: bool = False):
+        if is_loading and not self.is_stub_optimizer:
+            self.init_state_fn(self.optimizer, self.config)
+
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
@@ -1680,11 +1687,16 @@ class ChainedOptimizer(MegatronOptimizer):
         for idx, optimizer in enumerate(self.chained_optimizers):
             optimizer.reload_model_params(state_dict=state_dicts[idx])
 
-    def state_dict(self):
+    def state_dict(self, is_loading: bool = False):
+        def get_state_dict(optimizer):
+            if is_loading:
+                return optimizer.state_dict(is_loading=True)
+            return optimizer.state_dict()
+
         if len(self.chained_optimizers) == 1:
-            return self.chained_optimizers[0].state_dict()
+            return get_state_dict(self.chained_optimizers[0])
         else:
-            return [optimizer.state_dict() for optimizer in self.chained_optimizers]
+            return [get_state_dict(optimizer) for optimizer in self.chained_optimizers]
 
     def save_state_dict_to_file(self, filename: str) -> None:
         """Save this optimizer's per-rank state for torch checkpoints."""
