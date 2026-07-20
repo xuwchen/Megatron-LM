@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Optional, Set
+from typing import List, Optional, Set, Tuple, Type
 
 import torch
 
@@ -23,6 +23,36 @@ from ..transformer.transformer_config import TransformerConfig
 from ..transformer.transformer_layer import TransformerLayer
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
+
+
+def _build_fsdp_wrap_plan(
+    root_module: torch.nn.Module, sub_modules_to_wrap: Set[Type[torch.nn.Module]]
+) -> Tuple[List[torch.nn.Module], List[torch.nn.Module]]:
+    """Build stable forward and bottom-up orders for FSDP2 module wrapping."""
+    forward_order = []
+    bottom_up_order = []
+    visited_module_ids = set()
+
+    def visit(module: torch.nn.Module) -> None:
+        module_id = id(module)
+        if module_id in visited_module_ids:
+            return
+        visited_module_ids.add(module_id)
+
+        should_wrap = module is not root_module and any(
+            isinstance(module, sub_module_type) for sub_module_type in sub_modules_to_wrap
+        )
+        if should_wrap:
+            forward_order.append(module)
+
+        for child_module in module.children():
+            visit(child_module)
+
+        if should_wrap:
+            bottom_up_order.append(module)
+
+    visit(root_module)
+    return forward_order, bottom_up_order
 
 
 class TorchFullyShardedDataParallel(_BaseDataParallel):
@@ -57,7 +87,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         config: TransformerConfig,
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
-        sub_modules_to_wrap: Set[torch.nn.Module] = {
+        sub_modules_to_wrap: Set[Type[torch.nn.Module]] = {
             TransformerLayer,
             LanguageModelEmbedding,
             RotaryEmbedding,
@@ -122,23 +152,21 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             for f in fsdp_modules:
                 sub_modules_to_wrap.add(f)
 
-        prev_module = None
-        for sub_module in self.module.modules():
+        forward_order, bottom_up_order = _build_fsdp_wrap_plan(self.module, sub_modules_to_wrap)
+        for sub_module in bottom_up_order:
             # Wrap individual submodules to fetch parameters just-in-time rather than
             # conservatively fetching all parameters at the start of each iteration.
             # See https://github.com/pytorch/pytorch/issues/114299.
-            if any(
-                isinstance(sub_module, sub_module_to_wrap)
-                for sub_module_to_wrap in sub_modules_to_wrap
-            ):
-                fully_shard(sub_module, **kwargs)
+            fully_shard(sub_module, **kwargs)
 
+        if config.recompute_granularity is not None:
+            prev_module = None
+            for sub_module in forward_order:
                 # Explicitly set the FSDP backward prefetch schedule to prevent activation
                 # recomputation from disrupting the automatically generated default schedule.
-                if config.recompute_granularity is not None:
-                    sub_module.set_modules_to_backward_prefetch(
-                        [prev_module] if prev_module else []
-                    )
+                sub_module.set_modules_to_backward_prefetch(
+                    [prev_module] if prev_module is not None else []
+                )
                 prev_module = sub_module
 
         # Wrap the root module as required by the FSDP API.
