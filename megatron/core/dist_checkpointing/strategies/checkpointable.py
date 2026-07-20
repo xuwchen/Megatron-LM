@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from itertools import chain
 
 import torch
@@ -25,6 +25,11 @@ class CheckpointableShardedTensor(torch.Tensor):
         self._data = data
         self._sh_ten = sh_ten
 
+    def _checkpoint_data(self) -> torch.Tensor:
+        """View local data with metadata-only prepended axes materialized."""
+        checkpoint_shape = (1,) * self._sh_ten.prepend_axis_num + self._sh_ten.local_shape
+        return self._sh_ten.data.view(checkpoint_shape)
+
     def __create_write_items__(
         self, fqn: str, sh_ten: 'CheckpointableShardedTensor', index: int = None
     ) -> list[WriteItem]:
@@ -41,8 +46,9 @@ class CheckpointableShardedTensor(torch.Tensor):
         """
         offsets = torch.Size(sh_ten._sh_ten.global_offset)
         global_shape = torch.Size(sh_ten._sh_ten.global_shape)
-        chunk_size = torch.Size(sh_ten._sh_ten.local_shape)
-        assert chunk_size == sh_ten._sh_ten.data.size()
+        checkpoint_data = sh_ten._checkpoint_data()
+        chunk_size = checkpoint_data.size()
+        assert len(offsets) == len(chunk_size) == len(global_shape)
 
         return [
             WriteItem(
@@ -50,7 +56,7 @@ class CheckpointableShardedTensor(torch.Tensor):
                 type=WriteItemType.SHARD,
                 tensor_data=TensorWriteData(
                     chunk=ChunkStorageMetadata(offsets=offsets, sizes=chunk_size),
-                    properties=TensorProperties.create_from_tensor(sh_ten._sh_ten.data),
+                    properties=TensorProperties.create_from_tensor(checkpoint_data),
                     size=global_shape,
                 ),
             )
@@ -63,8 +69,8 @@ class CheckpointableShardedTensor(torch.Tensor):
             List[ChunkStorageMetadata]: list of DCP ChunkStorageMetadata metadata objects.
         """
         offsets = torch.Size(self._sh_ten.global_offset)
-        chunk_size = torch.Size(self._sh_ten.local_shape)
-        assert chunk_size == self._sh_ten.data.size()
+        chunk_size = self._checkpoint_data().size()
+        assert len(offsets) == len(chunk_size)
 
         return [ChunkStorageMetadata(offsets=offsets, sizes=chunk_size)]
 
@@ -77,7 +83,7 @@ class CheckpointableShardedTensor(torch.Tensor):
         Returns:
             Tensor: the underlying data tensor
         """
-        return self._sh_ten.data
+        return self._checkpoint_data()
 
     @classmethod
     def from_sh_ten(cls, sh_ten: ShardedTensor) -> 'CheckpointableShardedTensor':
