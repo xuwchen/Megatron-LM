@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import re
 from copy import deepcopy
@@ -13,6 +13,7 @@ from torch.optim import Adam
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
+from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
     optim_state_to_sharding_state,
@@ -303,6 +304,34 @@ class TestOptimizer:
                 for layer_name in model_state_dict
             ]
         )
+
+    def test_fsdp2_optimizer_param_identity(self):
+        """FSDP2 optimizer mapping uses the stable DTensor local shard identity."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("FSDP2 is not supported on this version of PyTorch.")
+
+        from torch.distributed import DeviceMesh
+        from torch.distributed.fsdp import fully_shard
+
+        Utils.initialize_model_parallel(1, 1)
+        mesh = DeviceMesh.from_group(
+            parallel_state.get_data_parallel_group(with_context_parallel=True), "cuda"
+        )
+        model = torch.nn.Linear(8, 8, bias=False, device="cuda", dtype=torch.bfloat16)
+        fully_shard(model, mesh=mesh)
+        param = next(model.parameters())
+
+        sharded_tensor = ShardedTensor.from_rank_offsets("weight", param._local_tensor)
+        sharded_factory = ShardedTensorFactory(
+            "weight",
+            param._local_tensor,
+            lambda key, data, replica_id, flattened_range: {},
+            lambda state_dict: state_dict,
+        )
+        for sharded_param in (sharded_tensor, sharded_factory):
+            param_map = get_param_id_to_sharded_param_map({"weight": sharded_param}, [param])
+            assert set(param_map) == {0}
+            assert param_map[0] is sharded_param
 
     def test_float16_optimizer_with_fp32_marked_params(self):
         """Params kept in FP32 (mark_keep_in_fp32) land in fp32_from_fp32_groups, so

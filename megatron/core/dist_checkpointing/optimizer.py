@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """ Helpers for defining sharding for optimizer states based on existing sharding
 for model parameters.
@@ -36,7 +36,13 @@ def get_optim_param_to_id_map(optim_params_iter: Iterable[torch.nn.Parameter]) -
     """Generate mapping from optimizer param to optimizer state id."""
     param_mappings = {}
     for i, param in enumerate(optim_params_iter):
-        param = to_local_if_dtensor(param)
+        # Checkpoint sharding helpers keep the stable ``DTensor._local_tensor``
+        # as ShardedTensor.data. Parameter(DTensor).to_local() may return a
+        # fresh view (PyTorch 2.13+), so it cannot be used for identity matching.
+        if hasattr(param, '_local_tensor'):
+            param = param._local_tensor
+        else:
+            param = to_local_if_dtensor(param)
         if id(param) not in param_mappings:
             param_mappings[id(param)] = i
     return param_mappings
