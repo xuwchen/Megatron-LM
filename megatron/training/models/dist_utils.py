@@ -295,7 +295,7 @@ def _ddp_wrap(
                 "Using use_megatron_fsdp and use_torch_fsdp2 at the same time is not supported."
             )
     elif use_torch_fsdp2:
-        assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
+        assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.6.0"
         DP = TorchFullyShardedDataParallel
     else:
         DP = DistributedDataParallel

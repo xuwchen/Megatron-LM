@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import List, Optional, Set, Tuple, Type
+from contextlib import contextmanager
+from typing import Iterator, List, Optional, Set, Tuple, Type
 
 import torch
 
@@ -60,7 +61,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
     Enables fully sharded data parallelism by wrapping the given model with
     the PyTorch FSDP2 API:
     https://github.com/pytorch/torchtitan/blob/main/docs/fsdp.md
-    To utilize this class, PyTorch version >= 2.4.0 is required.
+    To utilize this class, PyTorch version >= 2.6.0 is required.
 
     Args:
         config: Transformer config object.
@@ -99,7 +100,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
         assert (
             HAVE_FSDP
-        ), 'TorchFullyShardedDataParallel requires PyTorch >= 2.4.0 with FSDP 2 support.'
+        ), 'TorchFullyShardedDataParallel requires PyTorch >= 2.6.0 with FSDP 2 support.'
 
         super().__init__(config=config, module=module)
 
@@ -115,6 +116,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         }
 
         self.ddp_config = ddp_config
+        self._no_sync_depth = 0
 
         def save_custom_attrs(module):
             custom_attrs = {}
@@ -174,6 +176,34 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         fully_shard(self.module, **kwargs)
 
         restore_custom_attrs(self.module, attrs)
+
+    @contextmanager
+    def no_sync(self) -> Iterator[None]:
+        """Disable FSDP2 gradient synchronization for intermediate microbatches.
+
+        This context restores only FSDP2 synchronization controls. If a forward or
+        backward raises, callers must discard the accumulated gradients, reset the
+        root FSDP module's iteration state, and restart the accumulation cycle.
+        """
+        is_outermost = self._no_sync_depth == 0
+        self._no_sync_depth += 1
+        set_is_last_backward = getattr(self.module, "set_is_last_backward", None)
+        try:
+            if is_outermost:
+                if set_is_last_backward is not None:
+                    set_is_last_backward(False)
+                self.module.set_requires_gradient_sync(False, recurse=True)
+            yield
+        finally:
+            self._no_sync_depth -= 1
+            if is_outermost:
+                try:
+                    self.module.set_requires_gradient_sync(True, recurse=True)
+                finally:
+                    if set_is_last_backward is not None:
+                        # The next backward runs outside this context and completes reductions,
+                        # waits for backward-prefetch communication, and clears iteration state.
+                        set_is_last_backward(True)
 
     def finish_grad_sync(self, force_all_reduce=False):
         """
