@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
 import torch
@@ -21,30 +21,26 @@ def test_swiglu_factory_splits_cross_section_fsdp_shard(singleton_local_shards):
         global_shape=(12, 2),
         global_offset=(4, 0),
         axis_fragmentations=(3, 1),
+        replica_id=(0, 0, 1),
     )
+    sharded_tensor.is_data_parallel_fully_shard = True
 
     factory = apply_swiglu_sharded_factory(
-        sharded_tensor,
-        (),
-        singleton_local_shards=singleton_local_shards,
-        tp_size=1,
+        sharded_tensor, (), singleton_local_shards=singleton_local_shards, tp_size=1
     )
     chunks = factory.build()
 
+    assert factory.is_data_parallel_fully_shard is True
+    assert factory.replica_id == (0, 0, 1)
+    assert all(chunk.replica_id == (0, 0, 1) for chunk in chunks)
     assert [chunk.local_shape for chunk in chunks] == [(2, 2), (2, 2)]
     assert all(chunk.axis_fragmentations is None for chunk in chunks)
     if singleton_local_shards:
-        assert [chunk.key for chunk in chunks] == [
-            "linear_fc1.weight_w",
-            "linear_fc1.weight_v",
-        ]
+        assert [chunk.key for chunk in chunks] == ["linear_fc1.weight_w", "linear_fc1.weight_v"]
         assert [chunk.global_shape for chunk in chunks] == [(6, 2), (6, 2)]
         assert [chunk.global_offset for chunk in chunks] == [(4, 0), (0, 0)]
     else:
-        assert [chunk.key for chunk in chunks] == [
-            "linear_fc1.weight",
-            "linear_fc1.weight",
-        ]
+        assert [chunk.key for chunk in chunks] == ["linear_fc1.weight", "linear_fc1.weight"]
         assert [chunk.global_shape for chunk in chunks] == [(12, 2), (12, 2)]
         assert [chunk.global_offset for chunk in chunks] == [(4, 0), (6, 0)]
 
@@ -58,9 +54,7 @@ def test_swiglu_factory_splits_cross_section_fsdp_shard(singleton_local_shards):
     optimizer_chunks = factory.build_fn(
         "optimizer.linear_fc1.weight", optimizer_data, replica_id=0, flattened_range=None
     )
-    assert torch.equal(
-        factory.merge_fn([chunk.data for chunk in optimizer_chunks]), optimizer_data
-    )
+    assert torch.equal(factory.merge_fn([chunk.data for chunk in optimizer_chunks]), optimizer_data)
 
 
 @pytest.mark.internal
@@ -77,10 +71,7 @@ def test_swiglu_factory_preserves_expert_prepend_axis_for_fsdp_shard():
     )
 
     factory = apply_swiglu_sharded_factory(
-        sharded_tensor,
-        ((0, 3, 16),),
-        singleton_local_shards=False,
-        tp_size=1,
+        sharded_tensor, ((0, 3, 16),), singleton_local_shards=False, tp_size=1
     )
     chunks = factory.build()
 

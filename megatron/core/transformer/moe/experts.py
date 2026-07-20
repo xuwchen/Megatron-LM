@@ -1409,7 +1409,8 @@ class SequentialMLP(MegatronModule):
                     len(replica_id) == 3
                 ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
 
-                sh_ten.replica_id = (*replica_id[:2], self.dp_group.rank())
+                if not getattr(sh_ten, "is_data_parallel_fully_shard", False):
+                    sh_ten.replica_id = (*replica_id[:2], self.dp_group.rank())
 
             sharded_state_dict.update(expert_state_dict)
         return sharded_state_dict

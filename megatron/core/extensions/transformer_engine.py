@@ -2450,11 +2450,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 assert (
                     len(replica_id) == 3
                 ), f"Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}"
-                if getattr(sh_ten, "is_data_parallel_fully_shard", False):
-                    edp_replica_id = 0
-                else:
+                if not getattr(sh_ten, "is_data_parallel_fully_shard", False):
                     edp_replica_id = get_pg_rank(self._pg_collection.expt_dp)
-                sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
+                    sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
             return sharded_state_dict
 
         def backward_dw(self):

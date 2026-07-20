@@ -508,7 +508,7 @@ def apply_swiglu_sharded_factory(
             assert sum(chunk.data.numel() for chunk in chunks) == t.numel(), (chunks, t.shape)
             return chunks
 
-        return ShardedTensorFactory(
+        factory = ShardedTensorFactory(
             original_sh_ten.key,
             original_sh_ten.data,
             fsdp_sh_ten_build_fn,
@@ -516,6 +516,9 @@ def apply_swiglu_sharded_factory(
             original_sh_ten.replica_id,
             flattened_range=original_sh_ten.flattened_range,
         )
+        if getattr(original_sh_ten, "is_data_parallel_fully_shard", False):
+            factory.is_data_parallel_fully_shard = True
+        return factory
 
     assert (
         original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
@@ -563,7 +566,7 @@ def apply_swiglu_sharded_factory(
             ),
         ]
 
-    return ShardedTensorFactory(
+    factory = ShardedTensorFactory(
         original_sh_ten.key,
         original_sh_ten.data,
         sh_ten_build_fn,
@@ -571,3 +574,6 @@ def apply_swiglu_sharded_factory(
         original_sh_ten.replica_id,
         flattened_range=original_sh_ten.flattened_range,
     )
+    if getattr(original_sh_ten, "is_data_parallel_fully_shard", False):
+        factory.is_data_parallel_fully_shard = True
+    return factory
