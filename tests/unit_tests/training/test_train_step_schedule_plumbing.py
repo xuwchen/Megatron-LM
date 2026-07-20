@@ -2,6 +2,7 @@
 
 """Training-loop plumbing regression tests."""
 
+import argparse
 import inspect
 from types import SimpleNamespace
 from unittest import mock
@@ -9,6 +10,7 @@ from unittest import mock
 import pytest
 
 from megatron.core.enums import ModelType
+from megatron.training import arguments as arguments_mod
 from megatron.training import training as training_mod
 
 
@@ -618,6 +620,8 @@ def test_dynamic_cp_cuda_graph_upper_bound_uses_dp_cp_and_sp_padding():
 
     # ceil(1000 / (DP=8 * CP=4 * 2 * SP=2)) * 128
     assert training_mod._get_thd_sequence_length_upper_bound(args) == 1024
+
+
 class _FakeTorchFSDP:
     def no_sync(self):
         """Stand in for the FSDP2 no_sync context factory."""
@@ -652,21 +656,96 @@ def test_configure_torch_fsdp2_no_sync_rejects_mixed_wrappers(monkeypatch):
         training_mod._configure_torch_fsdp2_no_sync([_FakeTorchFSDP(), object()], config)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("auto", None),
+        ("AUTO", None),
+        ("true", True),
+        ("TRUE", True),
+        ("false", False),
+        ("FALSE", False),
+        ("2", 2),
+        ("8", 8),
+    ],
+)
+def test_parse_torch_fsdp2_reshard_after_forward(value, expected):
+    """Parse every supported automatic, boolean, and integer policy spelling."""
+    parsed = arguments_mod._parse_torch_fsdp2_reshard_after_forward(value)
+
+    assert parsed == expected
+    assert type(parsed) is type(expected)
+
+
+@pytest.mark.parametrize("value", ["none", "yes", "0", "1", "-2", "2.5"])
+def test_parse_torch_fsdp2_reshard_after_forward_rejects_invalid_values(value):
+    """Reject ambiguous policy names and invalid partial-reshard world sizes."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        arguments_mod._parse_torch_fsdp2_reshard_after_forward(value)
+
+
+@pytest.mark.parametrize(
+    ("cli_args", "expected"),
+    [
+        ([], None),
+        (["--torch-fsdp2-reshard-after-forward", "auto"], None),
+        (["--torch-fsdp2-reshard-after-forward", "true"], True),
+        (["--torch-fsdp2-reshard-after-forward", "false"], False),
+        (["--torch-fsdp2-reshard-after-forward", "4"], 4),
+        (["--torch-fsdp2-no-reshard-after-forward"], False),
+    ],
+)
+def test_torch_fsdp2_reshard_cli_preserves_legacy_flag(cli_args, expected):
+    """Default to auto while preserving the legacy no-reshard flag."""
+    parser = argparse.ArgumentParser()
+    arguments_mod._add_distributed_args(parser)
+
+    parsed = parser.parse_args(cli_args).torch_fsdp2_reshard_after_forward
+
+    assert parsed == expected
+    assert type(parsed) is type(expected)
+
+
+@pytest.mark.parametrize(
+    "cli_args",
+    [
+        ["--torch-fsdp2-reshard-after-forward", "auto", "--torch-fsdp2-no-reshard-after-forward"],
+        ["--torch-fsdp2-no-reshard-after-forward", "--torch-fsdp2-reshard-after-forward", "auto"],
+    ],
+)
+def test_torch_fsdp2_reshard_cli_rejects_conflicting_flags(cli_args):
+    """Do not let argument order silently choose between new and legacy policies."""
+    parser = argparse.ArgumentParser()
+    arguments_mod._add_distributed_args(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(cli_args)
+
+
 @pytest.mark.parametrize("reduce_scatter_unused_params", [False, True])
 @pytest.mark.parametrize("clone_output_views", [False, True])
+@pytest.mark.parametrize("reshard_after_forward", [None, True, False, 2])
 def test_get_megatron_ddp_config_forwards_torch_fsdp2_options(
-    reduce_scatter_unused_params, clone_output_views
+    reduce_scatter_unused_params, clone_output_views, reshard_after_forward
 ):
     """Forward all Torch FSDP2-specific CLI options into its config."""
     args = SimpleNamespace(
         use_torch_fsdp2=True,
-        torch_fsdp2_reshard_after_forward=False,
+        torch_fsdp2_reshard_after_forward=reshard_after_forward,
         torch_fsdp2_reduce_scatter_unused_params=reduce_scatter_unused_params,
         torch_fsdp2_clone_output_views=clone_output_views,
     )
 
     config = training_mod.get_megatron_ddp_config(args)
 
-    assert config.reshard_after_forward is False
+    assert config.reshard_after_forward == reshard_after_forward
+    assert type(config.reshard_after_forward) is type(reshard_after_forward)
     assert config.reduce_scatter_unused_params is reduce_scatter_unused_params
     assert config.clone_output_views is clone_output_views
+
+
+def test_get_megatron_ddp_config_defaults_torch_fsdp2_to_auto_reshard():
+    """Use the automatic policy for programmatic argument namespaces without the new field."""
+    config = training_mod.get_megatron_ddp_config(SimpleNamespace(use_torch_fsdp2=True))
+
+    assert config.reshard_after_forward is None

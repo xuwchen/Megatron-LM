@@ -283,6 +283,27 @@ def _parse_cuda_graph_modules_arg(scope):
     return CudaGraphModule[scope]
 
 
+def _parse_torch_fsdp2_reshard_after_forward(value: str) -> bool | int | None:
+    """Parse the FSDP2 post-forward reshard policy."""
+    normalized_value = value.strip().lower()
+    if normalized_value == "auto":
+        return None
+    if normalized_value == "true":
+        return True
+    if normalized_value == "false":
+        return False
+
+    try:
+        shard_world_size = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "expected 'auto', 'true', 'false', or an integer greater than 1"
+        ) from error
+    if shard_world_size <= 1:
+        raise argparse.ArgumentTypeError("reshard world size must be greater than 1")
+    return shard_world_size
+
+
 def _normalize_cuda_graph_modules_args(args):
     """Normalize cuda_graph_modules to enums and apply deprecated scope migrations."""
     normalized_scopes, deprecated_scopes, used_full_scope = normalize_cuda_graph_modules(
@@ -4309,12 +4330,27 @@ def _add_distributed_args(parser):
         default=1,
         help='Number of Distributed Optimizer copies across Data Parallel domain.',
     )
-    group.add_argument(
+    torch_fsdp2_reshard_group = group.add_mutually_exclusive_group()
+    torch_fsdp2_reshard_group.add_argument(
+        '--torch-fsdp2-reshard-after-forward',
+        type=_parse_torch_fsdp2_reshard_after_forward,
+        # Keep the canonical action suppressed so argparse can distinguish an
+        # explicit auto (which parses to None) from an omitted option when
+        # enforcing mutual exclusion with the legacy flag below.
+        default=argparse.SUPPRESS,
+        metavar='{auto,true,false,RESHARD_WORLD_SIZE}',
+        help='Controls parameter resharding after forward when using PyTorch FSDP2. '
+        'auto reshards non-root modules and keeps the root unsharded; true reshards '
+        'all modules; false keeps parameters unsharded until backward (ZeRO-2); an '
+        'integer reshards to that shard world size.',
+    )
+    torch_fsdp2_reshard_group.add_argument(
         '--torch-fsdp2-no-reshard-after-forward',
-        action='store_false',
+        action='store_const',
+        const=False,
+        default=None,
         dest='torch_fsdp2_reshard_after_forward',
-        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
-        'Set to enable FSDP ZeRO-2.',
+        help='Legacy alias for --torch-fsdp2-reshard-after-forward=false.',
     )
     group.add_argument(
         '--torch-fsdp2-reduce-scatter-unused-params',

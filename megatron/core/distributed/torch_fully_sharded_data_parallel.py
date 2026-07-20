@@ -24,6 +24,7 @@ from ..models.common.embeddings.language_model_embedding import LanguageModelEmb
 from ..models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from ..transformer.transformer_config import TransformerConfig
 from ..transformer.transformer_layer import TransformerLayer
+from ..utils import is_torch_min_version
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
@@ -65,6 +66,20 @@ def _configure_fsdp_sum_gradient_reduction(module: torch.nn.Module) -> None:
         setter(1.0)
     else:
         module.set_reduce_scatter_divide_factor(1.0)
+
+
+def _resolve_fsdp_reshard_after_forward(
+    reshard_after_forward: bool | int | None,
+) -> bool | int | None:
+    """Resolve the automatic reshard policy across supported PyTorch versions.
+
+    PyTorch 2.8 introduced ``None`` for the automatic policy. PyTorch 2.6 and
+    2.7 accept only bool or int, but passing ``True`` already keeps the root
+    unsharded, which is equivalent to the newer automatic behavior.
+    """
+    if reshard_after_forward is None and not is_torch_min_version("2.8.0"):
+        return True
+    return reshard_after_forward
 
 
 def _clone_fsdp_output_views(
@@ -156,10 +171,10 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             self.process_group = process_group
 
         self.device_mesh = DeviceMesh.from_group(self.process_group, "cuda")
-        kwargs = {
-            "mesh": self.device_mesh,
-            "reshard_after_forward": getattr(ddp_config, "reshard_after_forward", True),
-        }
+        reshard_after_forward = _resolve_fsdp_reshard_after_forward(
+            getattr(ddp_config, "reshard_after_forward", None)
+        )
+        kwargs = {"mesh": self.device_mesh, "reshard_after_forward": reshard_after_forward}
 
         self.ddp_config = ddp_config
         self._no_sync_depth = 0

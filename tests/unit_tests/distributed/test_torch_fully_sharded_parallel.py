@@ -75,6 +75,19 @@ class _NestedWrapRoot(torch.nn.Module):
         return self.parent(inputs)
 
 
+class _AutoReshardRoot(torch.nn.Module):
+    """Root with its own parameter and one independently wrapped child."""
+
+    def __init__(self):
+        super().__init__()
+        self.child = _WrapLeaf(8, 8)
+        self.root_bias = torch.nn.Parameter(torch.zeros(8))
+
+    def forward(self, inputs):
+        """Run both the child and the parameter owned by the root FSDP group."""
+        return self.child(inputs) + self.root_bias
+
+
 class _ViewOutputRoot(torch.nn.Module):
     """Root module whose differentiable output aliases an intermediate tensor."""
 
@@ -300,6 +313,28 @@ def test_fsdp2_wrap_plan_is_bottom_up_and_deduplicated():
     assert model not in bottom_up_order
 
 
+@pytest.mark.parametrize(
+    ("requested", "torch_supports_auto", "expected"),
+    [
+        (None, False, True),
+        (None, True, None),
+        (True, False, True),
+        (False, False, False),
+        (2, False, 2),
+    ],
+)
+def test_fsdp2_resolves_auto_reshard_across_torch_versions(
+    monkeypatch, requested, torch_supports_auto, expected
+):
+    """Map auto to the equivalent legacy policy without changing explicit values."""
+    monkeypatch.setattr(torch_fsdp2, "is_torch_min_version", lambda _version: torch_supports_auto)
+
+    resolved = torch_fsdp2._resolve_fsdp_reshard_after_forward(requested)
+
+    assert resolved == expected
+    assert type(resolved) is type(expected)
+
+
 def test_fsdp2_output_view_clone_preserves_containers_and_repeated_references():
     """Clone dataclass view outputs once while preserving the no-op fast path."""
     base = torch.arange(8, dtype=torch.float32, requires_grad=True)
@@ -318,7 +353,7 @@ def test_fsdp2_output_view_clone_preserves_containers_and_repeated_references():
     assert _clone_fsdp_output_views(torch.nn.Identity(), (), independent) is independent
 
 
-@pytest.mark.parametrize("reshard_after_forward", [True, False, 2])
+@pytest.mark.parametrize("reshard_after_forward", [None, True, False, 2])
 def test_fsdp2_constructor_uses_bottom_up_wrap_plan(monkeypatch, reshard_after_forward):
     """Wrap children before parents while preserving forward-order prefetching."""
     if not is_torch_min_version("2.6.0"):
@@ -355,9 +390,14 @@ def test_fsdp2_constructor_uses_bottom_up_wrap_plan(monkeypatch, reshard_after_f
         config, ddp_config, model, sub_modules_to_wrap=_WRAP_TYPES, process_group=fake_process_group
     )
 
+    expected_reshard_after_forward = (
+        True
+        if reshard_after_forward is None and not is_torch_min_version("2.8.0")
+        else reshard_after_forward
+    )
     assert [module for module, _ in shard_calls] == [model.parent.leaf, model.parent, model]
     assert all(
-        kwargs == {"mesh": fake_mesh, "reshard_after_forward": reshard_after_forward}
+        kwargs == {"mesh": fake_mesh, "reshard_after_forward": expected_reshard_after_forward}
         for _, kwargs in shard_calls
     )
     assert prefetch_calls == [(model.parent, []), (model.parent.leaf, [model.parent])]
@@ -501,6 +541,38 @@ def test_fsdp2_constructor_wraps_nested_modules(init_model_parallel):
     assert fsdp_model.module.__class__.__name__.startswith("FSDP")
     assert fsdp_model.module.parent.__class__.__name__.startswith("FSDP")
     assert fsdp_model.module.parent.leaf.__class__.__name__.startswith("FSDP")
+
+
+def test_fsdp2_auto_reshard_keeps_only_root_unsharded_after_forward(init_model_parallel):
+    """Apply PyTorch's automatic reshard policy to real nested FSDP2 groups."""
+    if not is_torch_min_version("2.8.0"):
+        pytest.skip("FSDP2 automatic reshard policy requires PyTorch >= 2.8.")
+
+    config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
+    ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=None)
+    model = _AutoReshardRoot().cuda()
+
+    fsdp_model = TorchFullyShardedDataParallel(
+        config, ddp_config, model, sub_modules_to_wrap={_WrapLeaf}
+    )
+    output = fsdp_model(torch.randn(2, 8, device="cuda"))
+
+    root_state = torch_fsdp2.fully_shard.state(fsdp_model.module)
+    child_state = torch_fsdp2.fully_shard.state(fsdp_model.module.child)
+    root_param_group = root_state._fsdp_param_group
+    child_param_group = child_state._fsdp_param_group
+
+    assert root_param_group is not None
+    assert child_param_group is not None
+    assert root_param_group.post_forward_mesh_info is None
+    assert child_param_group.post_forward_mesh_info is not None
+    assert root_param_group.is_unsharded
+    assert not child_param_group.is_unsharded
+
+    output.square().mean().backward()
+
+    assert fsdp_model.module.root_bias.grad is not None
+    assert fsdp_model.module.child.weight.grad is not None
 
 
 def test_fsdp2_clones_output_views_before_registering_backward_hook(init_model_parallel):
