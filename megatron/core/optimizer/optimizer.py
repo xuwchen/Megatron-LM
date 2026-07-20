@@ -558,6 +558,18 @@ class MegatronOptimizer(ABC):
         """Load pass-in `state_dict`."""
         pass
 
+    def load_common_state_dict(self, state_dict):
+        """Load optimizer state that was not restored in-place by a sharded loader.
+
+        Distributed checkpoint loaders can restore parameter-shaped optimizer tensors
+        directly into their live storage. Optimizers that support that loading mode
+        must override this method and restore only common metadata, without replacing
+        those tensors or copying model/main parameters.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support common-only optimizer state loading"
+        )
+
     # Promote state so it can be retrieved or set via
     # "optimizer_instance.state"
     def _get_state(self):
@@ -716,6 +728,85 @@ class MegatronOptimizer(ABC):
             final_groups.append(group)
 
         return final_groups
+
+    @staticmethod
+    def _restore_common_value(
+        current_value: Any, loaded_value: Any, *, target_device: Optional[torch.device] = None
+    ) -> Any:
+        """Restore a common value while preserving live tensor identity when possible."""
+        if isinstance(current_value, torch.Tensor):
+            if isinstance(loaded_value, torch.Tensor):
+                source = loaded_value.detach()
+            else:
+                source = torch.as_tensor(loaded_value)
+            with torch.no_grad():
+                current_value.copy_(
+                    source.to(device=current_value.device, dtype=current_value.dtype)
+                )
+            return current_value
+
+        if isinstance(loaded_value, torch.Tensor):
+            restored_value = loaded_value.detach().clone()
+            if target_device is not None:
+                restored_value = restored_value.to(device=target_device)
+            return restored_value
+
+        return copy.deepcopy(loaded_value)
+
+    def _load_common_optimizer_state(self, state_dict: Dict) -> None:
+        """Restore optimizer-wide metadata without replacing parameter-shaped state."""
+        loaded_groups = [dict(group) for group in state_dict['param_groups']]
+        loaded_groups = self._filter_and_reorder_param_groups(
+            self.optimizer.param_groups, loaded_groups
+        )
+
+        for current_group, loaded_group in zip(self.optimizer.param_groups, loaded_groups):
+            live_params = current_group['params']
+            current_values = dict(current_group)
+            capturable = bool(
+                loaded_group.get('capturable', current_values.get('capturable', False))
+            )
+            restored_group = {}
+            for key, loaded_value in loaded_group.items():
+                if key == 'params':
+                    continue
+                target_device = None
+                if (
+                    key not in current_values
+                    and isinstance(loaded_value, torch.Tensor)
+                    and capturable
+                    and live_params
+                ):
+                    target_device = live_params[0].device
+                restored_group[key] = self._restore_common_value(
+                    current_values.get(key), loaded_value, target_device=target_device
+                )
+
+            current_group.clear()
+            current_group.update(restored_group)
+            current_group['params'] = live_params
+
+        common_step = state_dict.get('state', {}).get('common_step')
+        if common_step is None:
+            return
+
+        capturable_param_ids = {
+            id(param)
+            for group in self.optimizer.param_groups
+            if group.get('capturable', False)
+            for param in group['params']
+        }
+        for param, param_state in self.optimizer.state.items():
+            target_device = None
+            if (
+                'step' not in param_state
+                and isinstance(common_step, torch.Tensor)
+                and id(param) in capturable_param_ids
+            ):
+                target_device = param.device
+            param_state['step'] = self._restore_common_value(
+                param_state.get('step'), common_step, target_device=target_device
+            )
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
@@ -1286,6 +1377,25 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
 
+    def load_common_state_dict(self, state_dict):
+        """Restore common state after sharded tensors were loaded in-place."""
+        optimizer_key = 'optimizer'
+        if optimizer_key not in state_dict:
+            optimizer_key = 'optimizer_state_dict'
+            logger.info('***WARNING*** loading optimizer from an old checkpoint ...')
+        self._load_common_optimizer_state(state_dict[optimizer_key])
+
+        if 'grad_scaler' not in state_dict:
+            if self.config.fp16:
+                logger.info('***WARNING*** found an old checkpoint, will not load grad scaler ...')
+        elif self.grad_scaler:
+            self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
+        else:
+            logger.info(
+                '***WARNING*** found the grad scaler in the checkpoint but it is None in '
+                'the class. Skipping loading grad scaler ...'
+            )
+
 
 class FP32Optimizer(MegatronOptimizer):
     """Float32 optimizer.
@@ -1417,6 +1527,10 @@ class FP32Optimizer(MegatronOptimizer):
             self.optimizer.param_groups, state_dict['param_groups']
         )
         self.optimizer.load_state_dict(state_dict)
+
+    def load_common_state_dict(self, state_dict):
+        """Restore common state after sharded tensors were loaded in-place."""
+        self._load_common_optimizer_state(state_dict)
 
     def sharded_state_dict(
         self,
@@ -1752,6 +1866,22 @@ class ChainedOptimizer(MegatronOptimizer):
             state_dict = (v for k, v in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             optimizer.load_state_dict(state)
+        self._synchronize_steps()
+
+    def load_common_state_dict(self, state_dict):
+        """Restore common state for each child without replacing sharded tensors."""
+        if len(self.chained_optimizers) == 1:
+            self.chained_optimizers[0].load_common_state_dict(state_dict)
+            return
+        if len(self.chained_optimizers) != len(state_dict):
+            raise RuntimeError(
+                f'Expected {len(self.chained_optimizers)} entries'
+                f' in state dict, but got {len(state_dict)}.'
+            )
+        if isinstance(state_dict, dict):
+            state_dict = (value for _, value in sorted(state_dict.items()))
+        for optimizer, state in zip(self.chained_optimizers, state_dict):
+            optimizer.load_common_state_dict(state)
         self._synchronize_steps()
 
     @override

@@ -15,6 +15,7 @@ from transformer_engine.pytorch.fp8 import fp8_autocast
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import (
     ChainedOptimizer,
+    Float16OptimizerWithFloat16Params,
     FP32Optimizer,
     OptimizerConfig,
     ParamKey,
@@ -412,6 +413,100 @@ def test_fp32_optimizer_state_dict_initializes_state_for_loading():
 
     assert optimizer.state_dict(is_loading=True) == {'state': {'initialized': True}}
     assert init_calls == [(optimizer.optimizer, optimizer.config)]
+
+
+def test_float16_optimizer_load_common_state_dict_preserves_live_tensors():
+    """Common-only loading must not replace state restored in-place by DCP."""
+    param = nn.Parameter(torch.ones(2))
+    group_identifiers = {
+        'wd_mult': 1.0,
+        'lr_mult': 1.0,
+        'is_expert_parallel': False,
+        'is_decoupled_lr': False,
+    }
+    inner_optimizer = Adam([{**group_identifiers, 'params': [param]}], lr=0.1)
+    exp_avg = torch.full_like(param, 2.0)
+    exp_avg_sq = torch.full_like(param, 3.0)
+    step = torch.tensor(1.0)
+    inner_optimizer.state[param] = {
+        'step': step,
+        'exp_avg': exp_avg,
+        'exp_avg_sq': exp_avg_sq,
+    }
+    tensor_metadata = torch.tensor(0.1)
+    inner_optimizer.param_groups[0]['tensor_metadata'] = tensor_metadata
+
+    class RecordingScaler:
+        def __init__(self):
+            self.loaded_state = None
+
+        def load_state_dict(self, state_dict):
+            self.loaded_state = state_dict
+
+    optimizer = object.__new__(Float16OptimizerWithFloat16Params)
+    optimizer.optimizer = inner_optimizer
+    optimizer.grad_scaler = RecordingScaler()
+    optimizer.fp32_from_float16_groups = [[param]]
+
+    loaded_group = dict(inner_optimizer.param_groups[0])
+    loaded_group.update(
+        {
+            'params': [123],
+            'lr': 0.25,
+            'step': 9,
+            'tensor_metadata': torch.tensor(0.25),
+        }
+    )
+    loaded_state = {
+        'optimizer': {
+            'state': {'common_step': torch.tensor(9.0)},
+            'param_groups': [loaded_group],
+        },
+        'grad_scaler': {'scale': 128.0},
+        'fp32_from_fp16_params': [[torch.full_like(param, 99.0)]],
+    }
+
+    optimizer.load_common_state_dict(loaded_state)
+
+    assert inner_optimizer.param_groups[0]['params'][0] is param
+    assert inner_optimizer.param_groups[0]['lr'] == 0.25
+    assert inner_optimizer.param_groups[0]['step'] == 9
+    assert inner_optimizer.param_groups[0]['tensor_metadata'] is tensor_metadata
+    torch.testing.assert_close(tensor_metadata, torch.tensor(0.25))
+    assert inner_optimizer.state[param]['step'] is step
+    torch.testing.assert_close(step, torch.tensor(9.0))
+    assert inner_optimizer.state[param]['exp_avg'] is exp_avg
+    assert inner_optimizer.state[param]['exp_avg_sq'] is exp_avg_sq
+    torch.testing.assert_close(param, torch.ones_like(param))
+    assert optimizer.grad_scaler.loaded_state is loaded_state['grad_scaler']
+    assert loaded_state['optimizer']['param_groups'][0]['params'] == [123]
+    assert 'common_step' in loaded_state['optimizer']['state']
+
+
+def test_chained_optimizer_load_common_state_dict_delegates_in_key_order():
+    """Chained optimizer restores each child's common state in stable order."""
+
+    class MockOptimizer:
+        config = None
+        model_chunks = []
+        is_stub_optimizer = False
+
+        def __init__(self):
+            self.optimizer = self
+            self.param_groups = [{'params': [nn.Parameter(torch.ones(1))], 'step': 7}]
+            self.loaded_states = []
+
+        def load_common_state_dict(self, state_dict):
+            self.loaded_states.append(state_dict)
+
+    optimizers = [MockOptimizer(), MockOptimizer()]
+    state_0 = {'value': 0}
+    state_1 = {'value': 1}
+
+    ChainedOptimizer(optimizers).load_common_state_dict({1: state_1, 0: state_0})
+
+    assert optimizers[0].loaded_states == [state_0]
+    assert optimizers[1].loaded_states == [state_1]
 
 
 def test_chained_optimizer_get_parameters():
