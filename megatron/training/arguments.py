@@ -328,6 +328,20 @@ def _validate_torch_fsdp2_gradient_accumulation(args) -> None:
     ), f"{option} requires --torch-fsdp2-reduce-scatter-unused-params"
 
 
+def _validate_torch_fsdp2_expert_parallelism(args) -> None:
+    """Validate prerequisites for per-parameter dense and expert FSDP2 meshes."""
+    if not getattr(args, "use_torch_fsdp2", False):
+        return
+    if getattr(args, "expert_model_parallel_size", 1) <= 1:
+        return
+
+    option = "--use-torch-fsdp2 with expert parallelism"
+    assert is_torch_min_version("2.13.0"), f"{option} requires PyTorch >= 2.13"
+    assert getattr(
+        args, "torch_fsdp2_reduce_scatter_unused_params", False
+    ), f"{option} requires --torch-fsdp2-reduce-scatter-unused-params"
+
+
 def _normalize_cuda_graph_modules_args(args):
     """Normalize cuda_graph_modules to enums and apply deprecated scope migrations."""
     normalized_scopes, deprecated_scopes, used_full_scope = normalize_cuda_graph_modules(
@@ -476,6 +490,7 @@ def tuple_type(x):
 def validate_args(args, defaults={}):
 
     _validate_torch_fsdp2_gradient_accumulation(args)
+    _validate_torch_fsdp2_expert_parallelism(args)
 
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
@@ -1136,9 +1151,6 @@ def validate_args(args, defaults={}):
         assert (
             args.pipeline_model_parallel_size == 1
         ), '--use-torch-fsdp2 is not supported with pipeline parallelism'
-        assert (
-            args.expert_model_parallel_size == 1
-        ), '--use-torch-fsdp2 is not supported with expert parallelism'
         assert (
             not args.use_distributed_optimizer
         ), "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
