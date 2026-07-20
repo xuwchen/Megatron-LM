@@ -17,3 +17,13 @@ class TorchFullyShardedDataParallelConfig(DistributedDataParallelConfig):
     See PyTorch for complete documentation:
     https://github.com/pytorch/pytorch/blob/ac8ddf115065106f038865389a07f2d0c9ed5e11/torch/distributed/fsdp/_fully_shard/_fully_shard.py#L97C31-L97C49 # pylint: disable=line-too-long 
     """
+
+    reduce_scatter_unused_params: bool = False
+    """
+    Include zero gradients for locally unused parameters so rank-divergent
+    conditional control flow still produces matching FSDP2 reduce-scatter collectives.
+    Requires PyTorch FSDP2's set_reduce_scatter_unused_params API.
+    This does not make rank-divergent calls to whole FSDP modules safe in forward.
+    Parameters unused on every rank receive zero gradients instead of None, which may
+    change optimizer state and weight-decay behavior.
+    """

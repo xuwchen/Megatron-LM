@@ -202,6 +202,17 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                 # the DP division when applying the final global-token normalization.
                 self._gradient_scale_correction = float(self.process_group.size())
 
+        if getattr(ddp_config, "reduce_scatter_unused_params", False):
+            set_reduce_scatter_unused_params = getattr(
+                self.module, "set_reduce_scatter_unused_params", None
+            )
+            if set_reduce_scatter_unused_params is None:
+                raise RuntimeError(
+                    "Torch FSDP2 unused-parameter reduction requires "
+                    "FSDPModule.set_reduce_scatter_unused_params (PyTorch >= 2.13)."
+                )
+            set_reduce_scatter_unused_params(True, recurse=True)
+
         restore_custom_attrs(self.module, attrs)
 
     @contextmanager

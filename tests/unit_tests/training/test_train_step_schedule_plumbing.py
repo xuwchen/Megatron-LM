@@ -650,3 +650,18 @@ def test_configure_torch_fsdp2_no_sync_rejects_mixed_wrappers(monkeypatch):
 
     with pytest.raises(AssertionError, match="all model chunks"):
         training_mod._configure_torch_fsdp2_no_sync([_FakeTorchFSDP(), object()], config)
+
+
+@pytest.mark.parametrize("reduce_scatter_unused_params", [False, True])
+def test_get_megatron_ddp_config_forwards_torch_fsdp2_options(reduce_scatter_unused_params):
+    """Forward all Torch FSDP2-specific CLI options into its config."""
+    args = SimpleNamespace(
+        use_torch_fsdp2=True,
+        torch_fsdp2_reshard_after_forward=False,
+        torch_fsdp2_reduce_scatter_unused_params=reduce_scatter_unused_params,
+    )
+
+    config = training_mod.get_megatron_ddp_config(args)
+
+    assert config.reshard_after_forward is False
+    assert config.reduce_scatter_unused_params is reduce_scatter_unused_params
