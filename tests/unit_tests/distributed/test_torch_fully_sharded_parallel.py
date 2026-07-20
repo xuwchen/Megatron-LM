@@ -1,4 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import warnings
+from dataclasses import dataclass
+
 import pytest
 import torch
 
@@ -10,6 +13,7 @@ from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.torch_fully_sharded_data_parallel import (
     TorchFullyShardedDataParallel,
     _build_fsdp_wrap_plan,
+    _clone_fsdp_output_views,
 )
 from megatron.core.distributed.torch_fully_sharded_data_parallel_config import (
     TorchFullyShardedDataParallelConfig,
@@ -69,6 +73,27 @@ class _NestedWrapRoot(torch.nn.Module):
     def forward(self, inputs):
         """Run the nested parent."""
         return self.parent(inputs)
+
+
+class _ViewOutputRoot(torch.nn.Module):
+    """Root module whose differentiable output aliases an intermediate tensor."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.eye(8))
+
+    def forward(self, inputs):
+        """Return a view to exercise FSDP's output-hook safety requirement."""
+        return (inputs @ self.weight).view(-1, 8)
+
+
+@dataclass
+class _ViewOutputContainer:
+    """Dataclass output containing a repeated tensor reference."""
+
+    primary: torch.Tensor
+    aliases: tuple
+    metadata: str
 
 
 class _WrapRoot(torch.nn.Module):
@@ -275,6 +300,24 @@ def test_fsdp2_wrap_plan_is_bottom_up_and_deduplicated():
     assert model not in bottom_up_order
 
 
+def test_fsdp2_output_view_clone_preserves_containers_and_repeated_references():
+    """Clone dataclass view outputs once while preserving the no-op fast path."""
+    base = torch.arange(8, dtype=torch.float32, requires_grad=True)
+    view = base.view(2, 4)
+    output = _ViewOutputContainer(view, (view,), "metadata")
+
+    cloned = _clone_fsdp_output_views(torch.nn.Identity(), (), output)
+
+    assert cloned is not output
+    assert cloned.primary is cloned.aliases[0]
+    assert cloned.primary._base is None
+    assert cloned.metadata == output.metadata
+    torch.testing.assert_close(cloned.primary, view)
+
+    independent = (base.clone(),)
+    assert _clone_fsdp_output_views(torch.nn.Identity(), (), independent) is independent
+
+
 @pytest.mark.parametrize("reshard_after_forward", [True, False, 2])
 def test_fsdp2_constructor_uses_bottom_up_wrap_plan(monkeypatch, reshard_after_forward):
     """Wrap children before parents while preserving forward-order prefetching."""
@@ -458,6 +501,45 @@ def test_fsdp2_constructor_wraps_nested_modules(init_model_parallel):
     assert fsdp_model.module.__class__.__name__.startswith("FSDP")
     assert fsdp_model.module.parent.__class__.__name__.startswith("FSDP")
     assert fsdp_model.module.parent.leaf.__class__.__name__.startswith("FSDP")
+
+
+def test_fsdp2_clones_output_views_before_registering_backward_hook(init_model_parallel):
+    """Keep FSDP's pre-backward hook attached across downstream in-place ops."""
+    if not is_torch_min_version("2.13.0"):
+        pytest.skip("FSDP2 output-view safety warnings require PyTorch >= 2.13.")
+
+    config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
+    ddp_config = TorchFullyShardedDataParallelConfig(clone_output_views=True)
+    reference_model = _ViewOutputRoot().cuda()
+    with torch.no_grad():
+        torch.distributed.broadcast(reference_model.weight, src=0)
+    model = _ViewOutputRoot().cuda()
+    model.load_state_dict(reference_model.state_dict())
+    fsdp_model = TorchFullyShardedDataParallel(config, ddp_config, model, sub_modules_to_wrap=set())
+    group = fsdp_model.process_group
+    rank = torch.distributed.get_rank(group)
+    world_size = torch.distributed.get_world_size(group)
+    inputs = torch.arange(16, dtype=torch.float32, device="cuda").view(2, 8)
+    inputs = inputs + rank / 10
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=r"FSDP2-wrapped module .* returned a view tensor")
+        output = fsdp_model(inputs)
+    assert output._base is None
+    output.add_(0.25).square().mean().backward()
+
+    reference_output = reference_model(inputs).clone()
+    reference_output.add_(0.25).square().mean().backward()
+    torch.distributed.all_reduce(reference_model.weight.grad, group=group)
+    reference_model.weight.grad.div_(world_size)
+
+    assert fsdp_model.module.weight.grad is not None
+    torch.testing.assert_close(
+        fsdp_model.module.weight.grad.full_tensor(),
+        reference_model.weight.grad,
+        rtol=1e-5,
+        atol=1e-6,
+    )
 
 
 def test_fsdp2_no_sync_accumulates_and_reduces_gradients(init_model_parallel):

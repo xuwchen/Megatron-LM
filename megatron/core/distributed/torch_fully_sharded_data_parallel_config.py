@@ -27,3 +27,11 @@ class TorchFullyShardedDataParallelConfig(DistributedDataParallelConfig):
     Parameters unused on every rank receive zero gradients instead of None, which may
     change optimizer state and weight-decay behavior.
     """
+
+    clone_output_views: bool = False
+    """
+    Clone differentiable output views from the root module and language embedding
+    before FSDP2 registers its pre-backward hooks. This prevents downstream
+    in-place operations from silently dropping those hooks. This is opt-in because
+    cloning breaks output aliasing and may add activation memory and copy overhead.
+    """

@@ -4325,6 +4325,14 @@ def _add_distributed_args(parser):
         'modules on only some ranks.',
     )
     group.add_argument(
+        '--torch-fsdp2-clone-output-views',
+        action='store_true',
+        help='Clone differentiable output views from the FSDP2 root and language '
+        'embedding before backward-hook registration. This prevents downstream '
+        'in-place operations from dropping FSDP hooks, at the cost of breaking '
+        'output aliasing and potentially increasing activation memory.',
+    )
+    group.add_argument(
         '--cp-comm-type',
         nargs='+',
         type=str,

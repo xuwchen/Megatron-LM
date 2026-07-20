@@ -1,9 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import contextmanager
-from typing import Iterator, List, Optional, Set, Tuple, Type, Union
+from typing import Any, Iterator, List, Optional, Set, Tuple, Type, Union
 
 import torch
+from torch.distributed.utils import _apply_to_tensors
 
 try:
     from torch.distributed import DeviceMesh
@@ -64,6 +65,41 @@ def _configure_fsdp_sum_gradient_reduction(module: torch.nn.Module) -> None:
         setter(1.0)
     else:
         module.set_reduce_scatter_divide_factor(1.0)
+
+
+def _clone_fsdp_output_views(
+    _module: torch.nn.Module, _inputs: Tuple[Any, ...], output: Any
+) -> Any:
+    """Clone grad-requiring output views before FSDP registers backward hooks.
+
+    PyTorch FSDP2 attaches its pre-backward hook directly to module outputs.
+    A downstream in-place operation on a view can silently replace that hook,
+    skipping the parameter all-gather in backward. This hook is registered
+    before fully_shard so FSDP observes independent tensors instead.
+    """
+
+    needs_clone = False
+
+    def detect_view(tensor: torch.Tensor) -> torch.Tensor:
+        nonlocal needs_clone
+        needs_clone |= tensor.requires_grad and tensor._base is not None
+        return tensor
+
+    _apply_to_tensors(detect_view, output)
+    if not needs_clone:
+        return output
+
+    cloned_views = {}
+
+    def clone_view(tensor: torch.Tensor) -> torch.Tensor:
+        if not tensor.requires_grad or tensor._base is None:
+            return tensor
+        tensor_id = id(tensor)
+        if tensor_id not in cloned_views:
+            cloned_views[tensor_id] = tensor.clone()
+        return cloned_views[tensor_id]
+
+    return _apply_to_tensors(clone_view, output)
 
 
 class TorchFullyShardedDataParallel(_BaseDataParallel):
@@ -166,6 +202,12 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                 sub_modules_to_wrap.add(f)
 
         forward_order, bottom_up_order = _build_fsdp_wrap_plan(self.module, sub_modules_to_wrap)
+        if getattr(ddp_config, "clone_output_views", False):
+            for fsdp_module in [*bottom_up_order, self.module]:
+                if fsdp_module is self.module or isinstance(fsdp_module, LanguageModelEmbedding):
+                    # Register before fully_shard so this hook runs before FSDP's
+                    # post-forward hook and protects its pre-backward hook.
+                    fsdp_module.register_forward_hook(_clone_fsdp_output_views)
         for sub_module in bottom_up_order:
             # Wrap individual submodules to fetch parameters just-in-time rather than
             # conservatively fetching all parameters at the start of each iteration.
