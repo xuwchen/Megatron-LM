@@ -43,6 +43,27 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mock-image-count-config-json",
+        type=str,
+        default=None,
+        help=(
+            "Image-count coverage profile for mock_varlen. Accepts inline JSON or a "
+            "JSON-file path with schema "
+            "'{\"mode\":\"categorical\",\"counts\":[1,2,3,4],"
+            "\"weights\":[75,15,7,3]}'. Counts must be in [1, 4]; weights are "
+            "normalized internally. When omitted, every sample has exactly one image."
+        ),
+    )
+    group.add_argument(
+        "--mock-image-placement",
+        choices=("center", "uniform"),
+        default="center",
+        help=(
+            "Image-block placement for mock_varlen. 'center' preserves the legacy "
+            "middle insertion; 'uniform' samples text gaps deterministically."
+        ),
+    )
+    group.add_argument(
         "--total-seq-length", type=int, default=1024, help="Total sequence length for mock data"
     )
     group.add_argument(

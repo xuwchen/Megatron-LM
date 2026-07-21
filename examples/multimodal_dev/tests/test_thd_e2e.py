@@ -56,6 +56,34 @@ def _make_sample(
     }
 
 
+def _make_mock_multi_image_sample(num_images: int, seq_len: int, *, seed: int = 1234):
+    """Build one real mock-dataset sample with an exact one-hot image count."""
+    dataset = MockQwen35VLVarlenDataset(
+        num_samples=1,
+        seq_length=seq_len,
+        length_config={
+            "mode": "distribution",
+            "type": "lognormal",
+            "min_seq_len": seq_len,
+            "max_seq_len": seq_len,
+            "mean_seq_len": seq_len,
+            "lognormal_sigma": 0.0,
+        },
+        seed=seed,
+        vocab_size=100,
+        image_token_id=97,
+        video_token_id=98,
+        vision_start_token_id=96,
+        image_size=32,
+        image_count_config={"mode": "categorical", "counts": [num_images], "weights": [1]},
+        image_placement="uniform",
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+    )
+    return dataset[0]
+
+
 # ===================================================================
 # _build_packed_seq_params — pure helper, exercised independently
 # ===================================================================
@@ -127,12 +155,7 @@ def test_qwen35_vision_rope_wrapper_forwards_max_seqlen(monkeypatch):
     config = SimpleNamespace(rotary_interleaved=False, multi_latent_attention=False)
 
     output = specs._apply_rope_fp32_no_cp(
-        tensor,
-        freqs,
-        config,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=4,
-        inverse=False,
+        tensor, freqs, config, cu_seqlens=cu_seqlens, max_seqlen=4, inverse=False
     )
 
     assert output.dtype == tensor.dtype
@@ -354,6 +377,25 @@ class TestPackOrPadBatchPacked:
         assert psp.max_seqlen_q == 11
         assert psp.total_tokens == 18
 
+    def test_multi_image_loader_microbatch_concatenates_thd_vision_payloads(self):
+        """A loader microbatch mixing 1/2/4-image samples packs in sample order."""
+        image_counts = [1, 2, 4]
+        lengths = [13, 17, 23]
+        batch = [
+            _make_mock_multi_image_sample(count, length, seed=2026 + index)
+            for index, (count, length) in enumerate(zip(image_counts, lengths))
+        ]
+
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+        assert packed["input_ids"].shape == (1, sum(lengths))
+        assert packed["image_grid_thw"].tolist() == [[1, 2, 2]] * sum(image_counts)
+        assert packed["pixel_values"].shape == (4 * sum(image_counts), 1536)
+        assert int((packed["input_ids"] == 96).sum().item()) == sum(image_counts)
+        assert int((packed["input_ids"] == 97).sum().item()) == sum(image_counts)
+        assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 13, 30, 53]
+        assert packed["packed_seq_params"].cu_seqlens_q_padded.tolist() == [0, 13, 30, 53]
+
 
 class TestPackOrPadBatchPackedAlignment:
     """Core packed-padding flags also apply to the multimodal local packer."""
@@ -396,6 +438,26 @@ class TestPackOrPadBatchPackedAlignment:
         assert psp.max_seqlen_q == 110
         assert psp.total_tokens == 128
         assert psp.pad_between_seqs is False
+
+    def test_alignment_dummy_tail_does_not_add_multi_image_vision_payloads(self, alignment_128):
+        """The appended token-only dummy sequence leaves 1/2/4-image payloads untouched."""
+        image_counts = [1, 2, 4]
+        lengths = [13, 17, 23]
+        batch = [
+            _make_mock_multi_image_sample(count, length, seed=2026 + index)
+            for index, (count, length) in enumerate(zip(image_counts, lengths))
+        ]
+        expected_pixels = torch.cat([sample["pixel_values"] for sample in batch]).cuda()
+        expected_grids = torch.cat([sample["image_grid_thw"] for sample in batch]).cuda()
+
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+        assert packed["input_ids"].shape == (1, 128)
+        assert packed["padding_mask"][0, 53:].all().item()
+        assert torch.equal(packed["pixel_values"], expected_pixels)
+        assert torch.equal(packed["image_grid_thw"], expected_grids)
+        assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 13, 30, 53, 128]
+        assert packed["packed_seq_params"].cu_seqlens_q_padded.tolist() == [0, 13, 30, 53, 128]
 
     def test_alignment_preserves_cp2_per_sample_padding(self, alignment_128, monkeypatch):
         """CP2 aligns each rank to 128 after preserving real sample boundaries."""
@@ -510,6 +572,26 @@ class TestPackOrPadBatchPadded:
         assert padded["pixel_values"][:4].eq(0.0).all().item()
         assert padded["pixel_values"][4:].eq(10.0).all().item()
 
+    def test_multi_image_loader_microbatch_concatenates_bshd_vision_payloads(self):
+        """BSHD padding preserves a mixed 1/2/4-image loader microbatch."""
+        image_counts = [1, 2, 4]
+        lengths = [13, 17, 23]
+        batch = [
+            _make_mock_multi_image_sample(count, length, seed=2026 + index)
+            for index, (count, length) in enumerate(zip(image_counts, lengths))
+        ]
+
+        padded = pack_or_pad_batch(
+            batch, use_packed_sequence=False, seq_length=max(lengths), device="cuda"
+        )
+
+        assert padded["input_ids"].shape == (3, 23)
+        assert padded["padding_mask"].sum(dim=1).tolist() == [10, 6, 0]
+        assert padded["image_grid_thw"].tolist() == [[1, 2, 2]] * sum(image_counts)
+        assert padded["pixel_values"].shape == (4 * sum(image_counts), 1536)
+        assert int((padded["input_ids"] == 96).sum().item()) == sum(image_counts)
+        assert int((padded["input_ids"] == 97).sum().item()) == sum(image_counts)
+
 
 # ===================================================================
 # pack_or_pad_batch — divisible_by = 4 alignment
@@ -562,6 +644,25 @@ class TestPackOrPadBatchDivisibleBy4:
         # max_seqlen comes from the padded lengths.
         assert psp.max_seqlen_q == 8
         assert psp.total_tokens == T_padded
+
+    def test_multi_image_payloads_survive_static_cp_alignment(self, cp2):
+        """Static CP padding changes token layout but not 1/2/4-image payload order."""
+        image_counts = [1, 2, 4]
+        lengths = [13, 17, 23]
+        batch = [
+            _make_mock_multi_image_sample(count, length, seed=2026 + index)
+            for index, (count, length) in enumerate(zip(image_counts, lengths))
+        ]
+        expected_pixels = torch.cat([sample["pixel_values"] for sample in batch]).cuda()
+        expected_grids = torch.cat([sample["image_grid_thw"] for sample in batch]).cuda()
+
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+        assert packed["input_ids"].shape == (1, 60)
+        assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 13, 30, 53]
+        assert packed["packed_seq_params"].cu_seqlens_q_padded.tolist() == [0, 16, 36, 60]
+        assert torch.equal(packed["pixel_values"], expected_pixels)
+        assert torch.equal(packed["image_grid_thw"], expected_grids)
 
     def test_packed_pad_values(self, cp2):
         """Pad slots filled with input_ids=0, labels=-100, loss_mask=0."""

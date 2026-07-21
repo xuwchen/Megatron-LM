@@ -10,7 +10,9 @@ This provider therefore mirrors the raw per-sample contract of
 """
 
 import csv
+import itertools
 import math
+import numbers
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -28,6 +30,18 @@ from megatron.training.datasets.utils import load_json_arg
 
 _MIN_TEXT_TOKENS = 2
 _MAX_TORCH_SEED = 2**63 - 1
+
+_SEQUENCE_LENGTH_STREAM = 0
+_IMAGE_COUNT_STREAM = 1
+_IMAGE_GEOMETRY_STREAM = 2
+_TEXT_TOKEN_STREAM = 3
+_IMAGE_PLACEMENT_STREAM = 4
+_PIXEL_VALUE_STREAM = 5
+
+
+def _seed_sequence(seed: int, idx: int, stream: int, item: int = 0) -> np.random.SeedSequence:
+    """Return an access-order-independent RNG namespace for one sample stream."""
+    return np.random.SeedSequence([int(seed), int(idx), int(stream), int(item)])
 
 
 def _read_sequence_lengths(path: str) -> np.ndarray:
@@ -154,9 +168,125 @@ class _SequenceLengthSampler:
         if self.lengths is not None:
             return int(self.lengths[idx % self.lengths.size])
 
-        rng = np.random.default_rng(np.random.SeedSequence([self.seed, int(idx)]))
+        rng = np.random.default_rng(_seed_sequence(self.seed, int(idx), _SEQUENCE_LENGTH_STREAM))
         sampled = rng.lognormal(mean=self.mu, sigma=self.sigma)
         return int(np.clip(sampled, self.sample_min, self.sample_max))
+
+
+class _ImageCountSampler:
+    """Sample a feasible image count from a validated categorical profile."""
+
+    def __init__(self, config: dict[str, Any] | None, *, seed: int) -> None:
+        self.seed = seed
+        if config is None:
+            self.counts = (1,)
+            self.weights = (1.0,)
+            return
+        if not isinstance(config, dict):
+            raise TypeError(f"image_count_config must be a dict, got {type(config).__name__}")
+
+        # Counts/weights alone are a convenient one-hot test shorthand;
+        # explicit profiles may still declare the categorical mode.
+        mode = str(config.get("mode", "categorical"))
+        if mode != "categorical":
+            raise ValueError(f"Unsupported mock image-count mode {mode!r}; expected 'categorical'.")
+        missing_fields = [field for field in ("counts", "weights") if field not in config]
+        if missing_fields:
+            raise ValueError(
+                "Mock image-count categorical mode is missing required field(s): "
+                + ", ".join(missing_fields)
+            )
+
+        counts = config["counts"]
+        weights = config["weights"]
+        if not isinstance(counts, (list, tuple)) or not counts:
+            raise ValueError("Mock image-count 'counts' must be a non-empty list.")
+        if not isinstance(weights, (list, tuple)) or not weights:
+            raise ValueError("Mock image-count 'weights' must be a non-empty list.")
+        if len(counts) != len(weights):
+            raise ValueError(
+                "Mock image-count 'counts' and 'weights' must have the same length; "
+                f"got {len(counts)} and {len(weights)}."
+            )
+
+        validated_counts: list[int] = []
+        for count_index, count in enumerate(counts):
+            if not isinstance(count, numbers.Integral) or isinstance(count, bool):
+                raise ValueError(
+                    "Mock image counts must be integers in [1, 4]; "
+                    f"got {count!r} at index {count_index}."
+                )
+            count = int(count)
+            if count == 0:
+                raise ValueError(
+                    "Mock image count 0 is not supported; text-only samples are outside "
+                    "the current multimodal provider contract."
+                )
+            if not 1 <= count <= 4:
+                raise ValueError(
+                    "Mock image counts must be in [1, 4]; " f"got {count} at index {count_index}."
+                )
+            validated_counts.append(count)
+        if len(set(validated_counts)) != len(validated_counts):
+            raise ValueError("Mock image-count 'counts' must not contain duplicate values.")
+
+        validated_weights: list[float] = []
+        for weight_index, weight in enumerate(weights):
+            if not isinstance(weight, numbers.Real) or isinstance(weight, bool):
+                raise ValueError(
+                    "Mock image-count weights must be finite non-negative numbers; "
+                    f"got {weight!r} at index {weight_index}."
+                )
+            weight = float(weight)
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError(
+                    "Mock image-count weights must be finite non-negative numbers; "
+                    f"got {weight!r} at index {weight_index}."
+                )
+            validated_weights.append(weight)
+
+        max_weight = max(validated_weights)
+        if max_weight <= 0:
+            raise ValueError("Mock image-count weights must have a finite positive sum.")
+        scaled_weights = [weight / max_weight for weight in validated_weights]
+        scaled_sum = math.fsum(scaled_weights)
+
+        # Drop zero-probability categories so they cannot affect the minimum
+        # supported sequence length or conditional feasibility checks.
+        supported = [
+            (count, weight / scaled_sum)
+            for count, weight in zip(validated_counts, scaled_weights)
+            if weight > 0
+        ]
+        self.counts = tuple(count for count, _ in supported)
+        self.weights = tuple(weight for _, weight in supported)
+
+    @property
+    def min_count(self) -> int:
+        """Minimum count that has non-zero probability."""
+        return min(self.counts)
+
+    def __call__(self, idx: int, *, sample_length: int, min_merged_tokens: int) -> int:
+        feasible = [
+            (count, weight)
+            for count, weight in zip(self.counts, self.weights)
+            if _MIN_TEXT_TOKENS + count * (1 + min_merged_tokens) <= sample_length
+        ]
+        if not feasible:
+            raise RuntimeError(
+                f"No configured mock image count fits sample idx={idx} with length "
+                f"{sample_length}."
+            )
+        if len(feasible) == 1:
+            return feasible[0][0]
+
+        conditional_sum = math.fsum(weight for _, weight in feasible)
+        probabilities = np.asarray(
+            [weight / conditional_sum for _, weight in feasible], dtype=np.float64
+        )
+        rng = np.random.default_rng(_seed_sequence(self.seed, idx, _IMAGE_COUNT_STREAM))
+        selected = int(rng.choice(len(feasible), p=probabilities))
+        return feasible[selected][0]
 
 
 @dataclass(frozen=True)
@@ -172,7 +302,7 @@ class _ImageGeometry:
 
 
 class _ImageGeometrySampler:
-    """Deterministically choose a feasible processed image resolution per index."""
+    """Choose an ordered tuple of processed image resolutions within a token budget."""
 
     def __init__(
         self,
@@ -242,8 +372,40 @@ class _ImageGeometrySampler:
         self.geometries = tuple(geometries)
         self.seed = seed
         self.min_merged_tokens = min(geometry.num_merged_tokens for geometry in self.geometries)
+        self._tuples_by_count: dict[int, tuple[tuple[_ImageGeometry, ...], ...]] = {}
 
-    def __call__(self, idx: int, *, max_merged_tokens: int) -> _ImageGeometry:
+    def feasible_tuples(
+        self, num_images: int, *, max_total_merged_tokens: int
+    ) -> tuple[tuple[_ImageGeometry, ...], ...]:
+        """Return ordered geometry tuples whose merged tokens fit the sample."""
+        if num_images not in self._tuples_by_count:
+            self._tuples_by_count[num_images] = tuple(
+                itertools.product(self.geometries, repeat=num_images)
+            )
+        return tuple(
+            geometries
+            for geometries in self._tuples_by_count[num_images]
+            if sum(geometry.num_merged_tokens for geometry in geometries) <= max_total_merged_tokens
+        )
+
+    def __call__(
+        self, idx: int, *, num_images: int, max_total_merged_tokens: int
+    ) -> tuple[_ImageGeometry, ...]:
+        feasible = self.feasible_tuples(num_images, max_total_merged_tokens=max_total_merged_tokens)
+        if not feasible:
+            raise RuntimeError(
+                f"No ordered tuple of {num_images} mock image resolution(s) fits sample "
+                f"idx={idx} with capacity for {max_total_merged_tokens} merged vision tokens."
+            )
+
+        rng = np.random.default_rng(
+            _seed_sequence(self.seed, idx, _IMAGE_GEOMETRY_STREAM, num_images)
+        )
+        tuple_index = int(rng.integers(len(feasible)))
+        return feasible[tuple_index]
+
+    def sample_one_legacy(self, idx: int, *, max_merged_tokens: int) -> _ImageGeometry:
+        """Preserve the original cyclic bucket selection when count config is omitted."""
         feasible = tuple(
             geometry
             for geometry in self.geometries
@@ -254,9 +416,6 @@ class _ImageGeometrySampler:
                 f"No mock image resolution fits sample idx={idx} with capacity for "
                 f"{max_merged_tokens} merged vision tokens."
             )
-
-        # Consecutive indices cycle through the feasible buckets from a
-        # seed-dependent offset. This is deterministic and access-order independent.
         bucket_index = (self.seed + int(idx)) % len(feasible)
         return feasible[bucket_index]
 
@@ -264,9 +423,10 @@ class _ImageGeometrySampler:
 class MockQwen35VLVarlenDataset(Dataset):
     """Synthetic variable-length Qwen3.5-VL samples.
 
-    Each item contains one complete, unpadded image-text sequence. The
-    multimodal collator packs token tensors and vision payloads independently,
-    then the model computes 3D MRoPE position IDs from the final packed order.
+    Each item contains one complete, unpadded image-text sequence with one to
+    four images. The multimodal collator packs token tensors and vision
+    payloads independently, then the model computes 3D MRoPE position IDs from
+    the final packed order.
 
     Args:
         num_samples: Virtual number of samples in the dataset.
@@ -284,6 +444,11 @@ class MockQwen35VLVarlenDataset(Dataset):
         image_size_config: Optional dynamic-resolution configuration. The
             supported form is ``{"mode":"buckets","resolutions":[[H,W], ...]}``,
             where each pair is a processed image size in pixels.
+        image_count_config: Optional categorical image-count configuration with
+            ``counts`` drawn from 1 through 4 and arbitrary non-negative
+            ``weights``. When omitted, every sample contains exactly one image.
+        image_placement: ``center`` keeps image blocks at the middle text gap;
+            ``uniform`` independently samples each image's text gap.
         patch_size: Spatial patch size used by the vision encoder.
         temporal_patch_size: Temporal patch size folded into each pixel row's
             feature dimension. A still image has grid ``T=1``.
@@ -302,6 +467,8 @@ class MockQwen35VLVarlenDataset(Dataset):
         vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
         image_size: int = 224,
         image_size_config: dict[str, Any] | None = None,
+        image_count_config: dict[str, Any] | None = None,
+        image_placement: str = "center",
         patch_size: int = 16,
         temporal_patch_size: int = 2,
         spatial_merge_size: int = 2,
@@ -314,6 +481,10 @@ class MockQwen35VLVarlenDataset(Dataset):
             raise ValueError("patch_size and temporal_patch_size must be positive.")
         if spatial_merge_size <= 0:
             raise ValueError(f"spatial_merge_size must be positive, got {spatial_merge_size}.")
+        if not isinstance(image_placement, str) or image_placement not in {"center", "uniform"}:
+            raise ValueError(
+                f"image_placement must be 'center' or 'uniform', got {image_placement!r}."
+            )
         if image_size_config is None:
             if image_size <= 0:
                 raise ValueError(f"image_size must be positive, got {image_size}.")
@@ -331,6 +502,8 @@ class MockQwen35VLVarlenDataset(Dataset):
         self.vision_start_token_id = vision_start_token_id
         self.image_size = image_size
         self.image_size_config = image_size_config
+        self.image_count_config = image_count_config
+        self.image_placement = image_placement
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
@@ -342,16 +515,18 @@ class MockQwen35VLVarlenDataset(Dataset):
             spatial_merge_size=spatial_merge_size,
             seed=seed,
         )
+        self.image_count_sampler = _ImageCountSampler(image_count_config, seed=seed)
         self.pixel_dim = 3 * temporal_patch_size * patch_size * patch_size
-        min_seq_length = 1 + self.image_geometry_sampler.min_merged_tokens + _MIN_TEXT_TOKENS
+        min_num_images = self.image_count_sampler.min_count
+        min_seq_length = (
+            min_num_images * (1 + self.image_geometry_sampler.min_merged_tokens) + _MIN_TEXT_TOKENS
+        )
 
         special_ids = {image_token_id, video_token_id, vision_start_token_id}
         if len(special_ids) != 3:
             raise ValueError("image, video, and vision-start token IDs must be distinct.")
         if 0 in special_ids:
-            raise ValueError(
-                "Multimodal token ID 0 is reserved for multimodal packing padding."
-            )
+            raise ValueError("Multimodal token ID 0 is reserved for multimodal packing padding.")
         if vocab_size <= 1 or any(
             token_id < 0 or token_id >= vocab_size for token_id in special_ids
         ):
@@ -373,62 +548,136 @@ class MockQwen35VLVarlenDataset(Dataset):
     def __len__(self) -> int:
         return self.num_samples
 
-    def _generator(self, idx: int, stream: int) -> torch.Generator:
+    def _generator(self, idx: int, stream: int, item: int = 0) -> torch.Generator:
         generator = torch.Generator(device="cpu")
-        generator.manual_seed((self.seed + idx * 2 + stream) % _MAX_TORCH_SEED)
+        seed_state = _seed_sequence(self.seed, idx, stream, item).generate_state(1, dtype=np.uint64)
+        generator.manual_seed(int(seed_state[0]) % _MAX_TORCH_SEED)
         return generator
+
+    def _image_gaps(self, idx: int, *, text_length: int, num_images: int) -> list[int]:
+        """Choose insertion gaps in the original text token coordinates."""
+        if self.image_placement == "center":
+            return [text_length // 2] * num_images
+        return [
+            int(
+                np.random.default_rng(
+                    _seed_sequence(self.seed, idx, _IMAGE_PLACEMENT_STREAM, image_idx)
+                ).integers(0, text_length + 1)
+            )
+            for image_idx in range(num_images)
+        ]
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         if self.num_samples == 0:
             raise IndexError("Cannot index an empty MockQwen35VLVarlenDataset.")
         sample_idx = int(idx) % self.num_samples
         sample_length = self.length_sampler(sample_idx)
-        geometry = self.image_geometry_sampler(
-            sample_idx, max_merged_tokens=sample_length - 1 - _MIN_TEXT_TOKENS
-        )
-        text_length = sample_length - geometry.num_merged_tokens - 1
+        if self.image_count_config is None:
+            num_images = 1
+            geometries = (
+                self.image_geometry_sampler.sample_one_legacy(
+                    sample_idx, max_merged_tokens=sample_length - 1 - _MIN_TEXT_TOKENS
+                ),
+            )
+        else:
+            num_images = self.image_count_sampler(
+                sample_idx,
+                sample_length=sample_length,
+                min_merged_tokens=self.image_geometry_sampler.min_merged_tokens,
+            )
+            geometries = self.image_geometry_sampler(
+                sample_idx,
+                num_images=num_images,
+                max_total_merged_tokens=sample_length - num_images - _MIN_TEXT_TOKENS,
+            )
+        total_merged_tokens = sum(geometry.num_merged_tokens for geometry in geometries)
+        text_length = sample_length - num_images - total_merged_tokens
+        if text_length < _MIN_TEXT_TOKENS:
+            raise RuntimeError(
+                f"Mock sample idx={sample_idx} reserved only {text_length} text tokens; "
+                f"at least {_MIN_TEXT_TOKENS} are required."
+            )
 
         text_tokens = torch.randint(
             1,
             self.vocab_size,
             (text_length,),
             dtype=torch.long,
-            generator=self._generator(sample_idx, stream=0),
+            generator=self._generator(sample_idx, stream=_TEXT_TOKEN_STREAM),
         )
         for special_id in self.special_ids:
             text_tokens[text_tokens == special_id] = self.safe_text_token_id
 
-        prefix_length = text_length // 2
-        input_ids = torch.cat(
-            [
-                text_tokens[:prefix_length],
-                torch.tensor([self.vision_start_token_id], dtype=torch.long),
-                torch.full((geometry.num_merged_tokens,), self.image_token_id, dtype=torch.long),
-                text_tokens[prefix_length:],
-            ]
-        )
+        gaps = self._image_gaps(sample_idx, text_length=text_length, num_images=num_images)
+        image_order = sorted(range(num_images), key=lambda image_idx: (gaps[image_idx], image_idx))
+        ordered_geometries = tuple(geometries[image_idx] for image_idx in image_order)
+
+        token_chunks: list[torch.Tensor] = []
+        text_cursor = 0
+        for image_idx in image_order:
+            gap = gaps[image_idx]
+            geometry = geometries[image_idx]
+            token_chunks.extend(
+                [
+                    text_tokens[text_cursor:gap],
+                    torch.tensor([self.vision_start_token_id], dtype=torch.long),
+                    torch.full(
+                        (geometry.num_merged_tokens,), self.image_token_id, dtype=torch.long
+                    ),
+                ]
+            )
+            text_cursor = gap
+        token_chunks.append(text_tokens[text_cursor:])
+        input_ids = torch.cat(token_chunks)
 
         labels = torch.empty_like(input_ids)
         labels[:-1] = input_ids[1:]
         labels[-1] = -100
-        loss_mask = torch.ones(sample_length, dtype=torch.float32)
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
         target_is_special = labels == -100
         for special_id in self.special_ids:
             target_is_special |= labels == special_id
         labels[target_is_special] = -100
         loss_mask[target_is_special] = 0.0
 
-        pixel_values = torch.randn(
-            geometry.total_patches, self.pixel_dim, generator=self._generator(sample_idx, stream=1)
+        pixels_by_image = tuple(
+            torch.randn(
+                geometry.total_patches,
+                self.pixel_dim,
+                generator=self._generator(sample_idx, stream=_PIXEL_VALUE_STREAM, item=image_idx),
+            )
+            for image_idx, geometry in enumerate(geometries)
         )
-        image_grid_thw = torch.tensor([[1, geometry.grid_h, geometry.grid_w]], dtype=torch.long)
+        pixel_values = torch.cat([pixels_by_image[image_idx] for image_idx in image_order], dim=0)
+        image_grid_thw = torch.tensor(
+            [[1, geometry.grid_h, geometry.grid_w] for geometry in ordered_geometries],
+            dtype=torch.long,
+        )
 
         if input_ids.numel() != sample_length:
             raise RuntimeError(
                 f"Generated {input_ids.numel()} tokens for requested length {sample_length}."
             )
-        if int((input_ids == self.image_token_id).sum().item()) != geometry.num_merged_tokens:
+        vision_start_positions = torch.where(input_ids == self.vision_start_token_id)[0]
+        if vision_start_positions.numel() != num_images:
+            raise RuntimeError("Vision-start token count does not match the sampled image count.")
+        if int((input_ids == self.image_token_id).sum().item()) != total_merged_tokens:
             raise RuntimeError("Image placeholder count does not match the merged vision grid.")
+        expected_patches = sum(geometry.total_patches for geometry in ordered_geometries)
+        if pixel_values.shape != (expected_patches, self.pixel_dim):
+            raise RuntimeError("Pixel rows do not match the raw patch grids.")
+        if image_grid_thw.shape != (num_images, 3):
+            raise RuntimeError("Image grid rows do not match the sampled image count.")
+        for vision_start, geometry in zip(vision_start_positions.tolist(), ordered_geometries):
+            image_block = input_ids[
+                vision_start + 1 : vision_start + 1 + geometry.num_merged_tokens
+            ]
+            if image_block.numel() != geometry.num_merged_tokens or not torch.all(
+                image_block == self.image_token_id
+            ):
+                raise RuntimeError(
+                    "Each vision-start token must be followed by its complete image block."
+                )
 
         return {
             "input_ids": input_ids,
@@ -485,6 +734,7 @@ def train_valid_test_varlen_datasets_provider(
 
     length_config = load_json_arg(getattr(args, "varlen_mock_dataset_config_json", None))
     image_size_config = load_json_arg(getattr(args, "mock_image_size_config_json", None))
+    image_count_config = load_json_arg(getattr(args, "mock_image_count_config_json", None))
     kwargs = dict(
         seq_length=total_seq_length,
         length_config=length_config,
@@ -492,6 +742,8 @@ def train_valid_test_varlen_datasets_provider(
         image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
         image_size=getattr(args, "image_size", 224),
         image_size_config=image_size_config,
+        image_count_config=image_count_config,
+        image_placement=getattr(args, "mock_image_placement", "center"),
     )
     seed = int(getattr(args, "seed", 1234))
 

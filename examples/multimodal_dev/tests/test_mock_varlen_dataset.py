@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import megatron.training
+from examples.multimodal_dev.data import mock_varlen
 from examples.multimodal_dev.data.mock_varlen import (
     MockQwen35VLVarlenDataset,
     train_valid_test_varlen_datasets_provider,
@@ -54,10 +55,48 @@ def _bucket_config(*resolutions):
     return {"mode": "buckets", "resolutions": [list(size) for size in resolutions]}
 
 
+def _count_config(counts, weights):
+    return {"mode": "categorical", "counts": list(counts), "weights": list(weights)}
+
+
 def _assert_samples_equal(lhs, rhs):
     assert lhs.keys() == rhs.keys()
     for key in lhs:
         assert torch.equal(lhs[key], rhs[key]), key
+
+
+def _assert_multi_image_contract(sample):
+    input_ids = sample["input_ids"]
+    grids = sample["image_grid_thw"]
+    pixel_values = sample["pixel_values"]
+    vision_starts = torch.where(input_ids == _VISION_START_TOKEN_ID)[0].tolist()
+
+    assert tuple(grids.shape) == (len(vision_starts), 3)
+    assert 1 <= len(vision_starts) <= 4
+
+    patch_offset = 0
+    expected_image_tokens = 0
+    block_ends = []
+    for vision_start, (t, h, w) in zip(vision_starts, grids.tolist()):
+        num_patches = t * h * w
+        num_image_tokens = t * (h // _SPATIAL_MERGE_SIZE) * (w // _SPATIAL_MERGE_SIZE)
+        image_start = vision_start + 1
+        image_end = image_start + num_image_tokens
+
+        assert torch.all(input_ids[image_start:image_end] == _IMAGE_TOKEN_ID)
+        assert pixel_values[patch_offset : patch_offset + num_patches].shape == (
+            num_patches,
+            _PIXEL_DIM,
+        )
+        patch_offset += num_patches
+        expected_image_tokens += num_image_tokens
+        block_ends.append(image_end)
+
+    assert patch_offset == pixel_values.shape[0]
+    assert expected_image_tokens == int((input_ids == _IMAGE_TOKEN_ID).sum().item())
+    assert int((input_ids == _VISION_START_TOKEN_ID).sum().item()) == grids.shape[0]
+    assert all(end <= next_start for end, next_start in zip(block_ends, vision_starts[1:]))
+    return vision_starts, block_ends
 
 
 def test_provider_rejects_packed_hybridep_without_variable_token_padding(monkeypatch):
@@ -73,6 +112,38 @@ def test_provider_rejects_packed_hybridep_without_variable_token_padding(monkeyp
 
     with pytest.raises(ValueError, match="--moe-hybridep-pad-variable-tokens"):
         train_valid_test_varlen_datasets_provider((1, 1, 1))
+
+
+def test_provider_forwards_image_count_and_placement_config(monkeypatch):
+    args = SimpleNamespace(
+        use_varlen_dataset=False,
+        sequence_packing_scheduler=None,
+        use_packed_sequence=False,
+        use_vanilla_collate_fn=True,
+        total_seq_length=32,
+        seq_length=32,
+        varlen_mock_dataset_config_json=None,
+        mock_image_size_config_json=None,
+        mock_image_count_config_json=('{"mode":"categorical","counts":[4],"weights":[1]}'),
+        mock_image_placement="uniform",
+        # The provider intentionally keeps the Qwen defaults for video and
+        # vision-start IDs, so its vocabulary must contain those IDs.
+        padded_vocab_size=248320,
+        image_token_id=_IMAGE_TOKEN_ID,
+        image_size=32,
+        seed=2026,
+    )
+    monkeypatch.setattr(megatron.training, "get_args", lambda: args)
+
+    train_ds, val_ds, test_ds = train_valid_test_varlen_datasets_provider((1, 1, 1))
+
+    for dataset in (train_ds, val_ds, test_ds):
+        sample = dataset[0]
+        assert sample["image_grid_thw"].shape == (4, 3)
+        assert sample["image_grid_thw"].tolist() == [[1, 2, 2]] * 4
+        assert sample["pixel_values"].shape == (16, 1536)
+        assert int((sample["input_ids"] == dataset.vision_start_token_id).sum().item()) == 4
+        assert int((sample["input_ids"] == dataset.image_token_id).sum().item()) == 4
 
 
 def test_file_lengths_are_exact_and_repeat(tmp_path):
@@ -139,6 +210,141 @@ def test_image_geometry_matches_tokens_and_pixels(tmp_path):
     assert torch.all((0 <= input_ids) & (input_ids < _VOCAB_SIZE))
 
 
+@pytest.mark.parametrize("num_images", [1, 2, 3, 4])
+def test_one_hot_image_count_generates_requested_number(num_images):
+    # The counts/weights-only shorthand is useful for forced smoke coverage.
+    count_config = (
+        {"counts": [num_images], "weights": [1]}
+        if num_images == 4
+        else _count_config([num_images], [1])
+    )
+    dataset = _make_dataset(num_samples=1, seq_length=64, image_count_config=count_config)
+
+    sample = dataset[0]
+
+    assert sample["image_grid_thw"].shape == (num_images, 3)
+    assert int((sample["input_ids"] == _VISION_START_TOKEN_ID).sum().item()) == num_images
+    _assert_multi_image_contract(sample)
+
+
+def test_default_remains_one_fixed_centered_image(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("23\n", encoding="utf-8")
+    dataset = _make_dataset(seq_length=23, length_config=_file_config(lengths_file))
+
+    sample = dataset[0]
+    vision_start = int(torch.where(sample["input_ids"] == _VISION_START_TOKEN_ID)[0].item())
+    text_length = 23 - 1 - _NUM_MERGED_TOKENS
+
+    assert sample["image_grid_thw"].tolist() == [list(_GRID_THW)]
+    assert vision_start == text_length // 2
+    _assert_multi_image_contract(sample)
+
+
+def test_multi_image_dynamic_geometries_preserve_block_and_payload_order(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("96\n", encoding="utf-8")
+    dataset = _make_dataset(
+        num_samples=2,
+        seq_length=96,
+        length_config=_file_config(lengths_file),
+        image_count_config=_count_config([4], [1]),
+        image_size_config=_bucket_config((8, 8), (8, 16), (16, 8), (16, 16)),
+        image_placement="uniform",
+        seed=2026,
+    )
+
+    sample = dataset[1]
+
+    _assert_multi_image_contract(sample)
+    geometries = dataset.image_geometry_sampler(1, num_images=4, max_total_merged_tokens=96 - 4 - 2)
+    text_length = 96 - 4 - sum(geometry.num_merged_tokens for geometry in geometries)
+    gaps = dataset._image_gaps(1, text_length=text_length, num_images=4)
+    image_order = sorted(range(4), key=lambda image_idx: (gaps[image_idx], image_idx))
+    expected_grids = [
+        [1, geometries[image_idx].grid_h, geometries[image_idx].grid_w] for image_idx in image_order
+    ]
+    pixels_by_image = [
+        torch.randn(
+            geometry.total_patches,
+            dataset.pixel_dim,
+            generator=dataset._generator(1, stream=mock_varlen._PIXEL_VALUE_STREAM, item=image_idx),
+        )
+        for image_idx, geometry in enumerate(geometries)
+    ]
+    expected_pixels = torch.cat([pixels_by_image[image_idx] for image_idx in image_order])
+
+    # Seed 2026 / index 1 chooses all four buckets, then uniform placement
+    # reorders their payloads into final token order.
+    assert expected_grids == [[1, 8, 4], [1, 4, 4], [1, 8, 8], [1, 4, 8]]
+    assert sample["image_grid_thw"].tolist() == expected_grids
+    assert torch.equal(sample["pixel_values"], expected_pixels)
+
+
+def test_uniform_placement_covers_all_text_gaps_and_allows_adjacent_images(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("22\n", encoding="utf-8")
+    dataset = _make_dataset(
+        num_samples=1,
+        seq_length=22,
+        length_config=_file_config(lengths_file),
+        image_count_config=_count_config([4], [1]),
+        image_placement="uniform",
+        seed=2026,
+    )
+
+    sample = dataset[0]
+    vision_starts, block_ends = _assert_multi_image_contract(sample)
+
+    # With two text tokens, seed 2026 / index 0 samples gaps [1, 0, 2, 0].
+    # Stable gap sorting therefore covers start/middle/end and keeps the two
+    # images at gap 0 adjacent.
+    assert vision_starts == [0, 5, 11, 17]
+    assert block_ends == [5, 10, 16, 22]
+
+
+def test_short_length_renormalizes_over_feasible_image_counts(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("7\n", encoding="utf-8")
+    dataset = _make_dataset(
+        num_samples=1,
+        seq_length=7,
+        length_config=_file_config(lengths_file),
+        image_count_config=_count_config([1, 4], [1, 99]),
+        image_size_config=_bucket_config((8, 8), (8, 16)),
+    )
+
+    sample = dataset[0]
+
+    assert sample["image_grid_thw"].tolist() == [[1, 4, 4]]
+    _assert_multi_image_contract(sample)
+
+
+def test_image_count_weights_are_normalized_internally():
+    dataset = _make_dataset(image_count_config={"counts": [1, 2, 3, 4], "weights": [75, 15, 7, 3]})
+
+    assert dataset.image_count_sampler.counts == (1, 2, 3, 4)
+    assert dataset.image_count_sampler.weights == pytest.approx((0.75, 0.15, 0.07, 0.03))
+
+
+def test_short_length_filters_joint_geometry_tuple(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("22\n", encoding="utf-8")
+    dataset = _make_dataset(
+        num_samples=1,
+        seq_length=22,
+        length_config=_file_config(lengths_file),
+        image_count_config=_count_config([4], [1]),
+        image_size_config=_bucket_config((8, 8), (8, 16)),
+    )
+
+    sample = dataset[0]
+
+    assert sample["image_grid_thw"].tolist() == [[1, 4, 4]] * 4
+    assert sample["input_ids"].numel() == 22
+    _assert_multi_image_contract(sample)
+
+
 def test_labels_and_loss_mask_follow_shifted_targets(tmp_path):
     lengths_file = tmp_path / "lengths.csv"
     lengths_file.write_text("17\n", encoding="utf-8")
@@ -192,6 +398,39 @@ def test_samples_are_deterministic_and_access_order_independent():
     )
     assert not torch.equal(sample_7_before["image_grid_thw"], different_seed[7]["image_grid_thw"])
     assert not torch.equal(sample_7_before["pixel_values"], different_seed[7]["pixel_values"])
+
+
+def test_multi_image_random_streams_are_deterministic_and_distinct():
+    kwargs = {
+        "num_samples": 4,
+        "seq_length": 64,
+        "image_count_config": _count_config([4], [1]),
+        "image_placement": "uniform",
+        "seed": 2026,
+    }
+    dataset = _make_dataset(**kwargs)
+    same_seed = _make_dataset(**kwargs)
+
+    sample_0_before = dataset[0]
+    _ = dataset[3]
+    sample_0_after = dataset[0]
+    sample_0_fresh = same_seed[0]
+    sample_1 = dataset[1]
+
+    _assert_samples_equal(sample_0_before, sample_0_after)
+    _assert_samples_equal(sample_0_before, sample_0_fresh)
+
+    patches_per_image = _NUM_PATCHES
+    pixel_chunks = [
+        sample_0_before["pixel_values"][offset : offset + patches_per_image]
+        for offset in range(0, 4 * patches_per_image, patches_per_image)
+    ]
+    assert all(
+        not torch.equal(lhs, rhs)
+        for index, lhs in enumerate(pixel_chunks)
+        for rhs in pixel_chunks[index + 1 :]
+    )
+    assert not torch.equal(pixel_chunks[0], sample_1["pixel_values"][:patches_per_image])
 
 
 def test_dynamic_resolutions_vary_and_preserve_geometry(tmp_path):
@@ -322,6 +561,38 @@ def test_rejects_invalid_dynamic_resolution_config(image_size_config, message):
 def test_rejects_non_dict_dynamic_resolution_config():
     with pytest.raises(TypeError, match="image_size_config must be a dict"):
         _make_dataset(image_size_config=[[8, 8]])
+
+
+@pytest.mark.parametrize(
+    ("image_count_config", "message"),
+    [
+        ({"mode": "uniform", "counts": [1], "weights": [1]}, "categorical"),
+        ({"mode": "categorical", "weights": [1]}, "counts"),
+        ({"mode": "categorical", "counts": [1]}, "weights"),
+        (_count_config([], []), "non-empty"),
+        (_count_config([0], [1]), "text-only samples"),
+        (_count_config([-1], [1]), r"must be in \[1, 4\]"),
+        (_count_config([5], [1]), r"must be in \[1, 4\]"),
+        (_count_config([1, 1], [1, 1]), "duplicate"),
+        (_count_config([1, 2], [1]), "same length"),
+        (_count_config([1], [-1]), "non-negative"),
+        (_count_config([1], [float("nan")]), "finite"),
+        (_count_config([1, 2], [0, 0]), "positive"),
+    ],
+)
+def test_rejects_invalid_image_count_config(image_count_config, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        _make_dataset(image_count_config=image_count_config)
+
+
+def test_rejects_non_dict_image_count_config():
+    with pytest.raises(TypeError, match="image_count_config must be a dict"):
+        _make_dataset(image_count_config=[1, 2, 3, 4])
+
+
+def test_rejects_invalid_image_placement():
+    with pytest.raises(ValueError, match="center.*uniform"):
+        _make_dataset(image_placement="random")
 
 
 @pytest.mark.parametrize(
