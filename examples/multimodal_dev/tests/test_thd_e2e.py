@@ -16,6 +16,7 @@ require ``torch.distributed`` to be initialised.  Run via::
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +25,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from examples.multimodal_dev.data.mock_varlen import MockQwen35VLVarlenDataset
 from examples.multimodal_dev.forward_step import _build_packed_seq_params, pack_or_pad_batch
 from tests.unit_tests.test_utilities import Utils
 
@@ -50,7 +52,7 @@ def _make_sample(
         "labels": (torch.arange(seq_len, dtype=torch.long, device=device) + base + 100),
         "loss_mask": torch.ones(seq_len, dtype=torch.float, device=device),
         "pixel_values": torch.full((num_patches, pixel_dim), float(base), device=device),
-        "image_grid_thw": torch.tensor([[2, 4, 4]], dtype=torch.long, device=device),
+        "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long, device=device),
     }
 
 
@@ -178,6 +180,152 @@ class TestPackOrPadBatchPacked:
         assert psp.cu_seqlens_q.tolist() == [0, 7]
         assert psp.max_seqlen_q == 7
         assert psp.total_tokens == 7
+
+    def test_mock_qwen35_vl_varlen_dataset_integration(self, tmp_path):
+        """File-driven multimodal samples pack tokens and vision payloads together."""
+        lengths_file = tmp_path / "multimodal_lengths.csv"
+        lengths_file.write_text("7\n11\n", encoding="utf-8")
+        image_token_id = 97
+        dataset = MockQwen35VLVarlenDataset(
+            num_samples=2,
+            seq_length=11,
+            length_config={"mode": "file", "path": str(lengths_file)},
+            seed=1234,
+            vocab_size=100,
+            image_token_id=image_token_id,
+            video_token_id=98,
+            vision_start_token_id=96,
+            image_size=32,
+            image_size_config={"mode": "buckets", "resolutions": [[32, 32], [32, 96]]},
+            patch_size=16,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+        )
+
+        packed = pack_or_pad_batch(
+            [dataset[0], dataset[1]], use_packed_sequence=True, device="cuda"
+        )
+
+        assert packed["input_ids"].shape == (1, 18)
+        assert packed["labels"].shape == (1, 18)
+        assert packed["loss_mask"].shape == (1, 18)
+        assert packed["padding_mask"].shape == (1, 18)
+        assert not packed["padding_mask"].any().item()
+        assert packed["pixel_values"].shape == (16, 1536)
+        assert packed["image_grid_thw"].tolist() == [[1, 2, 2], [1, 2, 6]]
+        assert int((packed["input_ids"] == image_token_id).sum().item()) == 4
+
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 7, 18]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 7, 18]
+        assert psp.max_seqlen_q == 11
+        assert psp.total_tokens == 18
+
+
+class TestPackOrPadBatchPackedAlignment:
+    """Core packed-padding flags also apply to the multimodal local packer."""
+
+    @pytest.fixture
+    def alignment_128(self, monkeypatch):
+        """Enable eager 128-token padding with an appended dummy sequence."""
+        from examples.multimodal_dev import forward_step
+
+        args = SimpleNamespace(
+            sequence_parallel=False,
+            pad_packed_seq_alignment=128,
+            pad_packed_seq_by_appending_dummy_seq=True,
+            max_seqlen_per_dp_cp_rank=128,
+            thd_max_packed_sequences=None,
+            cuda_graph_impl="none",
+        )
+        monkeypatch.setattr(forward_step, "get_args", lambda: args)
+        return args
+
+    def test_alignment_appends_dummy_sequence(self, alignment_128):
+        """A packed 7/11 batch pads to 128 without changing vision payloads."""
+        batch = [_make_sample(7, base=0, num_patches=4), _make_sample(11, base=100, num_patches=12)]
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+        assert packed["input_ids"].shape == (1, 128)
+        assert packed["labels"].shape == (1, 128)
+        assert packed["loss_mask"].shape == (1, 128)
+        assert packed["padding_mask"].shape == (1, 128)
+        assert not packed["padding_mask"][0, :18].any().item()
+        assert packed["padding_mask"][0, 18:].all().item()
+        assert not packed["loss_mask"][0, 18:].any().item()
+        assert packed["labels"][0, 18:].eq(-100).all().item()
+        assert packed["pixel_values"].shape == (16, 8)
+        assert packed["image_grid_thw"].shape == (2, 3)
+
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 7, 18, 128]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 7, 18, 128]
+        assert psp.max_seqlen_q == 110
+        assert psp.total_tokens == 128
+        assert psp.pad_between_seqs is False
+
+    def test_alignment_preserves_cp2_per_sample_padding(self, alignment_128, monkeypatch):
+        """CP2 aligns each rank to 128 after preserving real sample boundaries."""
+        from examples.multimodal_dev import forward_step
+
+        monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 2)
+        packed = pack_or_pad_batch(
+            [_make_sample(7, base=0), _make_sample(11, base=100)],
+            use_packed_sequence=True,
+            device="cuda",
+        )
+
+        assert packed["input_ids"].shape == (1, 256)
+        assert packed["padding_mask"][0, 7].item()
+        assert packed["padding_mask"][0, 19:].all().item()
+        assert int(packed["padding_mask"].sum().item()) == 238
+        assert packed["labels"][0, 20:].eq(-100).all().item()
+
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 7, 18, 254]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 8, 20, 256]
+        assert psp.max_seqlen_q == 236
+        assert psp.total_tokens == 256
+
+        from examples.multimodal_dev.models.base import _thd_cp_partition_index
+        from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
+
+        rank_indices = [
+            _thd_cp_partition_index(psp.cu_seqlens_q_padded, 256, 2, rank) for rank in range(2)
+        ]
+        assert [indices.numel() for indices in rank_indices] == [128, 128]
+        covered = torch.cat(rank_indices).sort().values
+        assert torch.equal(covered, torch.arange(256, device=covered.device))
+
+        position_ids, deltas = get_rope_index(
+            spatial_merge_size=2,
+            image_token_id=10_001,
+            video_token_id=10_002,
+            vision_start_token_id=10_003,
+            input_ids=packed["input_ids"],
+            packed_seq_params=psp,
+        )
+        expected_dummy_positions = torch.arange(236, device="cuda").expand(3, -1)
+        assert position_ids.shape == (3, 1, 256)
+        assert torch.equal(position_ids[:, 0, 20:], expected_dummy_positions)
+        assert deltas.tolist() == [[0], [0], [0]]
+
+    def test_alignment_requires_dummy_sequence(self, alignment_128):
+        """The pre-CP path rejects an uncovered padding tail."""
+        alignment_128.pad_packed_seq_by_appending_dummy_seq = False
+        with pytest.raises(ValueError, match="appending-dummy-seq"):
+            pack_or_pad_batch(
+                [_make_sample(7), _make_sample(11)], use_packed_sequence=True, device="cuda"
+            )
+
+    def test_packed_thd_rejects_cuda_graph_without_alignment(self, alignment_128):
+        """Local THD is unsupported by CUDA Graph even without padding enabled."""
+        alignment_128.pad_packed_seq_alignment = None
+        alignment_128.cuda_graph_impl = "local"
+        with pytest.raises(ValueError, match="does not yet support CUDA Graph"):
+            pack_or_pad_batch(
+                [_make_sample(7), _make_sample(11)], use_packed_sequence=True, device="cuda"
+            )
 
 
 # ===================================================================
