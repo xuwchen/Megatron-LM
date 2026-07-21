@@ -47,12 +47,16 @@ def add_multimodal_args(parser):
         type=str,
         default=None,
         help=(
-            "Image-count coverage profile for mock_varlen. Accepts inline JSON or a "
-            "JSON-file path with schema "
-            "'{\"mode\":\"categorical\",\"counts\":[1,2,3,4],"
-            "\"weights\":[75,15,7,3]}'. Counts must be in [1, 4]; weights are "
-            "normalized internally. When omitted, every image-bearing sample has "
-            "exactly one image."
+            "Image-count profile for mock_varlen. Accepts inline JSON or a "
+            "JSON-file path. Categorical mode: "
+            "'{\"mode\":\"categorical\",\"counts\":[1,2,3,4,5,6,7,8],"
+            "\"weights\":[40,22,12,9,6,5,3,3]}' with counts in [1, 8] and "
+            "internally normalized weights. Density mode: "
+            "'{\"mode\":\"density\",\"images_per_1k_tokens\":1.4,"
+            "\"max_count\":64}' draws Poisson(density * L / 1000) clamped to "
+            "[1, max_count] so image counts scale with sample length and the "
+            "vision-token share stays stable across sequence-length profiles. "
+            "When omitted, every image-bearing sample has exactly one image."
         ),
     )
     group.add_argument(

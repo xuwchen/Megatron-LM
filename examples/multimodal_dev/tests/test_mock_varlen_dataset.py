@@ -76,7 +76,7 @@ def _assert_multi_image_contract(sample):
     vision_starts = torch.where(input_ids == _VISION_START_TOKEN_ID)[0].tolist()
 
     assert tuple(grids.shape) == (len(vision_starts), 3)
-    assert 1 <= len(vision_starts) <= 4
+    assert len(vision_starts) >= 1
 
     patch_offset = 0
     expected_image_tokens = 0
@@ -214,7 +214,7 @@ def test_image_geometry_matches_tokens_and_pixels(tmp_path):
     assert torch.all((0 <= input_ids) & (input_ids < _VOCAB_SIZE))
 
 
-@pytest.mark.parametrize("num_images", [1, 2, 3, 4])
+@pytest.mark.parametrize("num_images", [1, 2, 3, 4, 6, 8])
 def test_one_hot_image_count_generates_requested_number(num_images):
     # The counts/weights-only shorthand is useful for forced smoke coverage.
     count_config = (
@@ -278,9 +278,9 @@ def test_multi_image_dynamic_geometries_preserve_block_and_payload_order(tmp_pat
     ]
     expected_pixels = torch.cat([pixels_by_image[image_idx] for image_idx in image_order])
 
-    # Seed 2026 / index 1 chooses all four buckets, then uniform placement
-    # reorders their payloads into final token order.
-    assert expected_grids == [[1, 8, 4], [1, 4, 4], [1, 8, 8], [1, 4, 8]]
+    # Seed 2026 / index 1 mixes three distinct buckets with one repeat, then
+    # uniform placement reorders their payloads into final token order.
+    assert expected_grids == [[1, 4, 4], [1, 8, 4], [1, 4, 8], [1, 4, 4]]
     assert sample["image_grid_thw"].tolist() == expected_grids
     assert torch.equal(sample["pixel_values"], expected_pixels)
 
@@ -488,6 +488,123 @@ def test_short_length_renormalizes_over_feasible_image_counts(tmp_path):
 
     assert sample["image_grid_thw"].tolist() == [[1, 4, 4]]
     _assert_multi_image_contract(sample)
+
+
+def test_density_image_count_scales_with_sample_length(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("64\n" * 16 + "640\n" * 16, encoding="utf-8")
+    dataset = _make_dataset(
+        num_samples=32,
+        seq_length=640,
+        length_config=_file_config(lengths_file),
+        image_count_config={"mode": "density", "images_per_1k_tokens": 20, "max_count": 64},
+    )
+
+    counts = [dataset[idx]["image_grid_thw"].shape[0] for idx in range(32)]
+    short_counts, long_counts = counts[:16], counts[16:]
+
+    # Poisson means: 20 * 64/1000 = 1.28 and 20 * 640/1000 = 12.8.
+    assert all(1 <= count <= 5 for count in short_counts)
+    assert all(5 <= count <= 25 for count in long_counts)
+    short_mean = sum(short_counts) / len(short_counts)
+    long_mean = sum(long_counts) / len(long_counts)
+    assert 0.6 <= short_mean <= 2.2
+    assert 9.0 <= long_mean <= 17.0
+    for idx in (0, 16):
+        _assert_multi_image_contract(dataset[idx])
+
+
+def test_density_image_count_respects_max_count_and_budget(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("640\n", encoding="utf-8")
+    # Poisson mean 12.8 clamps down to max_count.
+    capped = _make_dataset(
+        num_samples=4,
+        seq_length=640,
+        length_config=_file_config(lengths_file),
+        image_count_config={"mode": "density", "images_per_1k_tokens": 20, "max_count": 3},
+    )
+    assert all(capped[idx]["image_grid_thw"].shape[0] == 3 for idx in range(4)), [
+        capped[idx]["image_grid_thw"].shape[0] for idx in range(4)
+    ]
+
+    # Budget clamp: a 16x16 image costs 1 + 16 tokens, so a 64-token sample
+    # fits at most (64 - 2) // 17 = 3 images regardless of the Poisson draw.
+    lengths_file.write_text("64\n", encoding="utf-8")
+    budget_bound = _make_dataset(
+        num_samples=8,
+        seq_length=64,
+        length_config=_file_config(lengths_file),
+        image_size=16,
+        image_count_config={"mode": "density", "images_per_1k_tokens": 64, "max_count": 100},
+    )
+    counts = [budget_bound[idx]["image_grid_thw"].shape[0] for idx in range(8)]
+    assert all(1 <= count <= 3 for count in counts), counts
+    assert max(counts) == 3, counts
+    assert budget_bound[0]["input_ids"].numel() == 64
+
+
+def test_density_counts_are_deterministic():
+    kwargs = {
+        "num_samples": 8,
+        "seq_length": 256,
+        "image_count_config": {"mode": "density", "images_per_1k_tokens": 8, "max_count": 16},
+        "seed": 2026,
+    }
+    dataset = _make_dataset(**kwargs)
+    same_seed = _make_dataset(**kwargs)
+
+    for idx in range(8):
+        _assert_samples_equal(dataset[idx], same_seed[idx])
+
+
+@pytest.mark.parametrize(
+    ("image_count_config", "message"),
+    [
+        ({"mode": "density", "max_count": 8}, "images_per_1k_tokens"),
+        ({"mode": "density", "images_per_1k_tokens": 1}, "max_count"),
+        (
+            {"mode": "density", "images_per_1k_tokens": 0, "max_count": 8},
+            r"finite number in \(0, 64",
+        ),
+        (
+            {"mode": "density", "images_per_1k_tokens": float("nan"), "max_count": 8},
+            r"finite number in \(0, 64",
+        ),
+        (
+            {"mode": "density", "images_per_1k_tokens": 100, "max_count": 8},
+            r"finite number in \(0, 64",
+        ),
+        ({"mode": "density", "images_per_1k_tokens": 1, "max_count": 0}, r"integer in \[1, 1024\]"),
+        (
+            {"mode": "density", "images_per_1k_tokens": 1, "max_count": 2000},
+            r"integer in \[1, 1024\]",
+        ),
+        (
+            {"mode": "density", "images_per_1k_tokens": 1, "max_count": True},
+            r"integer in \[1, 1024\]",
+        ),
+    ],
+)
+def test_rejects_invalid_density_config(image_count_config, message):
+    with pytest.raises(ValueError, match=message):
+        _make_dataset(image_count_config=image_count_config)
+
+
+def test_large_image_count_geometry_sampling_is_feasible_and_deterministic():
+    # 6^48 ordered tuples overflow any integer counter; the float-normalized
+    # completion counts must still sample a feasible tuple deterministically.
+    config = _bucket_config((8, 8), (8, 16))
+    sampler_kwargs = {"image_size": 8, "patch_size": 2, "spatial_merge_size": 2, "seed": 7}
+    first = mock_varlen._ImageGeometrySampler(config, **sampler_kwargs)
+    second = mock_varlen._ImageGeometrySampler(config, **sampler_kwargs)
+
+    budget = 48 * 6  # binding: min sum 48*4=192, max sum 48*8=384 > 288
+    geometries = first(3, num_images=48, max_total_merged_tokens=budget)
+
+    assert len(geometries) == 48
+    assert sum(geometry.num_merged_tokens for geometry in geometries) <= budget
+    assert geometries == second(3, num_images=48, max_total_merged_tokens=budget)
 
 
 def test_image_count_weights_are_normalized_internally():
@@ -741,8 +858,8 @@ def test_rejects_non_dict_dynamic_resolution_config():
         ({"mode": "categorical", "counts": [1]}, "weights"),
         (_count_config([], []), "non-empty"),
         (_count_config([0], [1]), "modality profile"),
-        (_count_config([-1], [1]), r"must be in \[1, 4\]"),
-        (_count_config([5], [1]), r"must be in \[1, 4\]"),
+        (_count_config([-1], [1]), r"must be in \[1, 8\]"),
+        (_count_config([9], [1]), r"must be in \[1, 8\]"),
         (_count_config([1, 1], [1, 1]), "duplicate"),
         (_count_config([1, 2], [1]), "same length"),
         (_count_config([1], [-1]), "non-negative"),

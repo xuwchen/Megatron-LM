@@ -10,7 +10,6 @@ This provider therefore mirrors the raw per-sample contract of
 """
 
 import csv
-import itertools
 import math
 import numbers
 from dataclasses import dataclass
@@ -44,7 +43,9 @@ _MODALITY_TEXT_ONLY = "text_only"
 _MODALITY_IMAGE_ONLY = "image_only"
 _SUPPORTED_MODALITIES = (_MODALITY_INTERLEAVED, _MODALITY_TEXT_ONLY, _MODALITY_IMAGE_ONLY)
 
-_MAX_IMAGES_PER_SAMPLE = 4
+_MAX_IMAGES_PER_SAMPLE = 8
+_MAX_DENSITY_IMAGE_COUNT = 1024
+_MAX_IMAGES_PER_1K_TOKENS = 64.0
 
 
 def _normalized_categorical(
@@ -309,10 +310,18 @@ class _ModalitySampler:
 
 
 class _ImageCountSampler:
-    """Sample a feasible image count from a validated categorical profile."""
+    """Sample a feasible image count from a categorical or density profile.
+
+    ``categorical`` draws from explicit counts/weights (1 through 8).
+    ``density`` draws ``Poisson(images_per_1k_tokens * L / 1000)`` clamped to
+    ``[1, max_count]`` and to the sample's feasible range, so the image count
+    scales with sample length and the vision-token share stays roughly
+    constant across sequence-length profiles.
+    """
 
     def __init__(self, config: dict[str, Any] | None, *, seed: int) -> None:
         self.seed = seed
+        self.mode = "categorical"
         if config is None:
             self.counts = (1,)
             self.weights = (1.0,)
@@ -323,8 +332,45 @@ class _ImageCountSampler:
         # Counts/weights alone are a convenient one-hot test shorthand;
         # explicit profiles may still declare the categorical mode.
         mode = str(config.get("mode", "categorical"))
+        if mode == "density":
+            self.mode = "density"
+            missing_fields = [
+                field for field in ("images_per_1k_tokens", "max_count") if field not in config
+            ]
+            if missing_fields:
+                raise ValueError(
+                    "Mock image-count density mode is missing required field(s): "
+                    + ", ".join(missing_fields)
+                )
+            density = config["images_per_1k_tokens"]
+            if (
+                not isinstance(density, numbers.Real)
+                or isinstance(density, bool)
+                or not math.isfinite(float(density))
+                or not 0 < float(density) <= _MAX_IMAGES_PER_1K_TOKENS
+            ):
+                raise ValueError(
+                    "Mock image-count 'images_per_1k_tokens' must be a finite number in "
+                    f"(0, {_MAX_IMAGES_PER_1K_TOKENS}]; got {density!r}."
+                )
+            max_count = config["max_count"]
+            if (
+                not isinstance(max_count, numbers.Integral)
+                or isinstance(max_count, bool)
+                or not 1 <= int(max_count) <= _MAX_DENSITY_IMAGE_COUNT
+            ):
+                raise ValueError(
+                    "Mock image-count 'max_count' must be an integer in "
+                    f"[1, {_MAX_DENSITY_IMAGE_COUNT}]; got {max_count!r}."
+                )
+            self.images_per_1k_tokens = float(density)
+            self.max_count = int(max_count)
+            return
         if mode != "categorical":
-            raise ValueError(f"Unsupported mock image-count mode {mode!r}; expected 'categorical'.")
+            raise ValueError(
+                f"Unsupported mock image-count mode {mode!r}; "
+                "expected 'categorical' or 'density'."
+            )
         missing_fields = [field for field in ("counts", "weights") if field not in config]
         if missing_fields:
             raise ValueError(
@@ -374,6 +420,8 @@ class _ImageCountSampler:
     @property
     def min_count(self) -> int:
         """Minimum count that has non-zero probability."""
+        if self.mode == "density":
+            return 1
         return min(self.counts)
 
     def __call__(
@@ -384,6 +432,17 @@ class _ImageCountSampler:
         min_merged_tokens: int,
         min_text_tokens: int = _MIN_TEXT_TOKENS,
     ) -> int:
+        if self.mode == "density":
+            max_feasible = (sample_length - min_text_tokens) // (1 + min_merged_tokens)
+            if max_feasible < 1:
+                raise RuntimeError(
+                    f"No configured mock image count fits sample idx={idx} with length "
+                    f"{sample_length}."
+                )
+            rng = np.random.default_rng(_seed_sequence(self.seed, idx, _IMAGE_COUNT_STREAM))
+            drawn = int(rng.poisson(self.images_per_1k_tokens * sample_length / 1000.0))
+            return max(1, min(drawn, self.max_count, int(max_feasible)))
+
         feasible = [
             (count, weight)
             for count, weight in zip(self.counts, self.weights)
@@ -489,37 +548,62 @@ class _ImageGeometrySampler:
         self.geometries = tuple(geometries)
         self.seed = seed
         self.min_merged_tokens = min(geometry.num_merged_tokens for geometry in self.geometries)
-        self._tuples_by_count: dict[int, tuple[tuple[_ImageGeometry, ...], ...]] = {}
-
-    def feasible_tuples(
-        self, num_images: int, *, max_total_merged_tokens: int
-    ) -> tuple[tuple[_ImageGeometry, ...], ...]:
-        """Return ordered geometry tuples whose merged tokens fit the sample."""
-        if num_images not in self._tuples_by_count:
-            self._tuples_by_count[num_images] = tuple(
-                itertools.product(self.geometries, repeat=num_images)
-            )
-        return tuple(
-            geometries
-            for geometries in self._tuples_by_count[num_images]
-            if sum(geometry.num_merged_tokens for geometry in geometries) <= max_total_merged_tokens
+        self._merged_values = np.asarray(
+            [geometry.num_merged_tokens for geometry in self.geometries], dtype=np.int64
         )
+
+    def _completion_counts(self, num_images: int, budget: int) -> np.ndarray:
+        """Cumulative ordered-tuple counts by merged-token budget.
+
+        Returns ``counts`` with ``counts[m][s]`` = number of ordered
+        ``m``-tuples of geometries whose merged tokens sum to at most ``s``
+        (``0 <= s <= budget``). Duplicate resolutions keep their multiplicity,
+        matching enumeration over the full ordered product.
+        """
+        tuples_by_sum = np.zeros((num_images + 1, budget + 1), dtype=np.float64)
+        tuples_by_sum[0, 0] = 1.0
+        for m in range(1, num_images + 1):
+            for value in self._merged_values:
+                if value <= budget:
+                    tuples_by_sum[m, value:] += tuples_by_sum[m - 1, : budget + 1 - value]
+            # Rescale each row: the sampler only consumes within-row ratios,
+            # and raw ordered-tuple counts grow as |buckets|^m, which would
+            # overflow for the large counts produced by the density profile.
+            row_max = tuples_by_sum[m].max()
+            if row_max > 0:
+                tuples_by_sum[m] /= row_max
+        return np.cumsum(tuples_by_sum, axis=1)
 
     def __call__(
         self, idx: int, *, num_images: int, max_total_merged_tokens: int
     ) -> tuple[_ImageGeometry, ...]:
-        feasible = self.feasible_tuples(num_images, max_total_merged_tokens=max_total_merged_tokens)
-        if not feasible:
+        budget = int(max_total_merged_tokens)
+        cumulative = self._completion_counts(num_images, budget) if budget >= 0 else None
+        if cumulative is None or cumulative[num_images, budget] == 0:
             raise RuntimeError(
                 f"No ordered tuple of {num_images} mock image resolution(s) fits sample "
                 f"idx={idx} with capacity for {max_total_merged_tokens} merged vision tokens."
             )
 
+        # Draw each image's bucket with probability proportional to its number
+        # of feasible completions: exactly uniform over all feasible ordered
+        # tuples without materializing the |buckets|^num_images product.
         rng = np.random.default_rng(
             _seed_sequence(self.seed, idx, _IMAGE_GEOMETRY_STREAM, num_images)
         )
-        tuple_index = int(rng.integers(len(feasible)))
-        return feasible[tuple_index]
+        chosen: list[_ImageGeometry] = []
+        remaining = budget
+        for position in range(num_images):
+            remaining_images = num_images - position - 1
+            completions = np.zeros(len(self.geometries), dtype=np.float64)
+            for bucket_index, value in enumerate(self._merged_values):
+                if value <= remaining:
+                    completions[bucket_index] = cumulative[remaining_images, remaining - value]
+            probabilities = completions / completions.sum()
+            bucket_index = int(rng.choice(len(self.geometries), p=probabilities))
+            chosen.append(self.geometries[bucket_index])
+            remaining -= int(self._merged_values[bucket_index])
+        return tuple(chosen)
 
     def sample_one_legacy(self, idx: int, *, max_merged_tokens: int) -> _ImageGeometry:
         """Preserve the original cyclic bucket selection when count config is omitted."""
@@ -541,7 +625,7 @@ class MockQwen35VLVarlenDataset(Dataset):
     """Synthetic variable-length Qwen3.5-VL samples.
 
     Each item contains one complete, unpadded sequence. By default every item
-    interleaves text with one to four images; an optional modality profile
+    interleaves text with one to eight images; an optional modality profile
     additionally emits ``text_only`` items (no images, empty vision payload)
     and ``image_only`` items (no text tokens). The multimodal collator packs
     token tensors and vision payloads independently, then the model computes
@@ -563,10 +647,15 @@ class MockQwen35VLVarlenDataset(Dataset):
         image_size_config: Optional dynamic-resolution configuration. The
             supported form is ``{"mode":"buckets","resolutions":[[H,W], ...]}``,
             where each pair is a processed image size in pixels.
-        image_count_config: Optional categorical image-count configuration with
-            ``counts`` drawn from 1 through 4 and arbitrary non-negative
-            ``weights``. When omitted, every image-bearing sample contains
-            exactly one image.
+        image_count_config: Optional image-count configuration. The
+            ``categorical`` mode draws from explicit ``counts`` (1 through 8)
+            with arbitrary non-negative ``weights``. The ``density`` mode
+            (``{"mode":"density","images_per_1k_tokens":1.4,"max_count":64}``)
+            draws ``Poisson(images_per_1k_tokens * L / 1000)`` clamped to
+            ``[1, max_count]`` and to the feasible range, so the image count
+            scales with sample length and the vision-token share stays
+            roughly constant across sequence-length profiles. When omitted,
+            every image-bearing sample contains exactly one image.
         modality_config: Optional categorical modality mix, e.g.
             ``{"mode":"categorical","modalities":["interleaved","text_only",
             "image_only"],"weights":[83,15,2]}``. Modalities that cannot fit a
