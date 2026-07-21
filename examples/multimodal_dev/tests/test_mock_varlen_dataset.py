@@ -59,6 +59,10 @@ def _count_config(counts, weights):
     return {"mode": "categorical", "counts": list(counts), "weights": list(weights)}
 
 
+def _modality_config(modalities, weights):
+    return {"mode": "categorical", "modalities": list(modalities), "weights": list(weights)}
+
+
 def _assert_samples_equal(lhs, rhs):
     assert lhs.keys() == rhs.keys()
     for key in lhs:
@@ -301,6 +305,172 @@ def test_uniform_placement_covers_all_text_gaps_and_allows_adjacent_images(tmp_p
     # images at gap 0 adjacent.
     assert vision_starts == [0, 5, 11, 17]
     assert block_ends == [5, 10, 16, 22]
+
+
+def test_text_only_modality_emits_empty_vision_payload(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("13\n", encoding="utf-8")
+    dataset = _make_dataset(
+        num_samples=1,
+        seq_length=13,
+        length_config=_file_config(lengths_file),
+        modality_config=_modality_config(["text_only"], [1]),
+    )
+
+    sample = dataset[0]
+    input_ids = sample["input_ids"]
+
+    assert input_ids.numel() == 13
+    assert sample["pixel_values"].shape == (0, _PIXEL_DIM)
+    assert sample["image_grid_thw"].shape == (0, 3)
+    for token_id in (_IMAGE_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_START_TOKEN_ID):
+        assert int((input_ids == token_id).sum().item()) == 0
+    assert torch.equal(sample["labels"][:-1], input_ids[1:])
+    assert sample["labels"][-1].item() == -100
+    assert sample["loss_mask"].sum().item() == 12.0
+
+
+def test_image_only_modality_has_no_text_tokens():
+    dataset = _make_dataset(
+        num_samples=1,
+        seq_length=32,
+        modality_config=_modality_config(["image_only"], [1]),
+        image_count_config=_count_config([2], [1]),
+    )
+
+    sample = dataset[0]
+    input_ids = sample["input_ids"]
+
+    # 2 x (vision_start + 4 merged tokens); the sampled length is only a budget.
+    assert input_ids.numel() == 2 * (1 + _NUM_MERGED_TOKENS)
+    assert set(input_ids.tolist()) == {_IMAGE_TOKEN_ID, _VISION_START_TOKEN_ID}
+    assert torch.all(sample["labels"] == -100)
+    assert sample["loss_mask"].sum().item() == 0.0
+    assert sample["pixel_values"].shape == (2 * _NUM_PATCHES, _PIXEL_DIM)
+    _assert_multi_image_contract(sample)
+
+
+def test_image_only_length_is_bounded_by_the_sampled_budget(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("23\n", encoding="utf-8")
+    dataset = _make_dataset(
+        num_samples=1,
+        seq_length=23,
+        length_config=_file_config(lengths_file),
+        modality_config=_modality_config(["image_only"], [1]),
+        image_count_config=_count_config([1, 2, 3, 4], [1, 1, 1, 1]),
+        image_size_config=_bucket_config((8, 8), (8, 16)),
+    )
+
+    sample = dataset[0]
+    num_images = sample["image_grid_thw"].shape[0]
+    merged_tokens = int((sample["input_ids"] == _IMAGE_TOKEN_ID).sum().item())
+
+    assert sample["input_ids"].numel() == num_images + merged_tokens
+    assert sample["input_ids"].numel() <= 23
+    _assert_multi_image_contract(sample)
+
+
+def test_short_length_renormalizes_over_feasible_modalities(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("2\n", encoding="utf-8")
+    dataset = _make_dataset(
+        num_samples=1,
+        seq_length=32,
+        length_config=_file_config(lengths_file),
+        modality_config=_modality_config(["interleaved", "text_only", "image_only"], [1, 1, 98]),
+    )
+
+    # Length 2 cannot host any image (1 + 4 merged tokens), so the sample must
+    # renormalize onto text_only despite its low weight.
+    sample = dataset[0]
+
+    assert sample["input_ids"].numel() == 2
+    assert sample["pixel_values"].shape == (0, _PIXEL_DIM)
+    assert sample["image_grid_thw"].shape == (0, 3)
+
+
+def test_modality_mix_is_deterministic_and_covers_all_modalities():
+    kwargs = {
+        "num_samples": 64,
+        "seq_length": 48,
+        "modality_config": _modality_config(
+            ["interleaved", "text_only", "image_only"], [60, 30, 10]
+        ),
+        "seed": 2026,
+    }
+    dataset = _make_dataset(**kwargs)
+    same_seed = _make_dataset(**kwargs)
+
+    def classify(sample):
+        has_image = sample["image_grid_thw"].shape[0] > 0
+        special = {_IMAGE_TOKEN_ID, _VIDEO_TOKEN_ID, _VISION_START_TOKEN_ID}
+        has_text = any(token not in special for token in sample["input_ids"].tolist())
+        if has_image and has_text:
+            return "interleaved"
+        return "image_only" if has_image else "text_only"
+
+    modalities = [classify(dataset[idx]) for idx in range(len(dataset))]
+
+    assert set(modalities) == {"interleaved", "text_only", "image_only"}
+    assert modalities == [classify(same_seed[idx]) for idx in range(len(same_seed))]
+    for idx, modality in enumerate(modalities):
+        sample = dataset[idx]
+        if modality == "text_only":
+            assert sample["pixel_values"].shape == (0, _PIXEL_DIM)
+        elif modality == "image_only":
+            assert sample["loss_mask"].sum().item() == 0.0
+        else:
+            assert sample["loss_mask"].sum().item() > 0.0
+            _assert_multi_image_contract(sample)
+
+
+@pytest.mark.parametrize(
+    ("modality_config", "message"),
+    [
+        ({"mode": "uniform", "modalities": ["text_only"], "weights": [1]}, "categorical"),
+        ({"mode": "categorical", "weights": [1]}, "modalities"),
+        ({"mode": "categorical", "modalities": ["text_only"]}, "weights"),
+        (_modality_config([], []), "non-empty"),
+        (_modality_config(["video_only"], [1]), "Unsupported mock modality"),
+        (_modality_config(["text_only", "text_only"], [1, 1]), "duplicate"),
+        (_modality_config(["text_only", "interleaved"], [1]), "same length"),
+        (_modality_config(["text_only"], [-1]), "non-negative"),
+        (_modality_config(["text_only"], [0]), "positive"),
+    ],
+)
+def test_rejects_invalid_modality_config(modality_config, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        _make_dataset(modality_config=modality_config)
+
+
+def test_rejects_non_dict_modality_config():
+    with pytest.raises(TypeError, match="modality_config must be a dict"):
+        _make_dataset(modality_config=["text_only"])
+
+
+def test_provider_rejects_image_only_only_modality_profile(monkeypatch):
+    args = SimpleNamespace(
+        use_varlen_dataset=False,
+        sequence_packing_scheduler=None,
+        use_packed_sequence=False,
+        use_vanilla_collate_fn=True,
+        total_seq_length=32,
+        seq_length=32,
+        varlen_mock_dataset_config_json=None,
+        mock_image_size_config_json=None,
+        mock_image_count_config_json=None,
+        mock_modality_config_json='{"modalities":["image_only"],"weights":[1]}',
+        mock_image_placement="center",
+        padded_vocab_size=248320,
+        image_token_id=_IMAGE_TOKEN_ID,
+        image_size=32,
+        seed=2026,
+    )
+    monkeypatch.setattr(megatron.training, "get_args", lambda: args)
+
+    with pytest.raises(ValueError, match="text-bearing"):
+        train_valid_test_varlen_datasets_provider((1, 1, 1))
 
 
 def test_short_length_renormalizes_over_feasible_image_counts(tmp_path):
@@ -570,7 +740,7 @@ def test_rejects_non_dict_dynamic_resolution_config():
         ({"mode": "categorical", "weights": [1]}, "counts"),
         ({"mode": "categorical", "counts": [1]}, "weights"),
         (_count_config([], []), "non-empty"),
-        (_count_config([0], [1]), "text-only samples"),
+        (_count_config([0], [1]), "modality profile"),
         (_count_config([-1], [1]), r"must be in \[1, 4\]"),
         (_count_config([5], [1]), r"must be in \[1, 4\]"),
         (_count_config([1, 1], [1, 1]), "duplicate"),

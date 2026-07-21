@@ -51,7 +51,23 @@ def add_multimodal_args(parser):
             "JSON-file path with schema "
             "'{\"mode\":\"categorical\",\"counts\":[1,2,3,4],"
             "\"weights\":[75,15,7,3]}'. Counts must be in [1, 4]; weights are "
-            "normalized internally. When omitted, every sample has exactly one image."
+            "normalized internally. When omitted, every image-bearing sample has "
+            "exactly one image."
+        ),
+    )
+    group.add_argument(
+        "--mock-modality-config-json",
+        type=str,
+        default=None,
+        help=(
+            "Sample-modality mix for mock_varlen. Accepts inline JSON or a JSON-file "
+            "path with schema "
+            "'{\"mode\":\"categorical\",\"modalities\":[\"interleaved\","
+            "\"text_only\",\"image_only\"],\"weights\":[83,15,2]}'. Modalities that "
+            "cannot fit a sample's length are removed and the remaining weights are "
+            "renormalized per index. When omitted, every sample is interleaved "
+            "image-text. image_only samples mask every loss target, so keep a "
+            "text-bearing modality in any training mix."
         ),
     )
     group.add_argument(

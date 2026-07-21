@@ -37,6 +37,47 @@ _IMAGE_GEOMETRY_STREAM = 2
 _TEXT_TOKEN_STREAM = 3
 _IMAGE_PLACEMENT_STREAM = 4
 _PIXEL_VALUE_STREAM = 5
+_MODALITY_STREAM = 6
+
+_MODALITY_INTERLEAVED = "interleaved"
+_MODALITY_TEXT_ONLY = "text_only"
+_MODALITY_IMAGE_ONLY = "image_only"
+_SUPPORTED_MODALITIES = (_MODALITY_INTERLEAVED, _MODALITY_TEXT_ONLY, _MODALITY_IMAGE_ONLY)
+
+_MAX_IMAGES_PER_SAMPLE = 4
+
+
+def _normalized_categorical(
+    items: Sequence[Any], weights: Sequence[Any], *, what: str
+) -> tuple[tuple[Any, ...], tuple[float, ...]]:
+    """Validate categorical weights, drop zero-probability items, and normalize."""
+    validated_weights: list[float] = []
+    for weight_index, weight in enumerate(weights):
+        if not isinstance(weight, numbers.Real) or isinstance(weight, bool):
+            raise ValueError(
+                f"{what} weights must be finite non-negative numbers; "
+                f"got {weight!r} at index {weight_index}."
+            )
+        weight = float(weight)
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(
+                f"{what} weights must be finite non-negative numbers; "
+                f"got {weight!r} at index {weight_index}."
+            )
+        validated_weights.append(weight)
+
+    max_weight = max(validated_weights)
+    if max_weight <= 0:
+        raise ValueError(f"{what} weights must have a finite positive sum.")
+    scaled_weights = [weight / max_weight for weight in validated_weights]
+    scaled_sum = math.fsum(scaled_weights)
+
+    # Drop zero-probability items so they cannot affect the minimum supported
+    # sequence length or conditional feasibility checks.
+    supported = [
+        (item, weight / scaled_sum) for item, weight in zip(items, scaled_weights) if weight > 0
+    ]
+    return tuple(item for item, _ in supported), tuple(weight for _, weight in supported)
 
 
 def _seed_sequence(seed: int, idx: int, stream: int, item: int = 0) -> np.random.SeedSequence:
@@ -173,6 +214,100 @@ class _SequenceLengthSampler:
         return int(np.clip(sampled, self.sample_min, self.sample_max))
 
 
+class _ModalitySampler:
+    """Sample a per-index sample modality from a validated categorical profile.
+
+    Modalities:
+
+    * ``interleaved`` — image blocks embedded in text (the default).
+    * ``text_only`` — no images; the whole sample is text.
+    * ``image_only`` — no text tokens; the sample is one or more adjacent
+      vision-start + image blocks. Every next-token target is a special
+      token, so image-only samples carry no loss; keep a text-bearing
+      modality in any training mix.
+    """
+
+    def __init__(self, config: dict[str, Any] | None, *, seed: int) -> None:
+        self.seed = seed
+        if config is None:
+            self.modalities: tuple[str, ...] = (_MODALITY_INTERLEAVED,)
+            self.weights: tuple[float, ...] = (1.0,)
+            return
+        if not isinstance(config, dict):
+            raise TypeError(f"modality_config must be a dict, got {type(config).__name__}")
+
+        mode = str(config.get("mode", "categorical"))
+        if mode != "categorical":
+            raise ValueError(f"Unsupported mock modality mode {mode!r}; expected 'categorical'.")
+        missing_fields = [field for field in ("modalities", "weights") if field not in config]
+        if missing_fields:
+            raise ValueError(
+                "Mock modality categorical mode is missing required field(s): "
+                + ", ".join(missing_fields)
+            )
+
+        modalities = config["modalities"]
+        weights = config["weights"]
+        if not isinstance(modalities, (list, tuple)) or not modalities:
+            raise ValueError("Mock modality 'modalities' must be a non-empty list.")
+        if not isinstance(weights, (list, tuple)) or not weights:
+            raise ValueError("Mock modality 'weights' must be a non-empty list.")
+        if len(modalities) != len(weights):
+            raise ValueError(
+                "Mock modality 'modalities' and 'weights' must have the same length; "
+                f"got {len(modalities)} and {len(weights)}."
+            )
+
+        validated_modalities: list[str] = []
+        for modality_index, modality in enumerate(modalities):
+            if modality not in _SUPPORTED_MODALITIES:
+                raise ValueError(
+                    f"Unsupported mock modality {modality!r} at index {modality_index}; "
+                    f"expected one of {list(_SUPPORTED_MODALITIES)}."
+                )
+            validated_modalities.append(str(modality))
+        if len(set(validated_modalities)) != len(validated_modalities):
+            raise ValueError("Mock modality 'modalities' must not contain duplicate values.")
+
+        self.modalities, self.weights = _normalized_categorical(
+            validated_modalities, weights, what="Mock modality"
+        )
+
+    @staticmethod
+    def min_tokens(modality: str, *, min_count: int, min_merged_tokens: int) -> int:
+        """Smallest sample length that can host one sample of *modality*."""
+        if modality == _MODALITY_TEXT_ONLY:
+            return _MIN_TEXT_TOKENS
+        image_tokens = min_count * (1 + min_merged_tokens)
+        if modality == _MODALITY_IMAGE_ONLY:
+            return image_tokens
+        return image_tokens + _MIN_TEXT_TOKENS
+
+    def __call__(
+        self, idx: int, *, sample_length: int, min_count: int, min_merged_tokens: int
+    ) -> str:
+        feasible = [
+            (modality, weight)
+            for modality, weight in zip(self.modalities, self.weights)
+            if self.min_tokens(modality, min_count=min_count, min_merged_tokens=min_merged_tokens)
+            <= sample_length
+        ]
+        if not feasible:
+            raise RuntimeError(
+                f"No configured mock modality fits sample idx={idx} with length {sample_length}."
+            )
+        if len(feasible) == 1:
+            return feasible[0][0]
+
+        conditional_sum = math.fsum(weight for _, weight in feasible)
+        probabilities = np.asarray(
+            [weight / conditional_sum for _, weight in feasible], dtype=np.float64
+        )
+        rng = np.random.default_rng(_seed_sequence(self.seed, idx, _MODALITY_STREAM))
+        selected = int(rng.choice(len(feasible), p=probabilities))
+        return feasible[selected][0]
+
+
 class _ImageCountSampler:
     """Sample a feasible image count from a validated categorical profile."""
 
@@ -213,64 +348,46 @@ class _ImageCountSampler:
         for count_index, count in enumerate(counts):
             if not isinstance(count, numbers.Integral) or isinstance(count, bool):
                 raise ValueError(
-                    "Mock image counts must be integers in [1, 4]; "
+                    f"Mock image counts must be integers in [1, {_MAX_IMAGES_PER_SAMPLE}]; "
                     f"got {count!r} at index {count_index}."
                 )
             count = int(count)
             if count == 0:
                 raise ValueError(
-                    "Mock image count 0 is not supported; text-only samples are outside "
-                    "the current multimodal provider contract."
+                    "Mock image count 0 is not supported; request image-free samples "
+                    "through the modality profile (--mock-modality-config-json with "
+                    "'text_only') instead."
                 )
-            if not 1 <= count <= 4:
+            if not 1 <= count <= _MAX_IMAGES_PER_SAMPLE:
                 raise ValueError(
-                    "Mock image counts must be in [1, 4]; " f"got {count} at index {count_index}."
+                    f"Mock image counts must be in [1, {_MAX_IMAGES_PER_SAMPLE}]; "
+                    f"got {count} at index {count_index}."
                 )
             validated_counts.append(count)
         if len(set(validated_counts)) != len(validated_counts):
             raise ValueError("Mock image-count 'counts' must not contain duplicate values.")
 
-        validated_weights: list[float] = []
-        for weight_index, weight in enumerate(weights):
-            if not isinstance(weight, numbers.Real) or isinstance(weight, bool):
-                raise ValueError(
-                    "Mock image-count weights must be finite non-negative numbers; "
-                    f"got {weight!r} at index {weight_index}."
-                )
-            weight = float(weight)
-            if not math.isfinite(weight) or weight < 0:
-                raise ValueError(
-                    "Mock image-count weights must be finite non-negative numbers; "
-                    f"got {weight!r} at index {weight_index}."
-                )
-            validated_weights.append(weight)
-
-        max_weight = max(validated_weights)
-        if max_weight <= 0:
-            raise ValueError("Mock image-count weights must have a finite positive sum.")
-        scaled_weights = [weight / max_weight for weight in validated_weights]
-        scaled_sum = math.fsum(scaled_weights)
-
-        # Drop zero-probability categories so they cannot affect the minimum
-        # supported sequence length or conditional feasibility checks.
-        supported = [
-            (count, weight / scaled_sum)
-            for count, weight in zip(validated_counts, scaled_weights)
-            if weight > 0
-        ]
-        self.counts = tuple(count for count, _ in supported)
-        self.weights = tuple(weight for _, weight in supported)
+        self.counts, self.weights = _normalized_categorical(
+            validated_counts, weights, what="Mock image-count"
+        )
 
     @property
     def min_count(self) -> int:
         """Minimum count that has non-zero probability."""
         return min(self.counts)
 
-    def __call__(self, idx: int, *, sample_length: int, min_merged_tokens: int) -> int:
+    def __call__(
+        self,
+        idx: int,
+        *,
+        sample_length: int,
+        min_merged_tokens: int,
+        min_text_tokens: int = _MIN_TEXT_TOKENS,
+    ) -> int:
         feasible = [
             (count, weight)
             for count, weight in zip(self.counts, self.weights)
-            if _MIN_TEXT_TOKENS + count * (1 + min_merged_tokens) <= sample_length
+            if min_text_tokens + count * (1 + min_merged_tokens) <= sample_length
         ]
         if not feasible:
             raise RuntimeError(
@@ -423,10 +540,12 @@ class _ImageGeometrySampler:
 class MockQwen35VLVarlenDataset(Dataset):
     """Synthetic variable-length Qwen3.5-VL samples.
 
-    Each item contains one complete, unpadded image-text sequence with one to
-    four images. The multimodal collator packs token tensors and vision
-    payloads independently, then the model computes 3D MRoPE position IDs from
-    the final packed order.
+    Each item contains one complete, unpadded sequence. By default every item
+    interleaves text with one to four images; an optional modality profile
+    additionally emits ``text_only`` items (no images, empty vision payload)
+    and ``image_only`` items (no text tokens). The multimodal collator packs
+    token tensors and vision payloads independently, then the model computes
+    3D MRoPE position IDs from the final packed order.
 
     Args:
         num_samples: Virtual number of samples in the dataset.
@@ -446,7 +565,18 @@ class MockQwen35VLVarlenDataset(Dataset):
             where each pair is a processed image size in pixels.
         image_count_config: Optional categorical image-count configuration with
             ``counts`` drawn from 1 through 4 and arbitrary non-negative
-            ``weights``. When omitted, every sample contains exactly one image.
+            ``weights``. When omitted, every image-bearing sample contains
+            exactly one image.
+        modality_config: Optional categorical modality mix, e.g.
+            ``{"mode":"categorical","modalities":["interleaved","text_only",
+            "image_only"],"weights":[83,15,2]}``. Modalities that cannot fit a
+            sample's length are dropped and the rest renormalized per index.
+            When omitted, every sample is interleaved (legacy behavior).
+            ``text_only`` items keep the exact sampled length and carry empty
+            ``pixel_values``/``image_grid_thw`` tensors. ``image_only`` items
+            treat the sampled length as an upper budget: the realized length is
+            ``N + sum(V_j)`` and every next-token target is masked, so they
+            contribute no loss.
         image_placement: ``center`` keeps image blocks at the middle text gap;
             ``uniform`` independently samples each image's text gap.
         patch_size: Spatial patch size used by the vision encoder.
@@ -468,6 +598,7 @@ class MockQwen35VLVarlenDataset(Dataset):
         image_size: int = 224,
         image_size_config: dict[str, Any] | None = None,
         image_count_config: dict[str, Any] | None = None,
+        modality_config: dict[str, Any] | None = None,
         image_placement: str = "center",
         patch_size: int = 16,
         temporal_patch_size: int = 2,
@@ -503,6 +634,7 @@ class MockQwen35VLVarlenDataset(Dataset):
         self.image_size = image_size
         self.image_size_config = image_size_config
         self.image_count_config = image_count_config
+        self.modality_config = modality_config
         self.image_placement = image_placement
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -516,10 +648,16 @@ class MockQwen35VLVarlenDataset(Dataset):
             seed=seed,
         )
         self.image_count_sampler = _ImageCountSampler(image_count_config, seed=seed)
+        self.modality_sampler = _ModalitySampler(modality_config, seed=seed)
         self.pixel_dim = 3 * temporal_patch_size * patch_size * patch_size
         min_num_images = self.image_count_sampler.min_count
-        min_seq_length = (
-            min_num_images * (1 + self.image_geometry_sampler.min_merged_tokens) + _MIN_TEXT_TOKENS
+        min_seq_length = min(
+            _ModalitySampler.min_tokens(
+                modality,
+                min_count=min_num_images,
+                min_merged_tokens=self.image_geometry_sampler.min_merged_tokens,
+            )
+            for modality in self.modality_sampler.modalities
         )
 
         special_ids = {image_token_id, video_token_id, vision_start_token_id}
@@ -572,11 +710,21 @@ class MockQwen35VLVarlenDataset(Dataset):
             raise IndexError("Cannot index an empty MockQwen35VLVarlenDataset.")
         sample_idx = int(idx) % self.num_samples
         sample_length = self.length_sampler(sample_idx)
-        if self.image_count_config is None:
+        modality = self.modality_sampler(
+            sample_idx,
+            sample_length=sample_length,
+            min_count=self.image_count_sampler.min_count,
+            min_merged_tokens=self.image_geometry_sampler.min_merged_tokens,
+        )
+        min_text_tokens = 0 if modality == _MODALITY_IMAGE_ONLY else _MIN_TEXT_TOKENS
+        if modality == _MODALITY_TEXT_ONLY:
+            num_images = 0
+            geometries: tuple[_ImageGeometry, ...] = ()
+        elif self.image_count_config is None:
             num_images = 1
             geometries = (
                 self.image_geometry_sampler.sample_one_legacy(
-                    sample_idx, max_merged_tokens=sample_length - 1 - _MIN_TEXT_TOKENS
+                    sample_idx, max_merged_tokens=sample_length - 1 - min_text_tokens
                 ),
             )
         else:
@@ -584,18 +732,24 @@ class MockQwen35VLVarlenDataset(Dataset):
                 sample_idx,
                 sample_length=sample_length,
                 min_merged_tokens=self.image_geometry_sampler.min_merged_tokens,
+                min_text_tokens=min_text_tokens,
             )
             geometries = self.image_geometry_sampler(
                 sample_idx,
                 num_images=num_images,
-                max_total_merged_tokens=sample_length - num_images - _MIN_TEXT_TOKENS,
+                max_total_merged_tokens=sample_length - num_images - min_text_tokens,
             )
         total_merged_tokens = sum(geometry.num_merged_tokens for geometry in geometries)
-        text_length = sample_length - num_images - total_merged_tokens
-        if text_length < _MIN_TEXT_TOKENS:
+        # An image-only sample treats the sampled length as an upper budget:
+        # discrete image geometries cannot fill it exactly without text.
+        if modality == _MODALITY_IMAGE_ONLY:
+            text_length = 0
+        else:
+            text_length = sample_length - num_images - total_merged_tokens
+        if text_length < min_text_tokens:
             raise RuntimeError(
                 f"Mock sample idx={sample_idx} reserved only {text_length} text tokens; "
-                f"at least {_MIN_TEXT_TOKENS} are required."
+                f"at least {min_text_tokens} are required."
             )
 
         text_tokens = torch.randint(
@@ -640,23 +794,35 @@ class MockQwen35VLVarlenDataset(Dataset):
         labels[target_is_special] = -100
         loss_mask[target_is_special] = 0.0
 
-        pixels_by_image = tuple(
-            torch.randn(
-                geometry.total_patches,
-                self.pixel_dim,
-                generator=self._generator(sample_idx, stream=_PIXEL_VALUE_STREAM, item=image_idx),
+        if num_images:
+            pixels_by_image = tuple(
+                torch.randn(
+                    geometry.total_patches,
+                    self.pixel_dim,
+                    generator=self._generator(
+                        sample_idx, stream=_PIXEL_VALUE_STREAM, item=image_idx
+                    ),
+                )
+                for image_idx, geometry in enumerate(geometries)
             )
-            for image_idx, geometry in enumerate(geometries)
-        )
-        pixel_values = torch.cat([pixels_by_image[image_idx] for image_idx in image_order], dim=0)
-        image_grid_thw = torch.tensor(
-            [[1, geometry.grid_h, geometry.grid_w] for geometry in ordered_geometries],
-            dtype=torch.long,
-        )
+            pixel_values = torch.cat(
+                [pixels_by_image[image_idx] for image_idx in image_order], dim=0
+            )
+            image_grid_thw = torch.tensor(
+                [[1, geometry.grid_h, geometry.grid_w] for geometry in ordered_geometries],
+                dtype=torch.long,
+            )
+        else:
+            pixel_values = torch.empty((0, self.pixel_dim))
+            image_grid_thw = torch.empty((0, 3), dtype=torch.long)
 
-        if input_ids.numel() != sample_length:
+        expected_length = (
+            num_images + total_merged_tokens if modality == _MODALITY_IMAGE_ONLY else sample_length
+        )
+        if input_ids.numel() != expected_length or input_ids.numel() > sample_length:
             raise RuntimeError(
-                f"Generated {input_ids.numel()} tokens for requested length {sample_length}."
+                f"Generated {input_ids.numel()} tokens for expected length {expected_length} "
+                f"(budget {sample_length})."
             )
         vision_start_positions = torch.where(input_ids == self.vision_start_token_id)[0]
         if vision_start_positions.numel() != num_images:
@@ -678,6 +844,12 @@ class MockQwen35VLVarlenDataset(Dataset):
                 raise RuntimeError(
                     "Each vision-start token must be followed by its complete image block."
                 )
+        has_loss_target = bool(loss_mask.sum().item() > 0)
+        if modality == _MODALITY_IMAGE_ONLY:
+            if has_loss_target:
+                raise RuntimeError("Image-only samples must not carry loss targets.")
+        elif not has_loss_target:
+            raise RuntimeError("Text-bearing samples must keep at least one loss target.")
 
         return {
             "input_ids": input_ids,
@@ -735,6 +907,7 @@ def train_valid_test_varlen_datasets_provider(
     length_config = load_json_arg(getattr(args, "varlen_mock_dataset_config_json", None))
     image_size_config = load_json_arg(getattr(args, "mock_image_size_config_json", None))
     image_count_config = load_json_arg(getattr(args, "mock_image_count_config_json", None))
+    modality_config = load_json_arg(getattr(args, "mock_modality_config_json", None))
     kwargs = dict(
         seq_length=total_seq_length,
         length_config=length_config,
@@ -743,6 +916,7 @@ def train_valid_test_varlen_datasets_provider(
         image_size=getattr(args, "image_size", 224),
         image_size_config=image_size_config,
         image_count_config=image_count_config,
+        modality_config=modality_config,
         image_placement=getattr(args, "mock_image_placement", "center"),
     )
     seed = int(getattr(args, "seed", 1234))
@@ -750,6 +924,12 @@ def train_valid_test_varlen_datasets_provider(
     train_ds = MockQwen35VLVarlenDataset(
         num_samples=train_val_test_num_samples[0], seed=seed, **kwargs
     )
+    if set(train_ds.modality_sampler.modalities) == {_MODALITY_IMAGE_ONLY}:
+        raise ValueError(
+            "The multimodal mock_varlen modality profile must keep a text-bearing "
+            "modality: image_only samples mask every next-token target, so an "
+            "image_only-only mix would train on zero loss tokens."
+        )
     val_ds = MockQwen35VLVarlenDataset(
         num_samples=train_val_test_num_samples[1], seed=seed + 1, **kwargs
     )
