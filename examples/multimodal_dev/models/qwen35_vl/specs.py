@@ -19,11 +19,19 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
+def _apply_rope_fp32(
+    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None, **kwargs
+):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
 
     Mirrors ``Qwen3VLSelfAttention.apply_rotary_pos_emb_absolute`` in Megatron-Bridge
     with ``apply_rotary_pos_emb_in_fp32=True``.
+
+    ``max_seqlen`` is forwarded to the THD path (required by core since the
+    packed-frequency offset validation). Remaining ``**kwargs`` mirror
+    ``apply_rotary_pos_emb`` extras (``mla_rotary_interleaved``, ``inverse``,
+    ``mla_output_remove_interleaving``) that do not apply to the non-MLA
+    vision tower and are intentionally ignored.
     """
     from megatron.core import parallel_state
     from megatron.core.models.common.embeddings.rope_utils import (
@@ -53,11 +61,14 @@ def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=Non
             multi_latent_attention=getattr(config, 'multi_latent_attention', False),
             mscale=mscale,
             cp_group=cp_group,
+            max_seqlen=max_seqlen,
         )
     return out.to(orig_dtype)
 
 
-def _apply_rope_fp32_no_cp(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
+def _apply_rope_fp32_no_cp(
+    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, **kwargs
+):
     """Same as ``_apply_rope_fp32`` but forces CP-size=1.
 
     The vision encoder uses THD packed sequences for variable-resolution
@@ -66,7 +77,7 @@ def _apply_rope_fp32_no_cp(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_gro
     trivial group so the vision RoPE sees the full packed sequence.
     """
     return _apply_rope_fp32(
-        t, freqs, config, cu_seqlens, mscale, cp_group=_NO_CP_GROUP,
+        t, freqs, config, cu_seqlens, mscale, cp_group=_NO_CP_GROUP, **kwargs
     )
 
 

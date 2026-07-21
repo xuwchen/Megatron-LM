@@ -104,6 +104,42 @@ class TestBuildPackedSeqParams:
 
 
 # ===================================================================
+# Qwen3.5-VL vision RoPE wrapper — latest core THD API compatibility
+# ===================================================================
+
+
+def test_qwen35_vision_rope_wrapper_forwards_max_seqlen(monkeypatch):
+    """The vision wrapper forwards the packed-sequence maximum to core RoPE."""
+    from examples.multimodal_dev.models.qwen35_vl import specs
+    from megatron.core.models.common.embeddings import rope_utils
+
+    captured = {}
+
+    def _fake_apply_rotary_pos_emb_thd(tensor, cu_seqlens, freqs, **kwargs):
+        captured.update(kwargs)
+        return tensor
+
+    monkeypatch.setattr(rope_utils, "_apply_rotary_pos_emb_thd", _fake_apply_rotary_pos_emb_thd)
+
+    tensor = torch.randn(4, 1, 8, dtype=torch.bfloat16)
+    freqs = torch.zeros_like(tensor, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    config = SimpleNamespace(rotary_interleaved=False, multi_latent_attention=False)
+
+    output = specs._apply_rope_fp32_no_cp(
+        tensor,
+        freqs,
+        config,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        inverse=False,
+    )
+
+    assert output.dtype == tensor.dtype
+    assert captured["max_seqlen"] == 4
+
+
+# ===================================================================
 # pack_or_pad_batch — packed (THD) mode
 # ===================================================================
 
