@@ -348,6 +348,10 @@ class MockQwen35VLVarlenDataset(Dataset):
         special_ids = {image_token_id, video_token_id, vision_start_token_id}
         if len(special_ids) != 3:
             raise ValueError("image, video, and vision-start token IDs must be distinct.")
+        if 0 in special_ids:
+            raise ValueError(
+                "Multimodal token ID 0 is reserved for multimodal packing padding."
+            )
         if vocab_size <= 1 or any(
             token_id < 0 or token_id >= vocab_size for token_id in special_ids
         ):

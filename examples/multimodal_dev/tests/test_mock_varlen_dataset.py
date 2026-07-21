@@ -328,6 +328,9 @@ def test_rejects_non_dict_dynamic_resolution_config():
     ("overrides", "message"),
     [
         ({"image_token_id": _VOCAB_SIZE}, "must be in"),
+        ({"image_token_id": 0}, "reserved for multimodal packing padding"),
+        ({"video_token_id": 0}, "reserved for multimodal packing padding"),
+        ({"vision_start_token_id": 0}, "reserved for multimodal packing padding"),
         ({"image_token_id": _VIDEO_TOKEN_ID}, "must be distinct"),
         (
             {"vocab_size": 4, "image_token_id": 1, "video_token_id": 2, "vision_start_token_id": 3},
