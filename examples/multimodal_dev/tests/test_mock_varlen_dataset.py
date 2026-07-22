@@ -11,6 +11,7 @@ import megatron.training
 from examples.multimodal_dev.data import mock_varlen
 from examples.multimodal_dev.data.mock_varlen import (
     MockQwen35VLVarlenDataset,
+    PackedWindowQwen35VLDataset,
     train_valid_test_varlen_datasets_provider,
 )
 
@@ -1237,3 +1238,166 @@ def test_rejects_invalid_image_placement():
 def test_rejects_invalid_vocabulary(overrides, message):
     with pytest.raises(ValueError, match=message):
         _make_dataset(**overrides)
+
+
+# ===================================================================
+# packed_window mode (v2): fixed-S windows over a mock document stream
+# ===================================================================
+
+_WINDOW_CONFIG = {
+    "doc_length": {
+        "short": {"mean": 24, "sigma": 0.8, "min": 8, "max": 63},
+        "long": {"mean": 128, "sigma": 0.5, "min": 64, "max": 256},
+        "long_component_text_token_share": 0.3,
+    },
+    "p_text": 0.4,
+    "image_density": {"mean_per_text_token": 0.05, "gamma_shape": 1.0},
+}
+
+
+def _make_packed_window_dataset(**overrides):
+    kwargs = {
+        "num_samples": 32,
+        "seq_length": 64,
+        "seed": 1234,
+        "vocab_size": _VOCAB_SIZE,
+        "image_token_id": _IMAGE_TOKEN_ID,
+        "video_token_id": _VIDEO_TOKEN_ID,
+        "vision_start_token_id": _VISION_START_TOKEN_ID,
+        "window_config": _WINDOW_CONFIG,
+        "image_size_config": _bucket_config((8, 8), (8, 16)),
+        "patch_size": _PATCH_SIZE,
+        "temporal_patch_size": _TEMPORAL_PATCH_SIZE,
+        "spatial_merge_size": _SPATIAL_MERGE_SIZE,
+    }
+    kwargs.update(overrides)
+    return PackedWindowQwen35VLDataset(**kwargs)
+
+
+class TestPackedWindowDataset:
+    def test_windows_are_exactly_seq_length_with_matching_seq_lens(self):
+        dataset = _make_packed_window_dataset()
+        saw_atoms = saw_multi_segment = False
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            assert sample.keys() == {
+                "input_ids",
+                "labels",
+                "loss_mask",
+                "pixel_values",
+                "image_grid_thw",
+                "seq_lens",
+            }
+            assert sample["input_ids"].shape == (64,)
+            assert int(sample["seq_lens"].sum().item()) == 64
+            assert (sample["seq_lens"] > 0).all()
+            if sample["image_grid_thw"].shape[0]:
+                saw_atoms = True
+                _assert_multi_image_contract(sample)
+            if sample["seq_lens"].numel() > 1:
+                saw_multi_segment = True
+        assert saw_atoms and saw_multi_segment
+
+    def test_segment_final_positions_have_no_targets(self):
+        dataset = _make_packed_window_dataset()
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            boundary = 0
+            for segment_length in sample["seq_lens"].tolist():
+                boundary += segment_length
+                assert sample["labels"][boundary - 1].item() == -100
+                assert sample["loss_mask"][boundary - 1].item() == 0.0
+
+    def test_windows_are_deterministic(self):
+        lhs = _make_packed_window_dataset()
+        rhs = _make_packed_window_dataset()
+        for idx in range(8):
+            _assert_samples_equal(lhs[idx], rhs[idx])
+
+    def test_requires_bucket_image_size_config(self):
+        with pytest.raises(ValueError, match="buckets"):
+            _make_packed_window_dataset(image_size_config=None)
+
+
+def _packed_window_args(**overrides):
+    args = SimpleNamespace(
+        use_varlen_dataset=False,
+        sequence_packing_scheduler=None,
+        use_packed_sequence=True,
+        use_vanilla_collate_fn=True,
+        micro_batch_size=1,
+        total_seq_length=64,
+        seq_length=64,
+        varlen_mock_dataset_config_json=(
+            '{"mode":"packed_window",'
+            '"doc_length":{"short":{"mean":24,"sigma":0.8,"min":8,"max":63},'
+            '"long":{"mean":128,"sigma":0.5,"min":64,"max":256},'
+            '"long_component_text_token_share":0.3},'
+            '"p_text":0.4,'
+            '"image_density":{"mean_per_text_token":0.05,"gamma_shape":1.0}}'
+        ),
+        mock_image_size_config_json='{"mode":"buckets","resolutions":[[32,32],[64,32]]}',
+        mock_image_count_config_json=None,
+        mock_modality_config_json=None,
+        mock_max_vision_tokens=None,
+        mock_max_vision_fraction=None,
+        padded_vocab_size=248320,
+        image_token_id=248056,
+        seed=2026,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+class TestPackedWindowProvider:
+    def test_dispatches_to_packed_window_datasets(self, monkeypatch):
+        monkeypatch.setattr(megatron.training, "get_args", lambda: _packed_window_args())
+        train_ds, val_ds, test_ds = train_valid_test_varlen_datasets_provider((2, 1, 1))
+        for dataset in (train_ds, val_ds, test_ds):
+            assert isinstance(dataset, PackedWindowQwen35VLDataset)
+        sample = train_ds[0]
+        assert sample["input_ids"].shape == (64,)
+        assert int(sample["seq_lens"].sum().item()) == 64
+        # Distinct split seeds must not collapse the splits onto one stream.
+        assert train_ds.seed != val_ds.seed != test_ds.seed
+
+    def test_rejects_micro_batch_size_above_one(self, monkeypatch):
+        monkeypatch.setattr(
+            megatron.training, "get_args", lambda: _packed_window_args(micro_batch_size=2)
+        )
+        with pytest.raises(ValueError, match="micro_batch_size == 1"):
+            train_valid_test_varlen_datasets_provider((1, 1, 1))
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "mock_image_count_config_json",
+            "mock_modality_config_json",
+            "mock_max_vision_tokens",
+            "mock_max_vision_fraction",
+        ],
+    )
+    def test_rejects_obsolete_window_level_knobs(self, monkeypatch, flag):
+        value = 16 if "tokens" in flag else 0.5 if "fraction" in flag else '{"mode":"density"}'
+        monkeypatch.setattr(
+            megatron.training, "get_args", lambda: _packed_window_args(**{flag: value})
+        )
+        with pytest.raises(ValueError, match="not supported in packed_window mode"):
+            train_valid_test_varlen_datasets_provider((1, 1, 1))
+
+    def test_requires_explicit_long_component_share(self, monkeypatch):
+        config = (
+            '{"mode":"packed_window",'
+            '"doc_length":{"short":{"mean":24,"sigma":0.8,"min":8,"max":63},'
+            '"long":{"mean":128,"sigma":0.5,"min":64,"max":256}},'
+            '"p_text":0.4,'
+            '"image_density":{"mean_per_text_token":0.05,"gamma_shape":1.0}}'
+        )
+        monkeypatch.setattr(
+            megatron.training,
+            "get_args",
+            lambda: _packed_window_args(varlen_mock_dataset_config_json=config),
+        )
+        with pytest.raises(ValueError, match="long_component_text_token_share"):
+            train_valid_test_varlen_datasets_provider((1, 1, 1))

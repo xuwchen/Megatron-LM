@@ -1223,6 +1223,233 @@ class MockQwen35VLVarlenDataset(Dataset):
         }
 
 
+class PackedWindowQwen35VLDataset(Dataset):
+    """Fixed-length packed windows sliced from a mock document stream.
+
+    One item is one training window of exactly ``seq_length`` tokens,
+    containing one or more document segments (``seq_lens``) with image
+    atoms placed by :class:`PackedWindowPlanGenerator` — the single source
+    of truth shared with the CPU calibration simulator. This class is a
+    token/pixel adapter over the plan: it materializes random text, image
+    placeholder blocks, and per-atom pixel noise.
+
+    Contract (six fields): ``input_ids``/``labels``/``loss_mask`` of shape
+    ``[seq_length]``, ``pixel_values [total_raw_patches, pixel_dim]``,
+    ``image_grid_thw [num_images, 3]``, and ``seq_lens [num_segments]``
+    with ``seq_lens.sum() == seq_length``. Labels are next-token targets;
+    each segment's final position is ``-100`` (no cross-document
+    prediction), as are targets that land on image or vision-start tokens.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_samples: int,
+        seq_length: int,
+        window_config: dict[str, Any],
+        seed: int = 1234,
+        vocab_size: int = 248320,
+        image_token_id: int = QWEN35_VL_IMAGE_TOKEN_ID,
+        video_token_id: int = QWEN35_VL_VIDEO_TOKEN_ID,
+        vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
+        image_size_config: dict[str, Any] | None = None,
+        patch_size: int = 16,
+        temporal_patch_size: int = 2,
+        spatial_merge_size: int = 2,
+    ) -> None:
+        from examples.multimodal_dev.data.packed_window_plan import PackedWindowPlanGenerator
+
+        if num_samples < 0:
+            raise ValueError(f"num_samples must be non-negative, got {num_samples}.")
+        if patch_size <= 0 or temporal_patch_size <= 0 or spatial_merge_size <= 0:
+            raise ValueError(
+                "patch_size, temporal_patch_size, and spatial_merge_size " "must be positive."
+            )
+        if (
+            not isinstance(image_size_config, dict)
+            or image_size_config.get("mode") != "buckets"
+            or not image_size_config.get("resolutions")
+        ):
+            raise ValueError(
+                "packed_window mode requires --mock-image-size-config-json with "
+                '{"mode":"buckets","resolutions":[...]} (optional "weights").'
+            )
+
+        block = patch_size * spatial_merge_size
+        grids: list[tuple[int, int, int]] = []
+        merged_tokens: list[int] = []
+        raw_patches: list[int] = []
+        for resolution in image_size_config["resolutions"]:
+            height, width = int(resolution[0]), int(resolution[1])
+            if height % block or width % block:
+                raise ValueError(
+                    f"Bucket resolution {height}x{width} must be divisible by "
+                    f"patch_size*spatial_merge_size={block}."
+                )
+            grid_h, grid_w = height // patch_size, width // patch_size
+            grids.append((1, grid_h, grid_w))
+            merged_tokens.append((grid_h // spatial_merge_size) * (grid_w // spatial_merge_size))
+            raw_patches.append(grid_h * grid_w)
+        weights = image_size_config.get("weights") or [1.0] * len(grids)
+
+        special_ids = {image_token_id, video_token_id, vision_start_token_id}
+        if any(not 0 <= token_id < vocab_size for token_id in special_ids):
+            raise ValueError(
+                f"All multimodal token IDs must be in [0, vocab_size={vocab_size}); "
+                f"got {sorted(special_ids)}."
+            )
+        self.safe_text_token_id = next(
+            (token_id for token_id in range(1, vocab_size) if token_id not in special_ids), None
+        )
+        if self.safe_text_token_id is None:
+            raise ValueError("vocab_size does not contain a usable non-special text token ID.")
+
+        self.num_samples = int(num_samples)
+        self.seq_length = int(seq_length)
+        self.seed = int(seed)
+        self.vocab_size = int(vocab_size)
+        self.image_token_id = int(image_token_id)
+        self.video_token_id = int(video_token_id)
+        self.vision_start_token_id = int(vision_start_token_id)
+        self.special_ids = special_ids
+        self.grids = grids
+        self.pixel_dim = 3 * temporal_patch_size * patch_size * patch_size
+        self.plan = (
+            PackedWindowPlanGenerator(
+                seq_length=seq_length,
+                num_windows=num_samples,
+                seed=seed,
+                config=window_config,
+                bucket_merged_tokens=merged_tokens,
+                bucket_raw_patches=raw_patches,
+                bucket_weights=weights,
+            )
+            if num_samples > 0
+            else None
+        )
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def _generator(self, idx: int, stream: int, item: int = 0) -> torch.Generator:
+        generator = torch.Generator(device="cpu")
+        seed_state = _seed_sequence(self.seed, idx, stream, item).generate_state(1, dtype=np.uint64)
+        generator.manual_seed(int(seed_state[0]) % _MAX_TORCH_SEED)
+        return generator
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        if self.num_samples == 0:
+            raise IndexError("Cannot index an empty PackedWindowQwen35VLDataset.")
+        window = self.plan.window(int(idx) % self.num_samples)
+
+        input_ids = torch.randint(
+            1,
+            self.vocab_size,
+            (self.seq_length,),
+            dtype=torch.long,
+            generator=self._generator(idx, stream=_TEXT_TOKEN_STREAM),
+        )
+        for special_id in self.special_ids:
+            input_ids[input_ids == special_id] = self.safe_text_token_id
+        for atom in window.atoms:
+            input_ids[atom.offset] = self.vision_start_token_id
+            input_ids[atom.offset + 1 : atom.offset + 1 + atom.merged_tokens] = self.image_token_id
+
+        labels = torch.empty_like(input_ids)
+        labels[:-1] = input_ids[1:]
+        labels[-1] = -100
+        # No cross-document prediction: the last position of every segment
+        # has no target inside its own document.
+        boundary = 0
+        for _, segment_length in window.segments:
+            boundary += segment_length
+            labels[boundary - 1] = -100
+        target_is_special = labels == -100
+        for special_id in self.special_ids:
+            target_is_special |= labels == special_id
+        labels[target_is_special] = -100
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+        loss_mask[target_is_special] = 0.0
+
+        if window.atoms:
+            pixel_values = torch.cat(
+                [
+                    torch.randn(
+                        atom.raw_patches,
+                        self.pixel_dim,
+                        generator=self._generator(idx, stream=_PIXEL_VALUE_STREAM, item=ordinal),
+                    )
+                    for ordinal, atom in enumerate(window.atoms)
+                ]
+            )
+            image_grid_thw = torch.tensor(
+                [self.grids[atom.bucket_index] for atom in window.atoms], dtype=torch.long
+            )
+        else:
+            pixel_values = torch.empty((0, self.pixel_dim), dtype=torch.float32)
+            image_grid_thw = torch.empty((0, 3), dtype=torch.long)
+
+        seq_lens = torch.tensor([length for _, length in window.segments], dtype=torch.long)
+        if int(seq_lens.sum().item()) != self.seq_length:
+            raise RuntimeError(
+                f"Window {idx} segment lengths sum to {int(seq_lens.sum().item())}; "
+                f"expected {self.seq_length}."
+            )
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "seq_lens": seq_lens,
+        }
+
+
+def _packed_window_datasets_provider(args, window_config, train_val_test_num_samples):
+    """Build packed_window train/valid/test datasets with mode validation."""
+    micro_batch_size = int(getattr(args, "micro_batch_size", 1) or 1)
+    if micro_batch_size != 1:
+        raise ValueError(
+            "packed_window mode requires micro_batch_size == 1 for training and "
+            f"evaluation: one item already is a full {getattr(args, 'seq_length', '?')}-token "
+            f"window; got micro_batch_size={micro_batch_size}."
+        )
+    obsolete = {
+        "mock_image_count_config_json": "image counts are emergent from the document stream",
+        "mock_modality_config_json": "modality is a per-document property (p_text)",
+        "mock_max_vision_tokens": "the profile carries no vision budget",
+        "mock_max_vision_fraction": "the profile carries no vision budget",
+    }
+    for flag, reason in obsolete.items():
+        if getattr(args, flag, None) is not None:
+            raise ValueError(
+                f"--{flag.replace('_', '-')} is not supported in packed_window mode: {reason}."
+            )
+    window_config = {key: value for key, value in window_config.items() if key != "mode"}
+    doc_length = window_config.get("doc_length")
+    if not isinstance(doc_length, dict) or "long_component_text_token_share" not in doc_length:
+        raise ValueError(
+            "packed_window mode requires doc_length.long_component_text_token_share to be "
+            "set explicitly by the recipe (the shared data config carries no default)."
+        )
+
+    kwargs = dict(
+        seq_length=int(getattr(args, "total_seq_length", 1024)),
+        window_config=window_config,
+        vocab_size=getattr(args, "padded_vocab_size", 248320),
+        image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
+        image_size_config=load_json_arg(getattr(args, "mock_image_size_config_json", None)),
+    )
+    seed = int(getattr(args, "seed", 1234))
+    return tuple(
+        PackedWindowQwen35VLDataset(
+            num_samples=train_val_test_num_samples[split], seed=seed + split, **kwargs
+        )
+        for split in range(3)
+    )
+
+
 def train_valid_test_varlen_datasets_provider(
     train_val_test_num_samples: Sequence[int],
 ) -> tuple[MockQwen35VLVarlenDataset, MockQwen35VLVarlenDataset, MockQwen35VLVarlenDataset]:
@@ -1268,6 +1495,8 @@ def train_valid_test_varlen_datasets_provider(
         )
 
     length_config = load_json_arg(getattr(args, "varlen_mock_dataset_config_json", None))
+    if isinstance(length_config, dict) and length_config.get("mode") == "packed_window":
+        return _packed_window_datasets_provider(args, length_config, train_val_test_num_samples)
     image_size_config = load_json_arg(getattr(args, "mock_image_size_config_json", None))
     image_count_config = load_json_arg(getattr(args, "mock_image_count_config_json", None))
     modality_config = load_json_arg(getattr(args, "mock_modality_config_json", None))
