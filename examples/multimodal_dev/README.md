@@ -11,7 +11,9 @@ multimodal_dev/
 ├── forward_step.py          # Forward step, TP broadcast, loss computation
 ├── arguments.py             # Multimodal CLI arguments
 ├── data/
-│   └── mock.py              # Mock dataset for end-to-end testing
+│   ├── mock.py              # Fixed-length mock data for end-to-end testing
+│   ├── mock_varlen.py       # Variable-length mock image-text data
+│   └── cord_v2.py           # CORD-V2 receipt-OCR data provider
 ├── models/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
 │   ├── base.py              # MultimodalModel base class (vision encoder + GPTModel)
@@ -33,6 +35,121 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
     --dataset-provider mock \
     ... # other Megatron args (--num-layers, --hidden-size, etc.)
 ```
+
+## Variable-Length Mock Data
+
+`mock_varlen` generates one complete, unpadded Qwen3.5-VL sequence per
+dataset item: text interleaved with images by default, plus optional
+`text_only` (no images) and `image_only` (no text tokens) items. The
+identity collator is required because token lengths differ and each item's
+token and vision payloads must stay associated; `--use-packed-sequence`
+selects the packed-THD packer (padded BSHD otherwise):
+
+```bash
+torchrun --nproc_per_node=8 examples/multimodal_dev/pretrain_multimodal.py \
+    --model-arch qwen35_vl \
+    --dataset-provider mock_varlen \
+    --seq-length 32768 \
+    --total-seq-length 32768 \
+    --use-vanilla-collate-fn \
+    --use-packed-sequence \
+    --max-seqlen-per-dp-cp-rank 32768 \
+    --pad-packed-seq-alignment 128 \
+    --varlen-mock-dataset-config-json \
+      '{"mode":"distribution","type":"lognormal","min_seq_len":1024,"max_seq_len":32768,"mean_seq_len":8192,"lognormal_sigma":1.1}' \
+    --mock-modality-config-json \
+      '{"mode":"categorical","modalities":["interleaved","text_only","image_only"],"weights":[83,15,2]}' \
+    --mock-image-count-config-json \
+      '{"mode":"density","images_per_1k_tokens":1.4,"max_count":64}' \
+    --mock-image-size-config-json \
+      '{"mode":"buckets","resolutions":[[224,224],[448,448],[672,448],[448,672],[896,672],[1120,896]]}' \
+    --mock-image-placement uniform \
+    ... # other Megatron model and training arguments
+```
+
+Each dataset item has exactly these fields:
+
+| Field | Per-sample shape | Meaning |
+|-------|------------------|---------|
+| `input_ids` | `[L_i]` | Text tokens plus `N_i` complete image-placeholder blocks |
+| `labels` | `[L_i]` | Shifted next-token labels; ignored targets are `-100` |
+| `loss_mask` | `[L_i]` | Float mask aligned with `labels` |
+| `pixel_values` | `[sum(P_j), D]` | Ordered flattened raw patches for all images |
+| `image_grid_thw` | `[N_i, 3]` | Ordered `(T, H, W)` patch grids |
+
+Configuration summary (every JSON option accepts inline JSON or a file
+path; omitting an option preserves the legacy fixed one-image behavior):
+
+- `--varlen-mock-dataset-config-json`: bounded lognormal `distribution`
+  lengths (sampled *truncated*: out-of-window mass is renormalized into the
+  window, so there are no endpoint spikes and `mean_seq_len` is the
+  post-truncation expectation), or a headerless CSV `file` of exact integer
+  lengths.
+- `--mock-modality-config-json`: categorical mix of `interleaved`,
+  `text_only`, and `image_only` items. `text_only` items carry zero-row
+  `pixel_values`/`image_grid_thw`; `image_only` items treat the sampled
+  length as an upper budget and carry zero loss tokens, so a mix whose only
+  modality is `image_only` is rejected.
+- `--mock-image-count-config-json`: `categorical` explicit counts in
+  `[1, 8]`, or `density` (`Poisson(images_per_1k_tokens * L / 1000)`
+  clamped to `[1, max_count]` and to the feasible range) so image counts
+  scale with item length and the vision-token share stays stable across
+  sequence-length profiles.
+- `--mock-image-size-config-json`: processed `[height, width]` buckets,
+  each divisible by `patch_size * spatial_merge_size`; a feasible ordered
+  geometry tuple is sampled per item. An optional `weights` list (same
+  length) weights the buckets: each tuple's probability is proportional to
+  the product of its members' weights over the feasible set.
+- `--mock-image-placement`: `center` (legacy) or `uniform` text-gap
+  placement of each complete vision-start + image block.
+- `--mock-max-vision-tokens` / `--mock-max-vision-fraction`: per-sample
+  caps on vision tokens (placeholders + vision starts). At
+  `micro_batch_size=1` a microbatch is one sample, so an absolute cap
+  bounds every microbatch's raw patches at `4 x cap` — the vision
+  attention-workspace footprint becomes a configuration-time guarantee.
+  Counts/geometries that no longer fit are renormalized per index; short
+  samples that physically cannot reach an absolute cap are unaffected.
+- `--max-vision-patches-per-microbatch` / `--max-vision-patches-per-image`:
+  packer-level fail-fast guards checked before the TP broadcast; violations
+  raise with the actual payload, the limit, and the offending geometry
+  instead of surfacing as an opaque CUDA OOM.
+
+Profiles that cannot fit a sampled item length are conditioned per index:
+infeasible modalities/counts/geometries are dropped and the remaining
+weights renormalized. Token blocks, `image_grid_thw` rows, and
+`pixel_values` slices always use the same image order, and generation is
+deterministic and access-order independent per index.
+
+### packed_window mode
+
+`--varlen-mock-dataset-config-json '{"mode":"packed_window",...}'` selects
+the production-shaped generator: documents (disjoint short/long
+truncated-lognormal text lengths, per-document `text_only` probability
+`p_text`, per-document `Gamma`-mixed Poisson image density) concatenate
+into a stream that is sliced into fixed `seq_length`-token windows. One
+dataset item is one full window; a sixth per-sample field `seq_lens`
+carries the per-segment lengths (`sum == seq_length`), and the packed-THD
+packer splices those segments into `cu_seqlens` with independent per-
+segment CP/SP alignment padding. Image atoms never cross window lines
+(spill/fill construction with an explicitly counted `boundary_fill`
+budget), each segment's final position carries no loss target, and the
+window-level modality/count/budget flags above are rejected as obsolete —
+counts and modality mixes are emergent from the document layer.
+`doc_length.long_component_text_token_share` must be set explicitly per
+recipe, and `micro_batch_size` must be 1. Requires
+`--use-packed-sequence` for multi-segment windows (BSHD has no segment
+representation).
+
+Do **not** combine with `--use-varlen-dataset` or
+`--sequence-packing-scheduler` (text-only core contract; neither carries
+ragged vision tensors). Packed THD + HybridEP flex dispatch requires
+`--moe-hybridep-pad-variable-tokens`. When `--pad-packed-seq-alignment` is
+set, real samples keep their CP/SP alignment and the packed tail is
+represented as one ordinary dummy THD sequence (token rows only — no
+pixels, grids, or loss); `--max-seqlen-per-dp-cp-rank` is the CP-local
+target for `alignment=max`. An image-free microbatch still runs the vision
+tower once on a minimal zero-weighted dummy image so every rank produces
+vision grads for bucketed grad synchronization.
 
 ## Checkpoint Conversion (HF → Megatron-FSDP DTensor)
 
