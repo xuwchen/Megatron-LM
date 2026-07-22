@@ -666,7 +666,24 @@ class _ImageGeometrySampler:
                 )
             )
 
-        self.geometries = tuple(geometries)
+        weights = config.get("weights") if isinstance(config, dict) else None
+        if weights is not None:
+            if not isinstance(weights, (list, tuple)) or len(weights) != len(geometries):
+                raise ValueError(
+                    "Mock image-size 'weights' and 'resolutions' must have the same length; "
+                    f"got {len(weights) if isinstance(weights, (list, tuple)) else weights!r} "
+                    f"for {len(geometries)} resolutions."
+                )
+            retained, probabilities = _normalized_categorical(
+                geometries, weights, what="Mock image-size"
+            )
+            self.geometries = tuple(retained)
+            self._weights = np.asarray(probabilities, dtype=np.float64)
+            self.has_explicit_weights = True
+        else:
+            self.geometries = tuple(geometries)
+            self._weights = np.full(len(geometries), 1.0 / len(geometries), dtype=np.float64)
+            self.has_explicit_weights = False
         self.seed = seed
         self.min_merged_tokens = min(geometry.num_merged_tokens for geometry in self.geometries)
         self._merged_values = np.asarray(
@@ -674,22 +691,26 @@ class _ImageGeometrySampler:
         )
 
     def _completion_counts(self, num_images: int, budget: int) -> np.ndarray:
-        """Cumulative ordered-tuple counts by merged-token budget.
+        """Cumulative weighted ordered-tuple mass by merged-token budget.
 
-        Returns ``counts`` with ``counts[m][s]`` = number of ordered
-        ``m``-tuples of geometries whose merged tokens sum to at most ``s``
-        (``0 <= s <= budget``). Duplicate resolutions keep their multiplicity,
-        matching enumeration over the full ordered product.
+        Returns ``counts`` with ``counts[m][s]`` proportional to the total
+        bucket-weight product of ordered ``m``-tuples whose merged tokens sum
+        to at most ``s`` (``0 <= s <= budget``). With uniform weights this
+        reduces to plain tuple counting; explicit weights make each ordered
+        tuple's probability proportional to the product of its members'
+        weights over the feasible set.
         """
         tuples_by_sum = np.zeros((num_images + 1, budget + 1), dtype=np.float64)
         tuples_by_sum[0, 0] = 1.0
         for m in range(1, num_images + 1):
-            for value in self._merged_values:
+            for bucket_index, value in enumerate(self._merged_values):
                 if value <= budget:
-                    tuples_by_sum[m, value:] += tuples_by_sum[m - 1, : budget + 1 - value]
+                    tuples_by_sum[m, value:] += (
+                        self._weights[bucket_index] * tuples_by_sum[m - 1, : budget + 1 - value]
+                    )
             # Rescale each row: the sampler only consumes within-row ratios,
-            # and raw ordered-tuple counts grow as |buckets|^m, which would
-            # overflow for the large counts produced by the density profile.
+            # and raw ordered-tuple mass grows multiplicatively with m, which
+            # would overflow for the large counts of the density profile.
             row_max = tuples_by_sum[m].max()
             if row_max > 0:
                 tuples_by_sum[m] /= row_max
@@ -706,9 +727,11 @@ class _ImageGeometrySampler:
                 f"idx={idx} with capacity for {max_total_merged_tokens} merged vision tokens."
             )
 
-        # Draw each image's bucket with probability proportional to its number
-        # of feasible completions: exactly uniform over all feasible ordered
-        # tuples without materializing the |buckets|^num_images product.
+        # Draw each image's bucket with probability proportional to its own
+        # weight times the weighted mass of feasible completions: each ordered
+        # tuple's probability is proportional to the product of its members'
+        # weights over the feasible set (exactly uniform when weights are
+        # uniform), without materializing the |buckets|^num_images product.
         rng = np.random.default_rng(
             _seed_sequence(self.seed, idx, _IMAGE_GEOMETRY_STREAM, num_images)
         )
@@ -719,7 +742,10 @@ class _ImageGeometrySampler:
             completions = np.zeros(len(self.geometries), dtype=np.float64)
             for bucket_index, value in enumerate(self._merged_values):
                 if value <= remaining:
-                    completions[bucket_index] = cumulative[remaining_images, remaining - value]
+                    completions[bucket_index] = (
+                        self._weights[bucket_index]
+                        * cumulative[remaining_images, remaining - value]
+                    )
             probabilities = completions / completions.sum()
             bucket_index = int(rng.choice(len(self.geometries), p=probabilities))
             chosen.append(self.geometries[bucket_index])
@@ -727,19 +753,29 @@ class _ImageGeometrySampler:
         return tuple(chosen)
 
     def sample_one_legacy(self, idx: int, *, max_merged_tokens: int) -> _ImageGeometry:
-        """Preserve the original cyclic bucket selection when count config is omitted."""
-        feasible = tuple(
-            geometry
-            for geometry in self.geometries
+        """Single-image selection when no count profile is configured.
+
+        Without explicit weights, the original deterministic cyclic bucket
+        selection is preserved bit-exactly. With explicit weights, the bucket
+        is drawn from the weight distribution restricted to feasible buckets.
+        """
+        feasible_indices = [
+            bucket_index
+            for bucket_index, geometry in enumerate(self.geometries)
             if geometry.num_merged_tokens <= max_merged_tokens
-        )
-        if not feasible:
+        ]
+        if not feasible_indices:
             raise RuntimeError(
                 f"No mock image resolution fits sample idx={idx} with capacity for "
                 f"{max_merged_tokens} merged vision tokens."
             )
-        bucket_index = (self.seed + int(idx)) % len(feasible)
-        return feasible[bucket_index]
+        if self.has_explicit_weights:
+            weights = self._weights[feasible_indices]
+            rng = np.random.default_rng(_seed_sequence(self.seed, idx, _IMAGE_GEOMETRY_STREAM, 1))
+            choice = int(rng.choice(len(feasible_indices), p=weights / weights.sum()))
+            return self.geometries[feasible_indices[choice]]
+        bucket_index = (self.seed + int(idx)) % len(feasible_indices)
+        return self.geometries[feasible_indices[bucket_index]]
 
 
 class MockQwen35VLVarlenDataset(Dataset):
@@ -767,7 +803,11 @@ class MockQwen35VLVarlenDataset(Dataset):
             ``image_size_config`` is omitted.
         image_size_config: Optional dynamic-resolution configuration. The
             supported form is ``{"mode":"buckets","resolutions":[[H,W], ...]}``,
-            where each pair is a processed image size in pixels.
+            where each pair is a processed image size in pixels. An optional
+            ``"weights"`` list (same length, non-negative, positive sum)
+            weights the buckets: each ordered geometry tuple's probability is
+            proportional to the product of its members' weights over the
+            feasible set. When omitted, buckets are weighted uniformly.
         image_count_config: Optional image-count configuration. The
             ``categorical`` mode draws from explicit ``counts`` (1 through 8)
             with arbitrary non-negative ``weights``. The ``density`` mode

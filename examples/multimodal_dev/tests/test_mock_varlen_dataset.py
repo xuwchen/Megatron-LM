@@ -51,8 +51,11 @@ def _file_config(path):
     return {"mode": "file", "path": str(path)}
 
 
-def _bucket_config(*resolutions):
-    return {"mode": "buckets", "resolutions": [list(size) for size in resolutions]}
+def _bucket_config(*resolutions, weights=None):
+    config = {"mode": "buckets", "resolutions": [list(size) for size in resolutions]}
+    if weights is not None:
+        config["weights"] = list(weights)
+    return config
 
 
 def _count_config(counts, weights):
@@ -605,6 +608,92 @@ def test_large_image_count_geometry_sampling_is_feasible_and_deterministic():
     assert len(geometries) == 48
     assert sum(geometry.num_merged_tokens for geometry in geometries) <= budget
     assert geometries == second(3, num_images=48, max_total_merged_tokens=budget)
+
+
+def test_bucket_weights_shape_single_image_marginals():
+    dataset = _make_dataset(
+        num_samples=400,
+        seq_length=32,
+        image_count_config=_count_config([1], [1]),
+        image_size_config=_bucket_config((8, 8), (8, 16), weights=[9, 1]),
+    )
+
+    small = sum(1 for idx in range(400) if dataset[idx]["image_grid_thw"].tolist() == [[1, 4, 4]])
+    assert 0.84 <= small / 400 <= 0.96  # expected 0.9
+
+
+def test_bucket_weights_apply_as_tuple_products():
+    # Two buckets weighted 3:1 with an unconstrained budget: the first image
+    # of each pair should be the small bucket with probability 3/4.
+    dataset = _make_dataset(
+        num_samples=1,
+        seq_length=64,
+        image_size_config=_bucket_config((8, 8), (8, 16), weights=[3, 1]),
+    )
+    sampler = dataset.image_geometry_sampler
+
+    first_small = sum(
+        1
+        for idx in range(2000)
+        if sampler(idx, num_images=2, max_total_merged_tokens=48)[0].num_merged_tokens == 4
+    )
+    assert 0.71 <= first_small / 2000 <= 0.79  # expected 0.75
+
+
+def test_zero_weight_buckets_are_dropped():
+    dataset = _make_dataset(
+        num_samples=8,
+        seq_length=32,
+        image_count_config=_count_config([1, 2], [1, 1]),
+        image_size_config=_bucket_config((8, 8), (8, 16), weights=[0, 1]),
+    )
+
+    assert dataset.image_geometry_sampler.min_merged_tokens == 8
+    for idx in range(8):
+        grids = dataset[idx]["image_grid_thw"].tolist()
+        assert all(grid == [1, 4, 8] for grid in grids)
+
+
+def test_uniform_bucket_weights_are_bit_identical_to_unweighted():
+    kwargs = {
+        "num_samples": 8,
+        "seq_length": 48,
+        "image_count_config": _count_config([1, 2, 3], [3, 2, 1]),
+        "image_placement": "uniform",
+        "seed": 2026,
+    }
+    unweighted = _make_dataset(image_size_config=_bucket_config((8, 8), (8, 16)), **kwargs)
+    weighted = _make_dataset(
+        image_size_config=_bucket_config((8, 8), (8, 16), weights=[2, 2]), **kwargs
+    )
+
+    for idx in range(8):
+        _assert_samples_equal(unweighted[idx], weighted[idx])
+
+
+def test_legacy_single_image_path_honors_explicit_weights():
+    # No count config -> legacy path; explicit weights replace cyclic choice.
+    dataset = _make_dataset(
+        num_samples=400,
+        seq_length=32,
+        image_size_config=_bucket_config((8, 8), (8, 16), weights=[1, 9]),
+    )
+
+    large = sum(1 for idx in range(400) if dataset[idx]["image_grid_thw"].tolist() == [[1, 4, 8]])
+    assert 0.84 <= large / 400 <= 0.96  # expected 0.9
+
+
+@pytest.mark.parametrize(
+    ("image_size_config", "message"),
+    [
+        (_bucket_config((8, 8), (8, 16), weights=[1]), "same length"),
+        (_bucket_config((8, 8), weights=[-1]), "non-negative"),
+        (_bucket_config((8, 8), (8, 16), weights=[0, 0]), "positive"),
+    ],
+)
+def test_rejects_invalid_bucket_weights(image_size_config, message):
+    with pytest.raises(ValueError, match=message):
+        _make_dataset(image_size_config=image_size_config)
 
 
 def test_absolute_vision_budget_bounds_every_sample():
