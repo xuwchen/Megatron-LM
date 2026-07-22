@@ -84,6 +84,34 @@ def _make_mock_multi_image_sample(num_images: int, seq_len: int, *, seed: int = 
     return dataset[0]
 
 
+def _make_mock_modality_sample(modality: str, seq_len: int, *, seed: int = 1234):
+    """Build one real mock-dataset sample with a forced one-hot modality."""
+    dataset = MockQwen35VLVarlenDataset(
+        num_samples=1,
+        seq_length=seq_len,
+        length_config={
+            "mode": "distribution",
+            "type": "lognormal",
+            "min_seq_len": seq_len,
+            "max_seq_len": seq_len,
+            "mean_seq_len": seq_len,
+            "lognormal_sigma": 0.0,
+        },
+        seed=seed,
+        vocab_size=100,
+        image_token_id=97,
+        video_token_id=98,
+        vision_start_token_id=96,
+        image_size=32,
+        modality_config={"mode": "categorical", "modalities": [modality], "weights": [1]},
+        image_placement="uniform",
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+    )
+    return dataset[0]
+
+
 # ===================================================================
 # _build_packed_seq_params — pure helper, exercised independently
 # ===================================================================
@@ -259,6 +287,67 @@ def test_multimodal_forward_partitions_cp_before_scattering_sequence_parallel(mo
     assert model.language_model.forward_kwargs["input_ids"].tolist() == [[10, 97, 16, 17]]
 
 
+def test_multimodal_forward_keeps_vision_grads_alive_without_images(monkeypatch):
+    """An image-free training microbatch still runs a zero-weight vision pass."""
+    from examples.multimodal_dev.models import base
+
+    events = []
+
+    class _FakeVision(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.spatial_merge_size = 2
+
+        def forward(self, pixel_values, image_grid_thw):
+            events.append(("vision", tuple(pixel_values.shape), image_grid_thw.tolist()))
+            return torch.zeros(1, 2)
+
+    class _FakeLanguage(torch.nn.Module):
+        def embedding(self, input_ids, position_ids):
+            return torch.arange(8, dtype=torch.float32).view(4, 1, 2)
+
+        def forward(self, **kwargs):
+            return kwargs["decoder_input"]
+
+    model = base.MultimodalModel.__new__(base.MultimodalModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(sequence_parallel=False)
+    model.image_token_id = 97
+    model.vision_model = _FakeVision()
+    model.language_model = _FakeLanguage()
+    model.train()
+
+    monkeypatch.setattr(base.parallel_state, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(base.parallel_state, "get_context_parallel_world_size", lambda: 1)
+
+    input_ids = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
+    forward_kwargs = dict(
+        input_ids=input_ids,
+        position_ids=torch.arange(4).unsqueeze(0),
+        labels=input_ids.clone(),
+        loss_mask=torch.ones_like(input_ids, dtype=torch.float32),
+        padding_mask=torch.zeros_like(input_ids, dtype=torch.bool),
+        pixel_values=torch.empty(0, 24),
+        image_grid_thw=torch.empty(0, 3, dtype=torch.long),
+        packed_seq_params=None,
+    )
+    output = model(**forward_kwargs)
+
+    # One minimal 4-patch dummy image keeps vision params in the graph while
+    # its zero-weighted scalar leaves the decoder input numerically unchanged.
+    assert events == [("vision", (4, 24), [[1, 2, 2]])]
+    assert torch.equal(output, torch.arange(8, dtype=torch.float32).view(4, 1, 2))
+
+    # The dummy pass must also run in eval: under Megatron-FSDP the vision
+    # tower's parameter unshard is a collective, so an image-free rank that
+    # skips the tower deadlocks the image-bearing ranks' all-gathers.
+    events.clear()
+    model.eval()
+    with torch.no_grad():
+        model(**forward_kwargs)
+    assert events == [("vision", (4, 24), [[1, 2, 2]])]
+
+
 # ===================================================================
 # pack_or_pad_batch — packed (THD) mode
 # ===================================================================
@@ -395,6 +484,42 @@ class TestPackOrPadBatchPacked:
         assert int((packed["input_ids"] == 97).sum().item()) == sum(image_counts)
         assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 13, 30, 53]
         assert packed["packed_seq_params"].cu_seqlens_q_padded.tolist() == [0, 13, 30, 53]
+
+    def test_mixed_modality_microbatch_packs_empty_and_real_vision_payloads(self):
+        """text_only / interleaved / image_only samples share one THD buffer."""
+        text_only = _make_mock_modality_sample("text_only", 9)
+        interleaved = _make_mock_multi_image_sample(1, 13)
+        image_only = _make_mock_modality_sample("image_only", 16)
+
+        assert text_only["pixel_values"].shape == (0, 1536)
+        assert image_only["input_ids"].numel() == 2  # vision_start + 1 merged token
+
+        packed = pack_or_pad_batch(
+            [text_only, interleaved, image_only], use_packed_sequence=True, device="cuda"
+        )
+
+        assert packed["input_ids"].shape == (1, 24)
+        assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 9, 22, 24]
+        assert packed["pixel_values"].shape == (8, 1536)
+        assert packed["image_grid_thw"].tolist() == [[1, 2, 2]] * 2
+        assert int((packed["input_ids"] == 96).sum().item()) == 2
+        assert int((packed["input_ids"] == 97).sum().item()) == 2
+        # The image-only tail contributes no loss tokens.
+        assert packed["loss_mask"][0, 22:].sum().item() == 0.0
+
+    def test_all_text_microbatch_packs_zero_pixel_rows(self):
+        """A text-only microbatch keeps empty vision tensors through packing."""
+        batch = [
+            _make_mock_modality_sample("text_only", length, seed=2026 + index)
+            for index, length in enumerate((9, 13))
+        ]
+
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+        assert packed["input_ids"].shape == (1, 22)
+        assert packed["pixel_values"].shape == (0, 1536)
+        assert packed["image_grid_thw"].shape == (0, 3)
+        assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 9, 22]
 
 
 class TestPackOrPadBatchPackedAlignment:
