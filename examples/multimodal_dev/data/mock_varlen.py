@@ -415,10 +415,14 @@ class _ImageCountSampler:
     """Sample a feasible image count from a categorical or density profile.
 
     ``categorical`` draws from explicit counts/weights (1 through 8).
-    ``density`` draws ``Poisson(images_per_1k_tokens * L / 1000)`` clamped to
-    ``[1, max_count]`` and to the sample's feasible range, so the image count
-    scales with sample length and the vision-token share stays roughly
-    constant across sequence-length profiles.
+    ``density`` draws a count with mean ``images_per_1k_tokens * L / 1000``
+    clamped to ``[1, max_count]`` and to the sample's feasible range, so the
+    image count scales with sample length and the vision-token share stays
+    roughly constant across sequence-length profiles. The count shape is
+    selected by ``distribution``: ``poisson`` (default) concentrates around
+    the mean, while ``geometric`` is monotonically decreasing with mode 1 —
+    the shape observed in production packed multimodal windows, where
+    single-image documents dominate and large counts form a long tail.
     """
 
     def __init__(self, config: dict[str, Any] | None, *, seed: int) -> None:
@@ -465,8 +469,15 @@ class _ImageCountSampler:
                     "Mock image-count 'max_count' must be an integer in "
                     f"[1, {_MAX_DENSITY_IMAGE_COUNT}]; got {max_count!r}."
                 )
+            distribution = str(config.get("distribution", "poisson"))
+            if distribution not in ("poisson", "geometric"):
+                raise ValueError(
+                    "Mock image-count density 'distribution' must be 'poisson' or "
+                    f"'geometric'; got {distribution!r}."
+                )
             self.images_per_1k_tokens = float(density)
             self.max_count = int(max_count)
+            self.distribution = distribution
             return
         if mode != "categorical":
             raise ValueError(
@@ -548,7 +559,14 @@ class _ImageCountSampler:
                     f"{sample_length}."
                 )
             rng = np.random.default_rng(_seed_sequence(self.seed, idx, _IMAGE_COUNT_STREAM))
-            drawn = int(rng.poisson(self.images_per_1k_tokens * sample_length / 1000.0))
+            mean = self.images_per_1k_tokens * sample_length / 1000.0
+            if self.distribution == "geometric":
+                # Geometric on {1, 2, ...} with mean max(mean, 1); the clamp
+                # keeps the success probability valid for short samples whose
+                # density-implied mean falls below one image.
+                drawn = int(rng.geometric(1.0 / max(mean, 1.0)))
+            else:
+                drawn = int(rng.poisson(mean))
             count = max(1, min(drawn, self.max_count, int(max_feasible)))
             if stats is not None and drawn > count:
                 if drawn > self.max_count and count == self.max_count:

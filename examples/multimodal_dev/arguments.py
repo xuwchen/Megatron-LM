@@ -52,10 +52,13 @@ def add_multimodal_args(parser):
             "'{\"mode\":\"categorical\",\"counts\":[1,2,3,4,5,6,7,8],"
             "\"weights\":[40,22,12,9,6,5,3,3]}' with counts in [1, 8] and "
             "internally normalized weights. Density mode: "
-            "'{\"mode\":\"density\",\"images_per_1k_tokens\":1.4,"
-            "\"max_count\":64}' draws Poisson(density * L / 1000) clamped to "
-            "[1, max_count] so image counts scale with sample length and the "
-            "vision-token share stays stable across sequence-length profiles. "
+            "'{\"mode\":\"density\",\"images_per_1k_tokens\":1.0,"
+            "\"max_count\":512,\"distribution\":\"geometric\"}' draws a count "
+            "with mean density * L / 1000 clamped to [1, max_count] so image "
+            "counts scale with sample length and the vision-token share stays "
+            "stable across sequence-length profiles. 'distribution' selects "
+            "the count shape: 'poisson' (default) or 'geometric' (mode-1 "
+            "decreasing, the shape of production packed multimodal windows). "
             "When omitted, every image-bearing sample has exactly one image."
         ),
     )

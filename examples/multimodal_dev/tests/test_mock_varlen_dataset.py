@@ -561,6 +561,62 @@ def test_density_counts_are_deterministic():
         _assert_samples_equal(dataset[idx], same_seed[idx])
 
 
+def test_geometric_density_counts_match_the_production_count_shape():
+    sampler = mock_varlen._ImageCountSampler(
+        {
+            "mode": "density",
+            "images_per_1k_tokens": 20,
+            "max_count": 512,
+            "distribution": "geometric",
+        },
+        seed=2026,
+    )
+    counts = [sampler(idx, sample_length=640, min_merged_tokens=0) for idx in range(1000)]
+
+    # Geometric with mean 20 * 640 / 1000 = 12.8: mode-1 decreasing shape with
+    # a long tail, unlike Poisson which concentrates around the mean.
+    mean = sum(counts) / len(counts)
+    assert 11.0 <= mean <= 15.0
+    assert min(counts) == 1
+    assert max(counts) >= 2 * 12.8
+    below_mean = sum(1 for count in counts if count <= 12.8) / len(counts)
+    assert 0.55 <= below_mean <= 0.72  # 1 - exp(-1) for geometric; ~0.5 for Poisson
+
+    resampled = mock_varlen._ImageCountSampler(
+        {
+            "mode": "density",
+            "images_per_1k_tokens": 20,
+            "max_count": 512,
+            "distribution": "geometric",
+        },
+        seed=2026,
+    )
+    assert counts == [resampled(idx, sample_length=640, min_merged_tokens=0) for idx in range(1000)]
+
+
+def test_geometric_density_short_samples_stay_feasible(tmp_path):
+    # Density-implied mean below one image (1 * 64 / 1000) must still draw a
+    # valid count, and the feasibility clamp still applies on top.
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("64\n" * 8, encoding="utf-8")
+    dataset = _make_dataset(
+        num_samples=8,
+        seq_length=64,
+        length_config=_file_config(lengths_file),
+        image_size=16,
+        image_count_config={
+            "mode": "density",
+            "images_per_1k_tokens": 1,
+            "max_count": 512,
+            "distribution": "geometric",
+        },
+    )
+
+    counts = [dataset[idx]["image_grid_thw"].shape[0] for idx in range(8)]
+    assert all(1 <= count <= 3 for count in counts), counts
+    _assert_multi_image_contract(dataset[0])
+
+
 @pytest.mark.parametrize(
     ("image_count_config", "message"),
     [
@@ -586,6 +642,15 @@ def test_density_counts_are_deterministic():
         (
             {"mode": "density", "images_per_1k_tokens": 1, "max_count": True},
             r"integer in \[1, 1024\]",
+        ),
+        (
+            {
+                "mode": "density",
+                "images_per_1k_tokens": 1,
+                "max_count": 8,
+                "distribution": "binomial",
+            },
+            "'poisson' or 'geometric'",
         ),
     ],
 )
