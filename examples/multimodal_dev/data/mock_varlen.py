@@ -86,6 +86,19 @@ def _seed_sequence(seed: int, idx: int, stream: int, item: int = 0) -> np.random
     return np.random.SeedSequence([int(seed), int(idx), int(stream), int(item)])
 
 
+def _normal_cdf(x: float) -> float:
+    """Standard normal CDF."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _normal_icdf(p: float) -> float:
+    """Standard normal inverse CDF (via erfinv, exact within float64)."""
+    p = min(max(p, 1e-15), 1.0 - 1e-15)
+    return float(
+        torch.special.erfinv(torch.tensor(2.0 * p - 1.0, dtype=torch.float64))
+    ) * math.sqrt(2.0)
+
+
 def _read_sequence_lengths(path: str) -> np.ndarray:
     """Read integer sequence lengths from a headerless CSV file."""
     values: list[int] = []
@@ -195,7 +208,68 @@ class _SequenceLengthSampler:
             )
         if self.sigma < 0:
             raise ValueError(f"lognormal_sigma must be non-negative, got {self.sigma}.")
-        self.mu = math.log(self.sample_mean) - self.sigma**2 / 2
+
+        if self.sigma == 0 or self.sample_min == self.sample_max:
+            # Degenerate profiles collapse to one constant length.
+            self._constant_length: int | None = int(
+                np.clip(self.sample_mean, self.sample_min, self.sample_max)
+            )
+            return
+        if not self.sample_min < self.sample_mean < self.sample_max:
+            raise ValueError(
+                "mean_seq_len must lie strictly inside (min_seq_len, max_seq_len) for a "
+                f"truncated distribution; got {self.sample_mean} for "
+                f"[{self.sample_min}, {self.sample_max}]."
+            )
+        self._constant_length = None
+        # ``mean_seq_len`` is the *post-truncation* expectation: solve for the
+        # underlying lognormal mu whose window-conditioned mean matches it.
+        self.mu = self._solve_mu()
+        self._cdf_lo = _normal_cdf((math.log(self.sample_min) - self.mu) / self.sigma)
+        self._cdf_hi = _normal_cdf((math.log(self.sample_max) - self.mu) / self.sigma)
+        if self._cdf_hi - self._cdf_lo <= 1e-15:
+            raise RuntimeError(
+                "Truncated length sampler solved a degenerate window "
+                f"(mu={self.mu:.4f}, window CDF mass {self._cdf_hi - self._cdf_lo:.3e}) for "
+                f"[{self.sample_min}, {self.sample_max}] mean={self.sample_mean} "
+                f"sigma={self.sigma}; this indicates a numerical solve failure."
+            )
+
+    def _truncated_mean(self, mu: float) -> float:
+        """Mean of the lognormal(mu, sigma) conditioned on the length window."""
+        sigma = self.sigma
+        alpha = (math.log(self.sample_min) - mu) / sigma
+        beta = (math.log(self.sample_max) - mu) / sigma
+        denominator = _normal_cdf(beta) - _normal_cdf(alpha)
+        if denominator <= 0.0:
+            # Window mass underflowed at this extreme mu; return the bound the
+            # window sits on so bisection keeps its bracket.
+            return float(self.sample_min if mu < math.log(self.sample_min) else self.sample_max)
+        numerator = _normal_cdf(beta - sigma) - _normal_cdf(alpha - sigma)
+        if numerator <= 0.0:
+            # math.erf saturates ~8 sigmas out, so the shifted CDF difference
+            # can underflow to zero while the window mass is still positive.
+            # The window then sits deep in one tail of the shifted
+            # distribution: the conditional mean approaches the upper bound in
+            # the left-tail case (mu far above the window) and the lower bound
+            # in the right-tail case. Returning zero here would break the
+            # bisection's monotonicity bracket (observed as every sampled
+            # length collapsing onto max for wide windows such as
+            # [1024, 32768] with mean 8192).
+            return float(self.sample_min if alpha - sigma > 0 else self.sample_max)
+        return math.exp(mu + sigma * sigma / 2.0) * numerator / denominator
+
+    def _solve_mu(self) -> float:
+        """Bisect mu so the truncated mean equals the configured mean."""
+        low = math.log(self.sample_min) - 40.0
+        high = math.log(self.sample_max) + 40.0
+        for _ in range(200):
+            mid = (low + high) / 2.0
+            if self._truncated_mean(mid) < self.sample_mean:
+                low = mid
+            else:
+                high = mid
+        return (low + high) / 2.0
 
     def _validate_lengths(self, lengths: np.ndarray, *, source: str) -> None:
         invalid = lengths[(lengths < self.min_seq_length) | (lengths > self.max_seq_length)]
@@ -209,9 +283,15 @@ class _SequenceLengthSampler:
     def __call__(self, idx: int) -> int:
         if self.lengths is not None:
             return int(self.lengths[idx % self.lengths.size])
+        if self._constant_length is not None:
+            return self._constant_length
 
+        # Truncated sampling: out-of-window mass is renormalized into the
+        # window via the inverse CDF instead of piling up on the bounds, so
+        # no endpoint spikes appear regardless of sigma / window ratio.
         rng = np.random.default_rng(_seed_sequence(self.seed, int(idx), _SEQUENCE_LENGTH_STREAM))
-        sampled = rng.lognormal(mean=self.mu, sigma=self.sigma)
+        quantile = self._cdf_lo + float(rng.random()) * (self._cdf_hi - self._cdf_lo)
+        sampled = math.exp(self.mu + self.sigma * _normal_icdf(quantile))
         return int(np.clip(sampled, self.sample_min, self.sample_max))
 
 

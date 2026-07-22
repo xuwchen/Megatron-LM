@@ -868,6 +868,82 @@ def test_short_lengths_only_select_feasible_resolutions(tmp_path):
     assert large["image_grid_thw"].tolist() == [[1, 4, 8]]
 
 
+def test_truncated_lengths_have_no_endpoint_spikes_and_match_mean():
+    # sigma=1.1 on a 2x window degenerated to ~57%/21% endpoint spikes under
+    # the old clip semantics; truncated sampling must spread smoothly and
+    # honor mean_seq_len as the post-truncation expectation.
+    config = {
+        "mode": "distribution",
+        "type": "lognormal",
+        "min_seq_len": 2048,
+        "max_seq_len": 4096,
+        "mean_seq_len": 3072,
+        "lognormal_sigma": 1.1,
+    }
+    dataset = _make_dataset(num_samples=2000, seq_length=4096, length_config=config)
+
+    lengths = [dataset.length_sampler(idx) for idx in range(2000)]
+
+    at_min = sum(1 for length in lengths if length == 2048) / len(lengths)
+    at_max = sum(1 for length in lengths if length == 4096) / len(lengths)
+    assert at_min < 0.01
+    assert at_max < 0.01
+    mean = sum(lengths) / len(lengths)
+    assert abs(mean - 3072) / 3072 < 0.02
+    assert all(2048 <= length <= 4096 for length in lengths)
+
+
+def test_truncated_lengths_survive_wide_windows():
+    # Regression: on wide windows the mu bisection used to wander into a
+    # region where the shifted CDF difference underflows to zero while the
+    # window mass is still positive, collapsing every sampled length onto
+    # max_seq_len (observed with [1024, 32768] mean 8192).
+    config = {
+        "mode": "distribution",
+        "type": "lognormal",
+        "min_seq_len": 1024,
+        "max_seq_len": 32768,
+        "mean_seq_len": 8192,
+        "lognormal_sigma": 1.1,
+    }
+    dataset = _make_dataset(num_samples=2000, seq_length=32768, length_config=config)
+
+    lengths = [dataset.length_sampler(idx) for idx in range(2000)]
+
+    at_max = sum(1 for length in lengths if length == 32768) / len(lengths)
+    assert at_max < 0.01
+    mean = sum(lengths) / len(lengths)
+    assert abs(mean - 8192) / 8192 < 0.05
+    assert all(1024 <= length <= 32768 for length in lengths)
+
+
+def test_degenerate_length_profiles_stay_constant():
+    config = {
+        "mode": "distribution",
+        "type": "lognormal",
+        "min_seq_len": 23,
+        "max_seq_len": 23,
+        "mean_seq_len": 23,
+        "lognormal_sigma": 0.0,
+    }
+    dataset = _make_dataset(num_samples=4, seq_length=32, length_config=config)
+
+    assert [dataset.length_sampler(idx) for idx in range(4)] == [23, 23, 23, 23]
+
+
+def test_rejects_mean_on_window_bound_for_truncated_profile():
+    config = {
+        "mode": "distribution",
+        "type": "lognormal",
+        "min_seq_len": 16,
+        "max_seq_len": 32,
+        "mean_seq_len": 32,
+        "lognormal_sigma": 1.1,
+    }
+    with pytest.raises(ValueError, match="strictly inside"):
+        _make_dataset(length_config=config)
+
+
 def test_lognormal_lengths_stay_in_bounds_and_vary():
     config = {
         "mode": "distribution",
