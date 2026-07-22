@@ -207,6 +207,26 @@ def _check_vision_patch_budget(
             )
 
 
+def _segment_bounds(seq_lens: Optional[torch.Tensor], sample_len: int) -> list[tuple[int, int]]:
+    """Per-segment (start, end) bounds of a sample's token axis.
+
+    ``seq_lens`` is the optional per-sample segment-length vector emitted by
+    the packed_window dataset mode; ``None`` means one segment spanning the
+    whole sample.
+    """
+    if seq_lens is None:
+        return [(0, sample_len)]
+    lengths = [int(length) for length in seq_lens.tolist()]
+    if any(length <= 0 for length in lengths):
+        raise ValueError(f"seq_lens must be positive, got {lengths}.")
+    if sum(lengths) != sample_len:
+        raise ValueError(
+            f"seq_lens sum {sum(lengths)} does not match the sample length {sample_len}."
+        )
+    ends = list(accumulate(lengths))
+    return list(zip([0] + ends[:-1], ends))
+
+
 def _append_cu_boundary(cu_seqlens: Optional[torch.Tensor], end: int) -> Optional[torch.Tensor]:
     """Append one cumulative sequence boundary on the existing device."""
     if cu_seqlens is None:
@@ -367,16 +387,32 @@ def pack_or_pad_batch(
             seqlens_list, seqlens_padded_list = [], []
 
             for sample in batch:
-                seqlen = sample["input_ids"].shape[0]
+                sample_len = sample["input_ids"].shape[0]
                 assert (
                     sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
                 ), "labels, input_ids, and loss_mask must have the same shape"
-                target_len = math.ceil(seqlen / divisible_by) * divisible_by
-                input_ids_list.append(F.pad(sample["input_ids"], (0, target_len - seqlen), value=0))
-                labels_list.append(F.pad(sample["labels"], (0, target_len - seqlen), value=-100))
-                loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
-                seqlens_list.append(seqlen)
-                seqlens_padded_list.append(target_len)
+                # A sample may carry multiple document segments (packed_window
+                # mode). Each segment becomes its own logical sequence: it is
+                # spliced into cu_seqlens and padded independently to the
+                # CP/SP alignment, so the physical layout always matches
+                # cu_seqlens_padded. Vision payloads stay sample-level:
+                # placeholder order inside the tokens already matches the
+                # pixel row order.
+                bounds = _segment_bounds(sample.get("seq_lens"), sample_len)
+                for start, end in bounds:
+                    seqlen = end - start
+                    target_len = math.ceil(seqlen / divisible_by) * divisible_by
+                    input_ids_list.append(
+                        F.pad(sample["input_ids"][start:end], (0, target_len - seqlen), value=0)
+                    )
+                    labels_list.append(
+                        F.pad(sample["labels"][start:end], (0, target_len - seqlen), value=-100)
+                    )
+                    loss_mask_list.append(
+                        F.pad(sample["loss_mask"][start:end], (0, target_len - seqlen), value=0)
+                    )
+                    seqlens_list.append(seqlen)
+                    seqlens_padded_list.append(target_len)
                 pixel_values_list.append(sample["pixel_values"])
                 image_grid_thw_list.append(sample["image_grid_thw"])
 
@@ -463,6 +499,14 @@ def pack_or_pad_batch(
 
     if is_src:
         assert batch is not None, "source TP rank must provide a batch"
+        if any(
+            sample.get("seq_lens") is not None and sample["seq_lens"].numel() > 1
+            for sample in batch
+        ):
+            raise ValueError(
+                "Multi-segment packed_window samples require --use-packed-sequence "
+                "(THD); the padded BSHD layout has no segment representation."
+            )
         max_seqlens = max(x["input_ids"].shape[0] for x in batch)
         target_seqlens = min(max_seqlens, seq_length)
         # Round target seqlen up to the parallelism alignment factor so the

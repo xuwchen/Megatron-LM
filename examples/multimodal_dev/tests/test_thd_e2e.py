@@ -522,6 +522,130 @@ class TestPackOrPadBatchPacked:
         assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 9, 22]
 
 
+class TestSegmentPacking:
+    """packed_window samples: per-sample ``seq_lens`` splice into cu_seqlens.
+
+    Each segment is an independent logical sequence with its own CP/SP
+    alignment padding, so the physical layout always matches
+    ``cu_seqlens_padded`` (v2 spec §4).
+    """
+
+    def test_seq_lens_splice_into_cu_seqlens(self):
+        multi = _make_sample(8, base=0)
+        multi["seq_lens"] = torch.tensor([3, 5], device="cuda")
+        plain = _make_sample(4, base=100)
+        packed = pack_or_pad_batch([multi, plain], use_packed_sequence=True, device="cuda")
+
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 3, 8, 12]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 3, 8, 12]
+        assert packed["input_ids"][0].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 100, 101, 102, 103]
+
+    def test_cp2_pads_each_segment_independently(self, monkeypatch):
+        from examples.multimodal_dev import forward_step
+
+        monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 2)
+        sample = _make_sample(8, base=0)
+        sample["seq_lens"] = torch.tensor([3, 5], device="cuda")
+        packed = pack_or_pad_batch([sample], use_packed_sequence=True, device="cuda")
+
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 3, 8]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 4, 12]
+        # Real padding tokens sit after each internal segment so the tensor
+        # layout matches cu_seqlens_padded (P0-2 correctness core).
+        assert packed["input_ids"].shape == (1, 12)
+        assert packed["input_ids"][0].tolist() == [0, 1, 2, 0, 3, 4, 5, 6, 7, 0, 0, 0]
+        assert packed["labels"][0, 3].item() == -100
+        assert packed["labels"][0, 9:].eq(-100).all().item()
+        assert packed["padding_mask"][0].tolist() == [
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+            True,
+        ]
+
+    def test_cp8_alignment_targets(self, monkeypatch):
+        from examples.multimodal_dev import forward_step
+
+        monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 8)
+        sample = _make_sample(32, base=0)
+        sample["seq_lens"] = torch.tensor([17, 15], device="cuda")
+        packed = pack_or_pad_batch([sample], use_packed_sequence=True, device="cuda")
+
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 17, 32]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 32, 48]
+        assert psp.total_tokens == 48
+
+    def test_single_segment_seq_lens_is_equivalent_to_plain(self):
+        tagged = _make_sample(6, base=0)
+        tagged["seq_lens"] = torch.tensor([6], device="cuda")
+        plain = _make_sample(6, base=0)
+        lhs = pack_or_pad_batch([tagged], use_packed_sequence=True, device="cuda")
+        rhs = pack_or_pad_batch([plain], use_packed_sequence=True, device="cuda")
+        assert torch.equal(lhs["input_ids"], rhs["input_ids"])
+        assert lhs["packed_seq_params"].cu_seqlens_q.tolist() == (
+            rhs["packed_seq_params"].cu_seqlens_q.tolist()
+        )
+
+    def test_seq_lens_sum_mismatch_raises(self):
+        sample = _make_sample(8, base=0)
+        sample["seq_lens"] = torch.tensor([3, 4], device="cuda")
+        with pytest.raises(ValueError, match="does not match the sample length"):
+            pack_or_pad_batch([sample], use_packed_sequence=True, device="cuda")
+
+    def test_bshd_rejects_multi_segment_samples(self):
+        sample = _make_sample(8, base=0)
+        sample["seq_lens"] = torch.tensor([3, 5], device="cuda")
+        with pytest.raises(ValueError, match="no segment representation"):
+            pack_or_pad_batch([sample], use_packed_sequence=False, seq_length=8, device="cuda")
+
+    def test_packed_window_dataset_roundtrip(self):
+        from examples.multimodal_dev.data.mock_varlen import PackedWindowQwen35VLDataset
+
+        dataset = PackedWindowQwen35VLDataset(
+            num_samples=4,
+            seq_length=64,
+            seed=1234,
+            vocab_size=100,
+            image_token_id=97,
+            video_token_id=98,
+            vision_start_token_id=96,
+            window_config={
+                "doc_length": {
+                    "short": {"mean": 24, "sigma": 0.8, "min": 8, "max": 63},
+                    "long": {"mean": 128, "sigma": 0.5, "min": 64, "max": 256},
+                    "long_component_text_token_share": 0.3,
+                },
+                "p_text": 0.4,
+                "image_density": {"mean_per_text_token": 0.05, "gamma_shape": 1.0},
+            },
+            image_size_config={"mode": "buckets", "resolutions": [[8, 8], [8, 16]]},
+            patch_size=2,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+        )
+        batch = [{key: value.to("cuda") for key, value in dataset[idx].items()} for idx in range(2)]
+        segment_counts = [sample["seq_lens"].numel() for sample in batch]
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+        psp = packed["packed_seq_params"]
+        assert len(psp.cu_seqlens_q) == 1 + sum(segment_counts)
+        assert psp.total_tokens == 2 * 64  # divisible_by == 1: no physical padding
+        expected_images = sum(sample["image_grid_thw"].shape[0] for sample in batch)
+        assert packed["image_grid_thw"].shape[0] == expected_images
+        assert int((packed["input_ids"] == 96).sum().item()) == expected_images
+
+
 class TestPackOrPadBatchPackedAlignment:
     """Core packed-padding flags also apply to the multimodal local packer."""
 
