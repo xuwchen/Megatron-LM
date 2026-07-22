@@ -75,6 +75,28 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mock-max-vision-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Absolute per-sample cap on mock_varlen vision tokens (image "
+            "placeholders + vision starts). With micro_batch_size=1 this bounds "
+            "every microbatch's vision payload exactly (raw patches <= 4 x cap), "
+            "turning attention-workspace usage into a configuration-time "
+            "guarantee. Unset by default."
+        ),
+    )
+    group.add_argument(
+        "--mock-max-vision-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Relative per-sample cap on mock_varlen vision tokens as a fraction "
+            "of the sample length, in (0, 1]. Composable with "
+            "--mock-max-vision-tokens; the tighter bound wins. Unset by default."
+        ),
+    )
+    group.add_argument(
         "--mock-image-placement",
         choices=("center", "uniform"),
         default="center",

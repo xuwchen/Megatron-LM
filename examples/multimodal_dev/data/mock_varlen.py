@@ -285,14 +285,36 @@ class _ModalitySampler:
         return image_tokens + _MIN_TEXT_TOKENS
 
     def __call__(
-        self, idx: int, *, sample_length: int, min_count: int, min_merged_tokens: int
+        self,
+        idx: int,
+        *,
+        sample_length: int,
+        min_count: int,
+        min_merged_tokens: int,
+        vision_budget: int | None = None,
+        stats: dict[str, int] | None = None,
     ) -> str:
-        feasible = [
-            (modality, weight)
-            for modality, weight in zip(self.modalities, self.weights)
-            if self.min_tokens(modality, min_count=min_count, min_merged_tokens=min_merged_tokens)
-            <= sample_length
-        ]
+        image_min_tokens = min_count * (1 + min_merged_tokens)
+        feasible = []
+        budget_dropped = False
+        for modality, weight in zip(self.modalities, self.weights):
+            if (
+                self.min_tokens(modality, min_count=min_count, min_merged_tokens=min_merged_tokens)
+                > sample_length
+            ):
+                continue
+            if (
+                modality != _MODALITY_TEXT_ONLY
+                and vision_budget is not None
+                and image_min_tokens > vision_budget
+            ):
+                budget_dropped = True
+                continue
+            feasible.append((modality, weight))
+        if budget_dropped and feasible and stats is not None:
+            stats["modality_dropped_by_vision_budget"] = (
+                stats.get("modality_dropped_by_vision_budget", 0) + 1
+            )
         if not feasible:
             raise RuntimeError(
                 f"No configured mock modality fits sample idx={idx} with length {sample_length}."
@@ -431,9 +453,15 @@ class _ImageCountSampler:
         sample_length: int,
         min_merged_tokens: int,
         min_text_tokens: int = _MIN_TEXT_TOKENS,
+        vision_budget: int | None = None,
+        stats: dict[str, int] | None = None,
     ) -> int:
+        image_cost = 1 + min_merged_tokens
+        budget_max = sample_length if vision_budget is None else min(sample_length, vision_budget)
         if self.mode == "density":
-            max_feasible = (sample_length - min_text_tokens) // (1 + min_merged_tokens)
+            max_feasible = min(
+                (sample_length - min_text_tokens) // image_cost, budget_max // image_cost
+            )
             if max_feasible < 1:
                 raise RuntimeError(
                     f"No configured mock image count fits sample idx={idx} with length "
@@ -441,18 +469,31 @@ class _ImageCountSampler:
                 )
             rng = np.random.default_rng(_seed_sequence(self.seed, idx, _IMAGE_COUNT_STREAM))
             drawn = int(rng.poisson(self.images_per_1k_tokens * sample_length / 1000.0))
-            return max(1, min(drawn, self.max_count, int(max_feasible)))
+            count = max(1, min(drawn, self.max_count, int(max_feasible)))
+            if stats is not None and drawn > count:
+                if drawn > self.max_count and count == self.max_count:
+                    stats["count_clamped_by_max_count"] = (
+                        stats.get("count_clamped_by_max_count", 0) + 1
+                    )
+                if drawn > max_feasible and count == int(max_feasible):
+                    stats["count_clamped_by_feasibility"] = (
+                        stats.get("count_clamped_by_feasibility", 0) + 1
+                    )
+            return count
 
         feasible = [
             (count, weight)
             for count, weight in zip(self.counts, self.weights)
-            if min_text_tokens + count * (1 + min_merged_tokens) <= sample_length
+            if min_text_tokens + count * image_cost <= sample_length
+            and count * image_cost <= budget_max
         ]
         if not feasible:
             raise RuntimeError(
                 f"No configured mock image count fits sample idx={idx} with length "
                 f"{sample_length}."
             )
+        if stats is not None and len(feasible) < len(self.counts):
+            stats["count_categories_filtered"] = stats.get("count_categories_filtered", 0) + 1
         if len(feasible) == 1:
             return feasible[0][0]
 
@@ -666,6 +707,16 @@ class MockQwen35VLVarlenDataset(Dataset):
             treat the sampled length as an upper budget: the realized length is
             ``N + sum(V_j)`` and every next-token target is masked, so they
             contribute no loss.
+        max_vision_tokens: Optional absolute per-sample cap on vision tokens
+            (image placeholders plus vision-start tokens). At
+            ``micro_batch_size=1`` this bounds the vision payload of every
+            microbatch exactly, making attention-workspace usage a
+            configuration-time guarantee (raw patches <= 4 x cap).
+        max_vision_fraction: Optional relative per-sample cap: vision tokens
+            <= ``fraction * L``. Composable with ``max_vision_tokens`` (the
+            tighter bound wins). Counts/geometries that no longer fit are
+            dropped and renormalized per index; when no image fits, the
+            modality renormalizes to ``text_only`` (if enabled).
         image_placement: ``center`` keeps image blocks at the middle text gap;
             ``uniform`` independently samples each image's text gap.
         patch_size: Spatial patch size used by the vision encoder.
@@ -688,6 +739,8 @@ class MockQwen35VLVarlenDataset(Dataset):
         image_size_config: dict[str, Any] | None = None,
         image_count_config: dict[str, Any] | None = None,
         modality_config: dict[str, Any] | None = None,
+        max_vision_tokens: int | None = None,
+        max_vision_fraction: float | None = None,
         image_placement: str = "center",
         patch_size: int = 16,
         temporal_patch_size: int = 2,
@@ -739,13 +792,62 @@ class MockQwen35VLVarlenDataset(Dataset):
         self.image_count_sampler = _ImageCountSampler(image_count_config, seed=seed)
         self.modality_sampler = _ModalitySampler(modality_config, seed=seed)
         self.pixel_dim = 3 * temporal_patch_size * patch_size * patch_size
+
+        if max_vision_tokens is not None:
+            if (
+                not isinstance(max_vision_tokens, numbers.Integral)
+                or isinstance(max_vision_tokens, bool)
+                or int(max_vision_tokens) < 1
+            ):
+                raise ValueError(
+                    f"max_vision_tokens must be a positive integer, got {max_vision_tokens!r}."
+                )
+            max_vision_tokens = int(max_vision_tokens)
+        if max_vision_fraction is not None:
+            if (
+                not isinstance(max_vision_fraction, numbers.Real)
+                or isinstance(max_vision_fraction, bool)
+                or not 0 < float(max_vision_fraction) <= 1
+            ):
+                raise ValueError(
+                    "max_vision_fraction must be a number in (0, 1], "
+                    f"got {max_vision_fraction!r}."
+                )
+            max_vision_fraction = float(max_vision_fraction)
+        self.max_vision_tokens = max_vision_tokens
+        self.max_vision_fraction = max_vision_fraction
+
+        image_bearing_modalities = [
+            modality
+            for modality in self.modality_sampler.modalities
+            if modality != _MODALITY_TEXT_ONLY
+        ]
+        image_min_tokens = self.image_count_sampler.min_count * (
+            1 + self.image_geometry_sampler.min_merged_tokens
+        )
+        if image_bearing_modalities:
+            if max_vision_tokens is not None and max_vision_tokens < image_min_tokens:
+                raise ValueError(
+                    f"max_vision_tokens={max_vision_tokens} cannot host the smallest "
+                    f"configured image payload ({image_min_tokens} vision tokens)."
+                )
+            if (
+                max_vision_fraction is not None
+                and int(max_vision_fraction * seq_length) < image_min_tokens
+            ):
+                raise ValueError(
+                    f"max_vision_fraction={max_vision_fraction} cannot host the smallest "
+                    f"configured image payload ({image_min_tokens} vision tokens) even at "
+                    f"seq_length={seq_length}."
+                )
+
+        # Per-index observability for budget/clamp interactions; incremented
+        # by the samplers and __getitem__, reset via reset_budget_stats().
+        self.budget_stats: dict[str, int] = {}
+
         min_num_images = self.image_count_sampler.min_count
         min_seq_length = min(
-            _ModalitySampler.min_tokens(
-                modality,
-                min_count=min_num_images,
-                min_merged_tokens=self.image_geometry_sampler.min_merged_tokens,
-            )
+            self._min_length_for_modality(modality, min_num_images, image_min_tokens)
             for modality in self.modality_sampler.modalities
         )
 
@@ -775,6 +877,30 @@ class MockQwen35VLVarlenDataset(Dataset):
     def __len__(self) -> int:
         return self.num_samples
 
+    def _min_length_for_modality(self, modality: str, min_count: int, image_min_tokens: int) -> int:
+        """Smallest sample length hosting *modality* under the vision budget."""
+        base = _ModalitySampler.min_tokens(
+            modality,
+            min_count=min_count,
+            min_merged_tokens=self.image_geometry_sampler.min_merged_tokens,
+        )
+        if modality != _MODALITY_TEXT_ONLY and self.max_vision_fraction is not None:
+            base = max(base, math.ceil(image_min_tokens / self.max_vision_fraction))
+        return base
+
+    def _vision_budget(self, sample_length: int) -> int:
+        """Per-sample cap on vision tokens (image placeholders + vision starts)."""
+        budget = sample_length
+        if self.max_vision_tokens is not None:
+            budget = min(budget, self.max_vision_tokens)
+        if self.max_vision_fraction is not None:
+            budget = min(budget, int(self.max_vision_fraction * sample_length))
+        return budget
+
+    def reset_budget_stats(self) -> None:
+        """Clear the per-index budget/clamp counters."""
+        self.budget_stats.clear()
+
     def _generator(self, idx: int, stream: int, item: int = 0) -> torch.Generator:
         generator = torch.Generator(device="cpu")
         seed_state = _seed_sequence(self.seed, idx, stream, item).generate_state(1, dtype=np.uint64)
@@ -799,11 +925,14 @@ class MockQwen35VLVarlenDataset(Dataset):
             raise IndexError("Cannot index an empty MockQwen35VLVarlenDataset.")
         sample_idx = int(idx) % self.num_samples
         sample_length = self.length_sampler(sample_idx)
+        vision_budget = self._vision_budget(sample_length)
         modality = self.modality_sampler(
             sample_idx,
             sample_length=sample_length,
             min_count=self.image_count_sampler.min_count,
             min_merged_tokens=self.image_geometry_sampler.min_merged_tokens,
+            vision_budget=vision_budget,
+            stats=self.budget_stats,
         )
         min_text_tokens = 0 if modality == _MODALITY_IMAGE_ONLY else _MIN_TEXT_TOKENS
         if modality == _MODALITY_TEXT_ONLY:
@@ -813,7 +942,8 @@ class MockQwen35VLVarlenDataset(Dataset):
             num_images = 1
             geometries = (
                 self.image_geometry_sampler.sample_one_legacy(
-                    sample_idx, max_merged_tokens=sample_length - 1 - min_text_tokens
+                    sample_idx,
+                    max_merged_tokens=min(sample_length - 1 - min_text_tokens, vision_budget - 1),
                 ),
             )
         else:
@@ -822,13 +952,19 @@ class MockQwen35VLVarlenDataset(Dataset):
                 sample_length=sample_length,
                 min_merged_tokens=self.image_geometry_sampler.min_merged_tokens,
                 min_text_tokens=min_text_tokens,
+                vision_budget=vision_budget,
+                stats=self.budget_stats,
             )
             geometries = self.image_geometry_sampler(
                 sample_idx,
                 num_images=num_images,
-                max_total_merged_tokens=sample_length - num_images - min_text_tokens,
+                max_total_merged_tokens=min(
+                    sample_length - num_images - min_text_tokens, vision_budget - num_images
+                ),
             )
         total_merged_tokens = sum(geometry.num_merged_tokens for geometry in geometries)
+        if num_images and num_images + total_merged_tokens >= 0.95 * vision_budget:
+            self.budget_stats["budget_saturated"] = self.budget_stats.get("budget_saturated", 0) + 1
         # An image-only sample treats the sampled length as an upper budget:
         # discrete image geometries cannot fill it exactly without text.
         if modality == _MODALITY_IMAGE_ONLY:
@@ -1006,6 +1142,8 @@ def train_valid_test_varlen_datasets_provider(
         image_size_config=image_size_config,
         image_count_config=image_count_config,
         modality_config=modality_config,
+        max_vision_tokens=getattr(args, "mock_max_vision_tokens", None),
+        max_vision_fraction=getattr(args, "mock_max_vision_fraction", None),
         image_placement=getattr(args, "mock_image_placement", "center"),
     )
     seed = int(getattr(args, "seed", 1234))

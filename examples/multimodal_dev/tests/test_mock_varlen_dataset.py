@@ -607,6 +607,114 @@ def test_large_image_count_geometry_sampling_is_feasible_and_deterministic():
     assert geometries == second(3, num_images=48, max_total_merged_tokens=budget)
 
 
+def test_absolute_vision_budget_bounds_every_sample():
+    # Budget 9 fits exactly one 4-merged-token image (1 VS + 4 IMG = 5);
+    # two images (10) exceed it, so counts must clamp to 1.
+    dataset = _make_dataset(
+        num_samples=16,
+        seq_length=64,
+        image_count_config={"mode": "density", "images_per_1k_tokens": 64, "max_count": 8},
+        max_vision_tokens=9,
+    )
+
+    for idx in range(16):
+        sample = dataset[idx]
+        num_images = sample["image_grid_thw"].shape[0]
+        vision_tokens = int((sample["input_ids"] == _IMAGE_TOKEN_ID).sum().item()) + num_images
+        assert num_images == 1
+        assert vision_tokens <= 9
+    assert dataset.budget_stats.get("count_clamped_by_feasibility", 0) > 0
+
+
+def test_fraction_vision_budget_scales_with_sample_length(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("20\n40\n", encoding="utf-8")
+    dataset = _make_dataset(
+        num_samples=2,
+        seq_length=40,
+        length_config=_file_config(lengths_file),
+        image_count_config=_count_config([1, 2, 3, 4], [1, 1, 1, 1]),
+        max_vision_fraction=0.5,
+    )
+
+    for idx, length in enumerate((20, 40)):
+        sample = dataset[idx]
+        num_images = sample["image_grid_thw"].shape[0]
+        vision_tokens = int((sample["input_ids"] == _IMAGE_TOKEN_ID).sum().item()) + num_images
+        assert vision_tokens <= length // 2
+        assert sample["input_ids"].numel() == length
+
+
+def test_vision_budget_renormalizes_modality_to_text_only(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("20\n", encoding="utf-8")
+    # fraction 0.1 -> budget 2 < smallest image (5): image-bearing infeasible.
+    dataset = _make_dataset(
+        num_samples=4,
+        seq_length=64,
+        length_config=_file_config(lengths_file),
+        modality_config=_modality_config(["interleaved", "text_only"], [99, 1]),
+        max_vision_fraction=0.1,
+    )
+
+    for idx in range(4):
+        sample = dataset[idx]
+        assert sample["image_grid_thw"].shape == (0, 3)
+        assert sample["input_ids"].numel() == 20
+    assert dataset.budget_stats.get("modality_dropped_by_vision_budget", 0) > 0
+
+
+def test_vision_budget_constrains_geometry_tuples(tmp_path):
+    lengths_file = tmp_path / "lengths.csv"
+    lengths_file.write_text("64\n", encoding="utf-8")
+    # Two images forced; budget 12 leaves 10 merged tokens -> only the
+    # (4, 4) bucket pair fits (8 <= 10); any tuple with an 8-merged bucket
+    # (12 > 10) must be filtered out.
+    dataset = _make_dataset(
+        num_samples=8,
+        seq_length=64,
+        length_config=_file_config(lengths_file),
+        image_count_config=_count_config([2], [1]),
+        image_size_config=_bucket_config((8, 8), (8, 16)),
+        max_vision_tokens=12,
+    )
+
+    for idx in range(8):
+        assert dataset[idx]["image_grid_thw"].tolist() == [[1, 4, 4], [1, 4, 4]]
+
+
+def test_loose_vision_budget_is_bit_identical_to_no_budget():
+    kwargs = {
+        "num_samples": 8,
+        "seq_length": 48,
+        "image_count_config": _count_config([1, 2, 3], [3, 2, 1]),
+        "image_size_config": _bucket_config((8, 8), (8, 16)),
+        "image_placement": "uniform",
+        "seed": 2026,
+    }
+    unbudgeted = _make_dataset(**kwargs)
+    budgeted = _make_dataset(max_vision_tokens=16384, max_vision_fraction=1.0, **kwargs)
+
+    for idx in range(8):
+        _assert_samples_equal(unbudgeted[idx], budgeted[idx])
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"max_vision_tokens": 0}, "positive integer"),
+        ({"max_vision_tokens": True}, "positive integer"),
+        ({"max_vision_fraction": 0}, r"in \(0, 1\]"),
+        ({"max_vision_fraction": 1.5}, r"in \(0, 1\]"),
+        ({"max_vision_tokens": 4}, "cannot host the smallest"),
+        ({"max_vision_fraction": 0.05, "seq_length": 32}, "cannot host the smallest"),
+    ],
+)
+def test_rejects_invalid_vision_budget(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _make_dataset(**overrides)
+
+
 def test_image_count_weights_are_normalized_internally():
     dataset = _make_dataset(image_count_config={"counts": [1, 2, 3, 4], "weights": [75, 15, 7, 3]})
 
