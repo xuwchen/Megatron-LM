@@ -765,6 +765,50 @@ class MegatronFSDP(torch.nn.Module):
             if not param_list:
                 return
 
+            # Parameters of multi-invocation units (e.g. a chunked vision
+            # tower under activation recompute) receive one gradient event
+            # PER invocation: every chunk's checkpoint recompute is its own
+            # inner backward, so AccumulateGrad — and this hook — fire once
+            # per chunk. Reducing on each event both races the previous
+            # chunk's in-flight reduce-scatter (observed as an illegal
+            # memory access in allocate_bucket_storage) and multiply-reduces
+            # the gradients. Accumulate locally per event and defer the
+            # single reduction to the root post-backward, which already
+            # reduces every parameter left in _params_require_handle_grad.
+            deferred = [
+                param for param in param_list if getattr(param, "_fsdp_defer_grad_reduce", False)
+            ]
+            if deferred:
+                for param in deferred:
+                    group_id = self.param_and_grad_buffer.param_to_param_group[param]
+                    group = self.param_and_grad_buffer.parameter_groups[group_id]
+                    if not group.requires_grad:
+                        continue
+                    if param.grad is not None:
+                        # First event copies (or adds on top of a TE-fused
+                        # wgrad that already wrote main_grad); later events
+                        # add. _grad_acc cannot be used per event: its copy
+                        # semantics would overwrite earlier chunks and its
+                        # None-grad path would zero the accumulation.
+                        param.main_grad = param.get_main_grad()
+                        local_grad = to_local_if_dtensor(param.grad)
+                        if getattr(param, "_fsdp_deferred_grad_ready", False):
+                            param.main_grad.add_(local_grad)
+                        elif param.grad_added_to_main_grad:
+                            param.main_grad.add_(local_grad)
+                            param._fsdp_deferred_grad_ready = True
+                        else:
+                            param.main_grad.copy_(local_grad)
+                            param._fsdp_deferred_grad_ready = True
+                        del param.grad
+                    # The root post-backward's _grad_acc must treat the
+                    # accumulated main_grad as final (no copy, no zeroing).
+                    param.grad_added_to_main_grad = True
+                deferred_set = set(deferred)
+                param_list = [p for p in param_list if p not in deferred_set]
+                if not param_list:
+                    return
+
             for param in param_list:
                 _grad_acc(param)
 
@@ -878,6 +922,8 @@ class MegatronFSDP(torch.nn.Module):
                 release_module_parameters(deferred_module, bwd=False)
                 for sub_module in deferred_module.modules():
                     sub_module._training_state = TrainingState.IDLE
+                for param in deferred_module.parameters():
+                    param._fsdp_deferred_grad_ready = False
             self._deferred_release_modules.clear()
 
             # Make sure all the gradients are handled.

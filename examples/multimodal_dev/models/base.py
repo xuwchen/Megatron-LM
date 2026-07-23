@@ -251,6 +251,12 @@ class MultimodalModel(MegatronModule):
             # asynchronous kernels).
             for submodule in getattr(self.vision_model, "modules", lambda: ())():
                 submodule._fsdp_defer_release = True
+            for parameter in getattr(self.vision_model, "parameters", lambda: ())():
+                # Each chunk's checkpoint recompute is its own inner
+                # backward, so grad hooks fire once per chunk: defer the
+                # reduce-scatter to the root post-backward (see
+                # megatron_fsdp._process_post_backward_gradients).
+                parameter._fsdp_defer_grad_reduce = True
             self._vision_release_deferred = True
         if streaming:
             # Synthetic-streaming profile: the dataset ships geometry only;
