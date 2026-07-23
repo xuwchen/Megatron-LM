@@ -338,6 +338,7 @@ class MegatronFSDP(torch.nn.Module):
                 param.__fsdp_param__ = True
 
         self._init_fsdp_param_and_grad_buffer()
+        self._deferred_release_modules = set()
         self._register_fsdp_hooks(self.module)
         self.microbatch_count = 0
         self.is_param_fsdp_distributed = False
@@ -698,6 +699,15 @@ class MegatronFSDP(torch.nn.Module):
             module._fsdp_inflight_backwards = inflight
             if inflight > 0:
                 return
+            if getattr(module, "_fsdp_defer_release", False):
+                # Multi-invocation units (e.g. a chunked vision tower) defer
+                # the release to the root post-backward: under activation
+                # recompute each invocation's insert/fire pair drains the
+                # in-flight count within its own checkpoint cycle, so the
+                # count alone cannot order the release after the OTHER
+                # invocations' still-enqueued asynchronous kernels.
+                self._deferred_release_modules.add(module)
+                return
 
             # Release parameters for this module after backward.
             release_module_parameters(module, bwd=True)
@@ -844,9 +854,7 @@ class MegatronFSDP(torch.nn.Module):
             # Track in-flight backward functions per FSDP unit so parameter
             # release can be deferred to the last one (multi-invocation
             # forwards, e.g. chunked vision towers).
-            module._fsdp_inflight_backwards = (
-                getattr(module, "_fsdp_inflight_backwards", 0) + 1
-            )
+            module._fsdp_inflight_backwards = getattr(module, "_fsdp_inflight_backwards", 0) + 1
             inp_tensors = RegisterFSDPBackwardFunction.apply(
                 functools.partial(post_backward_hook, module), *inp_tensors
             )
@@ -863,6 +871,15 @@ class MegatronFSDP(torch.nn.Module):
             return args, kwargs
 
         def _root_post_backward(*unused):
+            # Release multi-invocation (deferred) FSDP units now that every
+            # backward node of the iteration has executed.
+            for deferred_module in self._deferred_release_modules:
+                release_module_parameters(deferred_module, bwd=True)
+                release_module_parameters(deferred_module, bwd=False)
+                for sub_module in deferred_module.modules():
+                    sub_module._training_state = TrainingState.IDLE
+            self._deferred_release_modules.clear()
+
             # Make sure all the gradients are handled.
             ordered_params = sorted(
                 list(self._params_require_handle_grad), key=lambda p: self.param_to_name[p]

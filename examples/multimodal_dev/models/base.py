@@ -243,6 +243,15 @@ class MultimodalModel(MegatronModule):
         chunk_patches = int(getattr(self, "vision_encoder_chunk_patches", 0) or 0)
         pool = getattr(self, "vision_noise_pool", None)
         streaming = pixel_values is None
+        if chunk_patches > 0 and not getattr(self, "_vision_release_deferred", False):
+            # Chunked execution can invoke the tower several times per
+            # microbatch; Megatron-FSDP must defer these units' parameter
+            # release to the root post-backward (releasing after the first
+            # invocation's backward races with the other invocations'
+            # asynchronous kernels).
+            for submodule in getattr(self.vision_model, "modules", lambda: ())():
+                submodule._fsdp_defer_release = True
+            self._vision_release_deferred = True
         if streaming:
             # Synthetic-streaming profile: the dataset ships geometry only;
             # every chunk input is a read-only VIEW into one preallocated
