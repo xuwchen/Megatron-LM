@@ -684,6 +684,21 @@ class MegatronFSDP(torch.nn.Module):
             assert isinstance(module, tuple(fsdp_unit_modules))
             assert self.data_parallel_sharding_strategy == "optim_grads_params"
 
+            # An FSDP unit may run several forward passes inside one
+            # microbatch (e.g. a vision tower executed in image-boundary
+            # chunks). Each pass inserts its own post-backward function, but
+            # releasing the unsharded parameter buffers after the FIRST
+            # completed backward races with the asynchronous kernels of the
+            # remaining passes (observed as an illegal memory access that
+            # disappears under CUDA_LAUNCH_BLOCKING). Defer the release to
+            # the LAST in-flight backward of this unit. Gradients need no
+            # such guard: each parameter's AccumulateGrad node fires once
+            # per backward with all contributions already summed.
+            inflight = getattr(module, "_fsdp_inflight_backwards", 1) - 1
+            module._fsdp_inflight_backwards = inflight
+            if inflight > 0:
+                return
+
             # Release parameters for this module after backward.
             release_module_parameters(module, bwd=True)
             release_module_parameters(module, bwd=False)
@@ -826,6 +841,12 @@ class MegatronFSDP(torch.nn.Module):
             backward pass has completed in order to shard this layer's model memory
             once the current backward stage is done.
             """
+            # Track in-flight backward functions per FSDP unit so parameter
+            # release can be deferred to the last one (multi-invocation
+            # forwards, e.g. chunked vision towers).
+            module._fsdp_inflight_backwards = (
+                getattr(module, "_fsdp_inflight_backwards", 0) + 1
+            )
             inp_tensors = RegisterFSDPBackwardFunction.apply(
                 functools.partial(post_backward_hook, module), *inp_tensors
             )
