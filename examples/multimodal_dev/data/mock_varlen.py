@@ -79,6 +79,7 @@ class PackedWindowQwen35VLDataset(Dataset):
         vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
         image_size_config: dict[str, Any] | None = None,
         max_raw_patches_per_window: int | None = None,
+        streaming_pixels: bool = False,
         patch_size: int = 16,
         temporal_patch_size: int = 2,
         spatial_merge_size: int = 2,
@@ -186,6 +187,7 @@ class PackedWindowQwen35VLDataset(Dataset):
         self.max_raw_patches_per_window = (
             int(max_raw_patches_per_window) if max_raw_patches_per_window is not None else None
         )
+        self.streaming_pixels = bool(streaming_pixels)
         # The plan pool bounds construction time and memory independently of
         # the virtual dataset length Megatron requests for the full training
         # schedule: indices wrap onto the pool for the window LAYOUT while
@@ -298,7 +300,11 @@ class PackedWindowQwen35VLDataset(Dataset):
             )
         else:
             image_grid_thw = torch.empty((0, 3), dtype=torch.long)
-        if window.atoms:
+        if self.streaming_pixels:
+            # Synthetic-streaming profile: geometry only. The model
+            # materializes chunk inputs as views into its noise pool.
+            pixel_values = None
+        elif window.atoms:
             # One preallocated buffer, filled per image: no per-image tensor
             # list + concat, so the host peak is the payload itself rather
             # than twice the payload.
@@ -326,7 +332,8 @@ class PackedWindowQwen35VLDataset(Dataset):
             "image_grid_thw": image_grid_thw,
             "seq_lens": seq_lens,
         }
-        sample["pixel_values"] = pixel_values
+        if pixel_values is not None:
+            sample["pixel_values"] = pixel_values
         return sample
 
 
@@ -491,6 +498,12 @@ def train_valid_test_varlen_datasets_provider(
         key: value for key, value in config.items() if key not in ("mode", "image_sizes")
     }
 
+    streaming_pixels = bool(getattr(args, "mock_synthetic_streaming_pixels", False))
+    if streaming_pixels and int(getattr(args, "vision_encoder_chunk_patches", 0) or 0) <= 0:
+        raise ValueError(
+            "--mock-synthetic-streaming-pixels requires "
+            "--vision-encoder-chunk-patches > 0 (the noise pool holds one chunk)."
+        )
     micro_batch_size = int(getattr(args, "micro_batch_size", 1) or 1)
     if micro_batch_size != 1:
         raise ValueError(
@@ -508,6 +521,7 @@ def train_valid_test_varlen_datasets_provider(
         # Mirror the packer guard at the dataset so over-budget windows fail
         # before pixels are materialized on the host.
         max_raw_patches_per_window=getattr(args, "max_vision_patches_per_microbatch", None),
+        streaming_pixels=streaming_pixels,
     )
     seed = int(getattr(args, "seed", 1234))
     datasets = tuple(
@@ -516,6 +530,23 @@ def train_valid_test_varlen_datasets_provider(
         )
         for split in range(3)
     )
+
+    if streaming_pixels:
+        # The noise pool holds exactly one chunk of raw-patch rows, and
+        # images are indivisible: a bucket larger than the chunk budget can
+        # never stream. Fail at startup instead of probabilistically at the
+        # first heavy draw deep in a model forward.
+        largest_bucket_patches = largest_drawable_bucket_patches(datasets[0])
+        chunk_patches = int(getattr(args, "vision_encoder_chunk_patches", 0) or 0)
+        if largest_bucket_patches > chunk_patches:
+            raise ValueError(
+                "--mock-synthetic-streaming-pixels: the largest image bucket "
+                f"needs {largest_bucket_patches} raw patches but the noise pool "
+                f"holds one chunk of --vision-encoder-chunk-patches="
+                f"{chunk_patches}; raise the chunk budget or shrink the bucket "
+                "table (images are indivisible, so an oversized bucket can "
+                "never stream)."
+            )
 
     if getattr(args, "max_vision_patches_per_image", None) is None:
         # The per-image guard is a true invariant, not a tunable: atom sizes

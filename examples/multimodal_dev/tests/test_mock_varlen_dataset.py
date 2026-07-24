@@ -176,6 +176,24 @@ class TestPackedWindowDataset:
         with pytest.raises(ValueError, match="resolutions"):
             _make_dataset(image_size_config=None)
 
+    def test_streaming_mode_omits_pixel_values(self):
+        eager = _make_dataset()
+        streaming = _make_dataset(streaming_pixels=True)
+        for idx in range(len(streaming)):
+            sample = streaming[idx]
+            assert "pixel_values" not in sample
+            assert sample.keys() == {
+                "input_ids",
+                "labels",
+                "loss_mask",
+                "image_grid_thw",
+                "seq_lens",
+            }
+            # Geometry and tokens are identical to the eager profile.
+            reference = eager[idx]
+            for key in sample:
+                assert torch.equal(sample[key], reference[key]), key
+
     @pytest.mark.parametrize(
         ("image_size_config", "message"),
         [
@@ -308,6 +326,64 @@ class TestPackedWindowProvider:
         )
         with pytest.raises(ValueError, match="--sequence-packing-scheduler"):
             train_valid_test_varlen_datasets_provider((1, 1, 1))
+
+    def test_streaming_requires_chunked_encoder(self, monkeypatch):
+        monkeypatch.setattr(
+            megatron.training,
+            "get_args",
+            lambda: _provider_args(
+                mock_synthetic_streaming_pixels=True, vision_encoder_chunk_patches=0
+            ),
+        )
+        with pytest.raises(ValueError, match="--vision-encoder-chunk-patches"):
+            train_valid_test_varlen_datasets_provider((1, 1, 1))
+
+    def test_streaming_flag_reaches_the_dataset(self, monkeypatch):
+        monkeypatch.setattr(
+            megatron.training,
+            "get_args",
+            lambda: _provider_args(
+                mock_synthetic_streaming_pixels=True, vision_encoder_chunk_patches=1024
+            ),
+        )
+        train_ds, _, _ = train_valid_test_varlen_datasets_provider((2, 1, 1))
+        assert train_ds.streaming_pixels
+        assert "pixel_values" not in train_ds[0]
+
+    def test_streaming_pool_must_fit_the_largest_bucket(self, monkeypatch):
+        # Images are indivisible and the noise pool holds exactly one chunk:
+        # a chunk budget below the largest bucket (this fixture's table tops
+        # out at 8 raw patches; the calibrated default at 5,476) must fail at
+        # provider time, not probabilistically at the first heavy draw inside
+        # a model forward.
+        monkeypatch.setattr(
+            megatron.training,
+            "get_args",
+            lambda: _provider_args(
+                mock_synthetic_streaming_pixels=True, vision_encoder_chunk_patches=4
+            ),
+        )
+        with pytest.raises(ValueError, match="noise pool"):
+            train_valid_test_varlen_datasets_provider((2, 1, 1))
+
+    def test_zero_weight_bucket_does_not_trip_the_streaming_check(self, monkeypatch):
+        # The noise-pool feasibility check also considers only drawable
+        # buckets: a disabled oversized bucket must not force a bigger chunk.
+        spec = _provider_args().multimodal_varlen_mock_dataset_config_json.replace(
+            '"image_sizes":{"resolutions":[[32,32],[64,32]]}',
+            '"image_sizes":{"resolutions":[[32,32],[64,32]],"weights":[1,0]}',
+        )
+        monkeypatch.setattr(
+            megatron.training,
+            "get_args",
+            lambda: _provider_args(
+                multimodal_varlen_mock_dataset_config_json=spec,
+                mock_synthetic_streaming_pixels=True,
+                vision_encoder_chunk_patches=4,  # fits [32,32]=4, not [64,32]=8
+            ),
+        )
+        train_ds, _, _ = train_valid_test_varlen_datasets_provider((2, 1, 1))
+        assert train_ds.streaming_pixels
 
     def test_requires_packed_sequence(self, monkeypatch):
         monkeypatch.setattr(
