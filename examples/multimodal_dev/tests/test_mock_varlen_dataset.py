@@ -32,7 +32,7 @@ _WINDOW_CONFIG = {
         ]
     },
     "text_only_document_probability": 0.4,
-    "images_per_1k_text_tokens": 50,
+    "image_poisson_rate_per_1k_text_tokens": 50,
     "image_density_gamma_shape": 1.0,
     # Miniature 64-token test windows naturally exceed the production fill
     # ceiling; distortion accounting is covered by the kernel tests.
@@ -46,7 +46,7 @@ _CONSTANT_CONFIG = {
         "components": [{"name": "fixed", "weight": 1, "min": 24, "max": 24, "mean": 24, "sigma": 0}]
     },
     "text_only_document_probability": 0.0,
-    "images_per_1k_text_tokens": 50,
+    "image_poisson_rate_per_1k_text_tokens": 50,
     "max_boundary_fill_fraction": None,
 }
 
@@ -192,6 +192,29 @@ class TestPackedWindowDataset:
             for key in sample:
                 assert torch.equal(sample[key], reference[key]), key
 
+    @pytest.mark.parametrize(
+        ("image_size_config", "message"),
+        [
+            ({"mode": "buckets", "resolutions": [[8]]}, "two positive integers"),
+            ({"mode": "buckets", "resolutions": [[8, 8, 8]]}, "two positive integers"),
+            ({"mode": "buckets", "resolutions": [[0, 8]]}, "two positive integers"),
+            ({"mode": "buckets", "resolutions": [[-8, 8]]}, "two positive integers"),
+            ({"mode": "buckets", "resolutions": [[8.5, 8]]}, "two positive integers"),
+            (
+                {"mode": "buckets", "resolutions": [[8, 8], [8, 16]], "weights": [1]},
+                "match 'resolutions' in length",
+            ),
+            ({"mode": "buckets", "resolutions": [[8, 8]], "weights": [float("nan")]}, "finite"),
+        ],
+    )
+    def test_rejects_malformed_buckets(self, image_size_config, message):
+        with pytest.raises(ValueError, match=message):
+            _make_dataset(image_size_config=image_size_config)
+
+    def test_rejects_zero_patch_budget(self):
+        with pytest.raises(ValueError, match="positive integer or None"):
+            _make_dataset(max_raw_patches_per_window=0)
+
     def test_rejects_unusable_vocabulary(self):
         with pytest.raises(ValueError, match="token IDs must be in"):
             _make_dataset(vocab_size=64)
@@ -239,7 +262,7 @@ def _provider_args(**overrides):
             '{"name":"short","weight":3,"min":8,"max":63,"mean":24,"sigma":0.8},'
             '{"name":"long","weight":1,"min":64,"max":256,"mean":128,"sigma":0.5}]},'
             '"text_only_document_probability":0.4,'
-            '"images_per_1k_text_tokens":50,'
+            '"image_poisson_rate_per_1k_text_tokens":50,'
             '"image_density_gamma_shape":1.0,'
             '"max_boundary_fill_fraction":null}'
         ),

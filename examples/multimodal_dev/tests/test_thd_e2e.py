@@ -557,7 +557,7 @@ class TestSegmentPacking:
                     ]
                 },
                 "text_only_document_probability": 0.4,
-                "images_per_1k_text_tokens": 50,
+                "image_poisson_rate_per_1k_text_tokens": 50,
                 "image_density_gamma_shape": 1.0,
                 "max_boundary_fill_fraction": None,
             },

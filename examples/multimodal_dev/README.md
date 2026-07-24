@@ -63,7 +63,7 @@ torchrun --nproc_per_node=8 examples/multimodal_dev/pretrain_multimodal.py \
     --use-packed-sequence \
     --pad-packed-seq-alignment 128 \
     --varlen-mock-dataset-config-json \
-      '{"mode":"packed_window","doc_length":{"components":[{"name":"short","weight":95,"min":1024,"max":2048,"mean":1536,"sigma":0.3},{"name":"long","weight":5,"min":65536,"max":131072,"mean":98304,"sigma":0.4}]},"text_only_document_probability":0.735,"images_per_1k_text_tokens":1.76,"image_density_gamma_shape":0.46}' \
+      '{"mode":"packed_window","doc_length":{"components":[{"name":"short","weight":95,"min":1024,"max":2048,"mean":1536,"sigma":0.3},{"name":"long","weight":5,"min":65536,"max":131072,"mean":98304,"sigma":0.4}]},"text_only_document_probability":0.735,"image_poisson_rate_per_1k_text_tokens":1.76,"image_density_gamma_shape":0.46}' \
     --mock-image-size-config-json \
       '{"mode":"buckets","resolutions":[[224,224],[448,448],[672,448]],"weights":[3,2,1]}' \
     ... # other Megatron model and training arguments
@@ -89,8 +89,11 @@ Configuration:
   (post-truncation)/`sigma` (0 = constant length).
   `text_only_document_probability` is the **exact** text-only document
   probability (interleaved documents draw a zero-truncated count and always
-  carry at least one image); `images_per_1k_text_tokens` is the mean image
-  density of interleaved documents (per-document rates are Gamma-mixed
+  carry at least one image); `image_poisson_rate_per_1k_text_tokens` is the LATENT per-document
+  Poisson rate of interleaved documents — the realized zero-truncated
+  density is slightly higher (lambda/(1-e^-lambda), ~+8.5% at the parity
+  profile) and short documents floor at one image, so measure realized
+  densities with the simulator (per-document rates are Gamma-mixed
   with optional `image_density_gamma_shape`, default 1.0 = exponential;
   calibrated recipes set it explicitly). `boundary_fill` tokens emitted at
   window lines are ordinary text with normal loss; their fraction is

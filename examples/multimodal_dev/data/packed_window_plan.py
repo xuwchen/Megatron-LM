@@ -228,7 +228,12 @@ class PackedWindowPlanGenerator:
             truncated lognormal parameterized by post-truncation ``mean``,
             ``sigma`` — 0 means a constant-length component — ``min`` and
             ``max``), ``text_only_document_probability``,
-            ``images_per_1k_text_tokens``, and the optional
+            ``image_poisson_rate_per_1k_text_tokens`` (the LATENT Poisson rate
+            of interleaved documents; the realized zero-truncated density is
+            slightly higher — lambda/(1-e^-lambda) per document, about +8.5%
+            at the parity profile — and short documents floor at one image,
+            so window-level densities are calibrated and reported by the
+            simulator, never read off this knob), and the optional
             ``image_density_gamma_shape`` (default 1.0 = exponential
             mixing; calibrated recipes set it explicitly).
         bucket_merged_tokens / bucket_raw_patches / bucket_weights: image
@@ -307,11 +312,14 @@ class PackedWindowPlanGenerator:
         if self.p_text > 1.0:
             raise ValueError("text_only_document_probability must be in [0, 1].")
         self.density_mean = (
-            _require_number(config["images_per_1k_text_tokens"], what="images_per_1k_text_tokens")
+            _require_number(
+                config["image_poisson_rate_per_1k_text_tokens"],
+                what="image_poisson_rate_per_1k_text_tokens",
+            )
             / 1000.0
         )
         if self.density_mean <= 0:
-            raise ValueError("images_per_1k_text_tokens must be positive.")
+            raise ValueError("image_poisson_rate_per_1k_text_tokens must be positive.")
         self.gamma_shape = _require_number(
             config.get("image_density_gamma_shape", 1.0), what="image_density_gamma_shape"
         )
@@ -319,9 +327,9 @@ class PackedWindowPlanGenerator:
             raise ValueError("image_density_gamma_shape must be positive.")
         ceiling = config.get("max_boundary_fill_fraction", 0.005)
         self.max_boundary_fill_fraction = (
-            None if ceiling is None else _require_number(
-                ceiling, what="max_boundary_fill_fraction", minimum=0.0
-            )
+            None
+            if ceiling is None
+            else _require_number(ceiling, what="max_boundary_fill_fraction", minimum=0.0)
         )
 
         self.seq_length = int(seq_length)
@@ -330,8 +338,8 @@ class PackedWindowPlanGenerator:
         self.bucket_merged = tuple(int(v) for v in bucket_merged_tokens)
         self.bucket_raw = tuple(int(v) for v in bucket_raw_patches)
         weights = np.asarray(bucket_weights, dtype=np.float64)
-        if np.any(weights < 0) or weights.sum() <= 0:
-            raise ValueError("Bucket weights must be non-negative with a positive sum.")
+        if not np.all(np.isfinite(weights)) or np.any(weights < 0) or weights.sum() <= 0:
+            raise ValueError("Bucket weights must be finite and non-negative with a positive sum.")
         self.bucket_probs = weights / weights.sum()
 
         self.total_fill_tokens = 0
@@ -367,9 +375,7 @@ class PackedWindowPlanGenerator:
         # least one image, so text_only_document_probability is the EXACT
         # text-only document probability (not a lower bound) and the two
         # image knobs are directly settable user semantics.
-        count = _zero_truncated_poisson(
-            self._rng(doc_id, _STREAM_DOC_COUNT), lam * text_len
-        )
+        count = _zero_truncated_poisson(self._rng(doc_id, _STREAM_DOC_COUNT), lam * text_len)
         buckets = self._rng(doc_id, _STREAM_DOC_SIZES).choice(
             len(self.bucket_probs), size=count, p=self.bucket_probs
         )

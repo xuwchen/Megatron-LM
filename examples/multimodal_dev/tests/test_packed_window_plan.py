@@ -20,7 +20,7 @@ def _config(**overrides):
     config = {
         "doc_length": {"components": [dict(component) for component in _COMPONENTS]},
         "text_only_document_probability": 0.55,
-        "images_per_1k_text_tokens": 1.12,
+        "image_poisson_rate_per_1k_text_tokens": 1.12,
         "image_density_gamma_shape": 0.38,
         # Small synthetic test configs trip the production ceiling; the
         # enforcement itself is covered by its dedicated test below.
@@ -206,7 +206,7 @@ def test_spill_preserves_overtaken_atoms_and_order(monkeypatch):
             "sigma",
         ),
         ({"text_only_document_probability": 1.5}, "must be in"),
-        ({"images_per_1k_text_tokens": 0}, "must be positive"),
+        ({"image_poisson_rate_per_1k_text_tokens": 0}, "must be positive"),
         ({"image_density_gamma_shape": -1}, "must be positive"),
     ],
 )
@@ -241,7 +241,7 @@ def test_boundary_fill_ceiling_is_enforced():
                         {"name": "a", "weight": 1, "min": 64, "max": 128, "mean": 96, "sigma": 0.5}
                     ]
                 },
-                images_per_1k_text_tokens=64,
+                image_poisson_rate_per_1k_text_tokens=64,
                 image_density_gamma_shape=1.0,
                 max_boundary_fill_fraction=0.005,
             ),

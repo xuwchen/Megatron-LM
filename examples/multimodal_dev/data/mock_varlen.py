@@ -92,11 +92,26 @@ class PackedWindowQwen35VLDataset(Dataset):
                 '{"mode":"buckets","resolutions":[...]} (optional "weights").'
             )
 
+        import numbers
+
         block = patch_size * spatial_merge_size
         grids: list[tuple[int, int, int]] = []
         merged_tokens: list[int] = []
         raw_patches: list[int] = []
-        for resolution in image_size_config["resolutions"]:
+        for index, resolution in enumerate(image_size_config["resolutions"]):
+            if (
+                not isinstance(resolution, (list, tuple))
+                or len(resolution) != 2
+                or not all(
+                    isinstance(side, numbers.Integral) and not isinstance(side, bool)
+                    for side in resolution
+                )
+                or not all(int(side) > 0 for side in resolution)
+            ):
+                raise ValueError(
+                    f"Bucket resolution at index {index} must be exactly two positive "
+                    f"integers [height, width]; got {resolution!r}."
+                )
             height, width = int(resolution[0]), int(resolution[1])
             if height % block or width % block:
                 raise ValueError(
@@ -108,6 +123,11 @@ class PackedWindowQwen35VLDataset(Dataset):
             merged_tokens.append((grid_h // spatial_merge_size) * (grid_w // spatial_merge_size))
             raw_patches.append(grid_h * grid_w)
         weights = image_size_config.get("weights") or [1.0] * len(grids)
+        if len(weights) != len(grids):
+            raise ValueError(
+                f"Bucket 'weights' must match 'resolutions' in length; got "
+                f"{len(weights)} weights for {len(grids)} resolutions."
+            )
 
         special_ids = {image_token_id, video_token_id, vision_start_token_id}
         # Token ID 0 is reserved for packing padding; a special ID of 0 could
@@ -133,8 +153,13 @@ class PackedWindowQwen35VLDataset(Dataset):
         self.special_ids = special_ids
         self.grids = grids
         self.pixel_dim = 3 * temporal_patch_size * patch_size * patch_size
+        if max_raw_patches_per_window is not None and int(max_raw_patches_per_window) <= 0:
+            raise ValueError(
+                "max_raw_patches_per_window must be a positive integer or None "
+                f"(0 does not silently disable it); got {max_raw_patches_per_window!r}."
+            )
         self.max_raw_patches_per_window = (
-            int(max_raw_patches_per_window) if max_raw_patches_per_window else None
+            int(max_raw_patches_per_window) if max_raw_patches_per_window is not None else None
         )
         self.streaming_pixels = bool(streaming_pixels)
         # The plan pool bounds construction time and memory independently of
