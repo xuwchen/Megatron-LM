@@ -81,7 +81,7 @@ Each dataset item has exactly these fields:
 | `input_ids` | `[S]` | Always exactly `seq_length` tokens |
 | `labels` | `[S]` | Next-token targets; `-100` at each segment's final position (no cross-document prediction) and at image/vision-start targets |
 | `loss_mask` | `[S]` | Float mask aligned with `labels` |
-| `pixel_values` | `[sum(P_j), D]` | Ordered flattened raw patches for all images |
+| `pixel_values` | `[sum(P_j), D]` eager; **omitted** under `--mock-synthetic-streaming-pixels` | Ordered flattened raw patches for all images; streaming samples carry geometry only and the model materializes chunk inputs from its noise pool |
 | `image_grid_thw` | `[N, 3]` | Ordered `(T, H, W)` patch grids |
 | `seq_lens` | `[num_segments]` | Logical per-segment lengths, `sum == S` |
 
@@ -172,8 +172,8 @@ padding tokens after every internal segment, so the tensor layout matches
 The dataset mirrors `--max-vision-patches-per-microbatch` as a per-window
 budget checked from plan geometry BEFORE pixels are materialized, so
 over-budget windows fail without paying the multi-GiB host allocation;
-over-budget windows fail fast by design until the chunked/streaming
-vision runtime raises the envelope. Do **not**
+the eager pixel path is the 4K Phase A profile (long windows need the
+Phase B streaming pool). Do **not**
 combine with `--use-varlen-dataset` or `--sequence-packing-scheduler`.
 Packed THD + HybridEP flex dispatch requires
 `--moe-hybridep-pad-variable-tokens`. An image-free microbatch still runs
