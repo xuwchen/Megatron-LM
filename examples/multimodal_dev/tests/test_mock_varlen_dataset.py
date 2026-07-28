@@ -332,6 +332,32 @@ class TestPackedWindowProvider:
         with pytest.raises(ValueError, match="--total-seq-length to equal"):
             train_valid_test_varlen_datasets_provider((1, 1, 1))
 
+    def test_per_image_guard_defaults_to_the_largest_bucket(self, monkeypatch):
+        # Buckets [[32,32],[64,32]] at the real patch size 16: raw patches
+        # 2*2=4 and 4*2=8, so the derived exact bound is 8.
+        args = _provider_args()
+        monkeypatch.setattr(megatron.training, "get_args", lambda: args)
+        train_valid_test_varlen_datasets_provider((1, 1, 1))
+        assert args.max_vision_patches_per_image == 8
+
+    def test_zero_weight_bucket_does_not_lift_the_derived_guard(self, monkeypatch):
+        # Only drawable buckets count: disabling the larger bucket ([64,32],
+        # 8 raw patches) with weight 0 drops the derived bound to 4.
+        spec = _provider_args().multimodal_varlen_mock_dataset_config_json.replace(
+            '"image_sizes":{"resolutions":[[32,32],[64,32]]}',
+            '"image_sizes":{"resolutions":[[32,32],[64,32]],"weights":[1,0]}',
+        )
+        args = _provider_args(multimodal_varlen_mock_dataset_config_json=spec)
+        monkeypatch.setattr(megatron.training, "get_args", lambda: args)
+        train_valid_test_varlen_datasets_provider((1, 1, 1))
+        assert args.max_vision_patches_per_image == 4
+
+    def test_per_image_guard_explicit_value_is_preserved(self, monkeypatch):
+        args = _provider_args(max_vision_patches_per_image=123)
+        monkeypatch.setattr(megatron.training, "get_args", lambda: args)
+        train_valid_test_varlen_datasets_provider((1, 1, 1))
+        assert args.max_vision_patches_per_image == 123
+
 
 class TestCalibratedDefaults:
     """The single optional config: omitted keys fall back to the frozen
@@ -489,9 +515,7 @@ class TestCalibratedDefaults:
         parser = argparse.ArgumentParser()
         add_multimodal_args(parser)
         (action,) = [
-            a
-            for a in parser._actions
-            if a.dest == "multimodal_varlen_mock_dataset_config_json"
+            a for a in parser._actions if a.dest == "multimodal_varlen_mock_dataset_config_json"
         ]
         for key in PARITY_PROFILE:
             assert key in action.help, f"help text is missing profile key {key!r}"

@@ -330,6 +330,24 @@ class PackedWindowQwen35VLDataset(Dataset):
         return sample
 
 
+def largest_drawable_bucket_patches(dataset: "PackedWindowQwen35VLDataset") -> int:
+    """Raw patches (T*H*W) of the largest bucket that can actually be drawn.
+
+    Zero-weight buckets are disabled and must not gate feasibility or lift
+    guard bounds. The kernel guarantees a positive weight sum whenever a plan
+    was built; guard against the degenerate zero-sample split explicitly so
+    an all-zero table cannot reach an empty max().
+    """
+    sizes = [
+        grid_t * grid_h * grid_w
+        for (grid_t, grid_h, grid_w), weight in zip(dataset.grids, dataset.bucket_weights)
+        if weight > 0
+    ]
+    if not sizes:
+        raise ValueError("Bucket weights leave no drawable bucket (all zero).")
+    return max(sizes)
+
+
 def resolve_varlen_config(spec: str | None, *, seq_length: int) -> dict[str, Any]:
     """Shallow-merge a user config over the calibrated parity profile.
 
@@ -499,4 +517,11 @@ def train_valid_test_varlen_datasets_provider(
         for split in range(3)
     )
 
+    if getattr(args, "max_vision_patches_per_image", None) is None:
+        # The per-image guard is a true invariant, not a tunable: atom sizes
+        # come from the same (now fully validated) bucket table, so its exact
+        # upper bound is the largest drawable (weight > 0) bucket's raw-patch
+        # count. Resolve it once so the packer-side check (forward_step) sees
+        # a concrete bound even when no explicit cap was configured.
+        args.max_vision_patches_per_image = largest_drawable_bucket_patches(datasets[0])
     return datasets
