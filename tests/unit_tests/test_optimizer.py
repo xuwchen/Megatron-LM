@@ -608,6 +608,27 @@ def test_chained_optimizer_load_common_state_dict_rejects_lossy_collapse():
         ChainedOptimizer([destination]).load_common_state_dict(source_state)
 
 
+def test_chained_optimizer_load_common_state_dict_rejects_partial_child_identifiers():
+    """A mix of identifiable and unidentifiable indexed children must fail loudly.
+
+    Silently dropping the unidentifiable child would shrink the source child
+    count and misroute the load into the topology-reshard path, projecting the
+    surviving child's hyperparameters onto every destination child.
+    """
+    destinations = [
+        _RecordingCommonOptimizer(is_expert_parallel=False),
+        _RecordingCommonOptimizer(is_expert_parallel=True),
+    ]
+    source_state = {
+        0: _make_common_child(is_expert_parallel=False),
+        # Non-empty param_groups but missing the stable identifier keys.
+        1: {'optimizer': {'param_groups': [{'params': [123], 'lr': 0.5}]}},
+    }
+
+    with pytest.raises(RuntimeError, match="Ambiguous chained optimizer common state"):
+        ChainedOptimizer(destinations).load_common_state_dict(source_state)
+
+
 def test_chained_optimizer_get_parameters():
     """Test ChainedOptimizer.get_parameters() aggregates params from all sub-optimizers.
 

@@ -1926,17 +1926,25 @@ class ChainedOptimizer(MegatronOptimizer):
     def _extract_common_child_states(cls, state_dict):
         """Extract source common children from a possibly mixed DCP load result."""
         direct_child = state_dict if cls._is_saved_common_child_state(state_dict) else None
-        indexed_children = []
+        indexed_candidates = []
         if isinstance(state_dict, (list, tuple)):
-            indexed_children = [
-                child for child in state_dict if cls._is_saved_common_child_state(child)
-            ]
+            indexed_candidates = list(state_dict)
         elif isinstance(state_dict, dict):
-            indexed_children = [
-                state_dict[key]
-                for key in sorted(key for key in state_dict if isinstance(key, int))
-                if cls._is_saved_common_child_state(state_dict[key])
+            indexed_candidates = [
+                state_dict[key] for key in sorted(key for key in state_dict if isinstance(key, int))
             ]
+        indexed_children = [
+            child for child in indexed_candidates if cls._is_saved_common_child_state(child)
+        ]
+        if indexed_children and len(indexed_children) != len(indexed_candidates):
+            # A mix of children with and without the stable parameter-group
+            # identifiers must not be silently reinterpreted as a topology
+            # change: dropping the unidentifiable children would project the
+            # surviving child's hyperparameters onto every destination child.
+            raise RuntimeError(
+                'Ambiguous chained optimizer common state: some indexed children carry '
+                'saved parameter-group identifiers while their siblings do not.'
+            )
 
         if direct_child is not None and indexed_children:
             raise RuntimeError(
