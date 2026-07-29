@@ -459,6 +459,13 @@ class ShardedTensorFactory(ShardedBase):
             factories in different processes
         flattened_range (slice, optional): indicates additional flattening
             applied to the ShardedTensors produced by the factory
+        inplace_merge (bool): when True, `apply_factory_merges` copies the
+            merged result into `data` and returns `data`, so loaders that rely
+            on in-place restoration (e.g. FSDP2 with
+            `skip_load_to_model_and_opt`) update the live storage. Because this
+            is a dataclass field, `dataclasses.replace(factory, data=...)`
+            (used for optimizer-state clones) retargets the write-back to the
+            replaced `data` automatically.
     """
 
     key: str
@@ -467,6 +474,7 @@ class ShardedTensorFactory(ShardedBase):
     merge_fn: FactoryMergeFn
     replica_id: ReplicaId = 0
     flattened_range: Optional[slice] = None
+    inplace_merge: bool = False
 
     def build(self):
         """Builds a ShardedStateDict from the original tensor"""
@@ -517,7 +525,21 @@ def apply_factory_merges(
         StateDict: `x1` modified in-place
     """
     if isinstance(x2, ShardedTensorFactory):
-        return x2.merge_fn(x1)
+        merged = x2.merge_fn(x1)
+        if x2.inplace_merge:
+            if not isinstance(x2.data, torch.Tensor):
+                raise CheckpointingException(
+                    f"inplace_merge factory `{x2.key}` lost its destination tensor "
+                    f"(data={type(x2.data)}); the write-back would be silently skipped."
+                )
+            if not isinstance(merged, torch.Tensor):
+                raise CheckpointingException(
+                    f"inplace_merge factory `{x2.key}` merged to {type(merged)} "
+                    "instead of a tensor; the write-back would be silently skipped."
+                )
+            x2.data.detach().copy_(merged)
+            return x2.data
+        return merged
 
     # There rest is almost the same as the `merge` function from `dict_utils`
     if isinstance(x1, dict) and isinstance(x2, dict):

@@ -1254,14 +1254,20 @@ def _make_replicated_dtensor_factory(tensor, key, prepend_offsets, replica_id, k
         )
         return replicated_dtensor.redistribute(placements=placements).to_local()
 
-    return ShardedTensorFactory(
+    factory = ShardedTensorFactory(
         key,
         tensor._local_tensor,
         build_fn,
         merge_fn,
         replica_id,
         flattened_range=factory_flattened_range,
+        # In-place merge restores the live local shard (and, via
+        # dataclasses.replace clones, optimizer state) on loaders that skip
+        # model/optimizer load_state_dict and rely on in-place DCP writes.
+        inplace_merge=True,
     )
+    factory.is_data_parallel_fully_shard = True
+    return factory
 
 
 def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:

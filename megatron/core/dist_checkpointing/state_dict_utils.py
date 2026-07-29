@@ -85,8 +85,11 @@ def load_preprocess(sharded_state_dict: ShardedStateDict):
     )
     apply_factories(sharded_state_dict)
 
-    # Data inside sh_ten_factories no longer needed so delete them to reduce memory usage
-    dict_list_map_inplace(ShardedTensorFactory.without_data, sh_ten_factories)
+    # Data inside sh_ten_factories is no longer needed so delete it to reduce
+    # memory usage — except for inplace-merge factories, whose `data` IS the
+    # live destination tensor that apply_factory_merges must write back into
+    # (it is long-lived model/optimizer storage, not a droppable temporary).
+    dict_list_map_inplace(lambda f: f if f.inplace_merge else f.without_data(), sh_ten_factories)
     # Non-persistent objects
     nonpersistent_state_dict, sharded_state_dict = extract_nonpersistent(sharded_state_dict)
     dict_list_map_inplace(lambda o: o.unwrap(), nonpersistent_state_dict)

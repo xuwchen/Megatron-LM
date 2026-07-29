@@ -74,12 +74,13 @@ class TestTinyFSDPParamCheckpoint:
         ) as ckpt_dir:
             save({"model": model_factory, "optimizer": optimizer_factory}, ckpt_dir)
             param._local_tensor.zero_()
+            optimizer_destination = torch.zeros_like(optimizer_local)
             loaded = load(
                 {
                     "model": make_sharded_tensor_for_checkpoint(param, "weight"),
                     "optimizer": make_sharded_optimizer_tensor(
                         make_sharded_tensor_for_checkpoint(param, "weight"),
-                        torch.zeros_like(optimizer_local),
+                        optimizer_destination,
                         prefix="optimizer.state.exp_avg",
                     ),
                 },
@@ -90,3 +91,14 @@ class TestTinyFSDPParamCheckpoint:
         assert loaded["optimizer"].shape == optimizer_local.shape
         torch.testing.assert_close(loaded["model"], expected_local_model)
         torch.testing.assert_close(loaded["optimizer"], expected_local_optimizer)
+
+        # In-place restore contract: production FSDP2 loads run with
+        # skip_load_to_model_and_opt=True and discard the returned state dict,
+        # so the LIVE local shard and the optimizer destination tensor must be
+        # restored in place — not just the returned values. load_preprocess
+        # must keep the inplace-merge factories' data (the live destinations)
+        # instead of stripping it, so the merge returns the live objects.
+        torch.testing.assert_close(param._local_tensor, expected_local_model)
+        torch.testing.assert_close(optimizer_destination, expected_local_optimizer)
+        assert loaded["model"] is param._local_tensor
+        assert loaded["optimizer"] is optimizer_destination
