@@ -1168,6 +1168,13 @@ def validate_args(args, defaults={}):
         assert (
             os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1"
         ), 'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
+        if getattr(args, 'torch_fsdp2_reduce_scatter_unused_params', False):
+            # Fail at validation time instead of model-wrap time; the partial-RS
+            # and EP validators only cover this flag when their features are on.
+            assert is_torch_min_version("2.13.0"), (
+                '--torch-fsdp2-reduce-scatter-unused-params requires PyTorch >= 2.13 '
+                '(FSDPModule.set_reduce_scatter_unused_params)'
+            )
 
         if args.fp8_param_gather and is_te_min_version("2.0.0"):
             args.fp8_param_gather = False
