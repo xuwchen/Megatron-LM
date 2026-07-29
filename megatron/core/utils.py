@@ -1008,15 +1008,21 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     # Use local get_pg_rank and get_pg_size functions
     tp_rank = get_pg_rank(tp_group)
-    dp_rank = get_pg_rank(dp_cp_group)
     tp_size = get_pg_size(tp_group)
-    dp_size = get_pg_size(dp_cp_group)
     dp_replica_id = get_pg_rank(dp_cp_group)
 
     new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
 
     is_data_parallel_fully_sharded = HAVE_DTENSOR and isinstance(tensor, DTensor)
     if is_data_parallel_fully_sharded:
+        if _dtensor_requires_full_tensor(tensor):
+            raise NotImplementedError(
+                "make_tp_sharded_tensor_for_checkpoint does not support FSDP2 "
+                "DTensor shards with empty or uneven local chunks "
+                f"(global shape {tuple(tensor.shape)}, mesh shape "
+                f"{tuple(tensor.device_mesh.shape)}); emitting regular-grid "
+                "metadata for such layouts would corrupt the checkpoint."
+            )
         # TP + FSDP2 sharding
         dp_rank, dp_size, dp_replica_id = _get_dtensor_checkpoint_shard_info(tensor)
         tensor = tensor._local_tensor
@@ -1193,17 +1199,21 @@ def _get_dtensor_checkpoint_full_tensor_replica_id(tensor):
 
 
 def _dtensor_requires_full_tensor(tensor):
-    """Return whether a sharded DTensor has ranks with an empty local shard."""
+    """Return whether a sharded DTensor has empty or uneven local chunks.
+
+    ``Shard`` placements follow ``torch.chunk`` semantics, so any dimension
+    that does not divide evenly across its mesh dimension produces ranks with
+    smaller or empty local shards. ``ShardedTensor.from_rank_offsets`` assumes
+    a regular grid, so those layouts must go through the full-tensor factory.
+    """
     return any(
         isinstance(placement, Shard)
-        and tensor.device_mesh.shape[mesh_dim] > tensor.shape[placement.dim]
+        and (
+            tensor.device_mesh.shape[mesh_dim] > tensor.shape[placement.dim]
+            or tensor.shape[placement.dim] % tensor.device_mesh.shape[mesh_dim] != 0
+        )
         for mesh_dim, placement in enumerate(tensor.placements)
     )
-
-
-def get_full_tensor_if_necessary(tensor):
-    """For DTensor gets full tensor if some ranks will not have a local copy"""
-    return tensor.full_tensor() if _dtensor_requires_full_tensor(tensor) else tensor._local_tensor
 
 
 def _make_replicated_dtensor_factory(tensor, key, prepend_offsets, replica_id, kwargs):

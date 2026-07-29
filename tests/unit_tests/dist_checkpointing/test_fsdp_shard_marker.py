@@ -152,3 +152,39 @@ def test_unsupported_dtensor_checkpoint_layout_fails_fast(monkeypatch, placement
 
     with pytest.raises(ValueError, match="FSDP2 checkpointing"):
         utils._get_dtensor_checkpoint_shard_info(tensor)
+
+
+def test_uneven_dtensor_chunking_requires_full_tensor():
+    # dim0=10 over a 4-way shard mesh chunks as [3, 3, 3, 1]: uneven, so the
+    # regular-grid ShardedTensor path must be bypassed.
+    uneven = FakeDTensor(torch.zeros(3, 2), mesh_shape=(4,), coordinate=(0,), global_shape=(10, 2))
+    assert utils._dtensor_requires_full_tensor(uneven)
+
+    # dim0=96 over a 64-way mesh chunks as 48x2 plus 16 EMPTY ranks even
+    # though 64 > 96 is false; the divisibility term must catch it.
+    empty_tail = FakeDTensor(
+        torch.zeros(2, 2), mesh_shape=(64,), coordinate=(0,), global_shape=(96, 2)
+    )
+    assert utils._dtensor_requires_full_tensor(empty_tail)
+
+    even = FakeDTensor(torch.zeros(2, 2), mesh_shape=(4,), coordinate=(0,), global_shape=(8, 2))
+    assert not utils._dtensor_requires_full_tensor(even)
+
+
+def test_tp_helper_rejects_empty_or_uneven_dtensor_shards(monkeypatch):
+    monkeypatch.setattr(utils, "HAVE_DTENSOR", True)
+    monkeypatch.setattr(utils, "DTensor", FakeDTensor)
+    monkeypatch.setattr(utils, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(utils, "get_pg_size", lambda group: 1)
+
+    tiny = FakeDTensor(torch.ones(1, 2), mesh_shape=(4,), coordinate=(0,), global_shape=(1, 2))
+    with pytest.raises(NotImplementedError, match="empty or uneven local chunks"):
+        utils.make_tp_sharded_tensor_for_checkpoint(
+            tiny, "linear_fc1.weight", tp_axis=0, tp_group=object(), dp_cp_group=object()
+        )
+
+    uneven = FakeDTensor(torch.ones(3, 2), mesh_shape=(4,), coordinate=(0,), global_shape=(10, 2))
+    with pytest.raises(NotImplementedError, match="empty or uneven local chunks"):
+        utils.make_tp_sharded_tensor_for_checkpoint(
+            uneven, "linear_fc1.weight", tp_axis=0, tp_group=object(), dp_cp_group=object()
+        )

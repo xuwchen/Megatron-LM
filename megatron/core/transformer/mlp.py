@@ -436,7 +436,10 @@ def apply_swiglu_sharded_factory(
         tp_local_size = global_axis_size // tp_size
         if tp_local_size % 2 != 0:
             raise ValueError(f"SwiGLU TP-local dimension must be even, got {tp_local_size}")
-        if original_sh_ten.global_offset[original_split_axis] % local_axis_size != 0:
+        if (
+            local_axis_size == 0
+            or original_sh_ten.global_offset[original_split_axis] % local_axis_size != 0
+        ):
             raise ValueError("SwiGLU FSDP shard must use a regular physical grid")
 
         combined_rank = original_sh_ten.global_offset[original_split_axis] // local_axis_size
