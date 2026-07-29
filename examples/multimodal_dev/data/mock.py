@@ -172,7 +172,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     args = get_args()
     kwargs = dict(
-        seq_length=getattr(args, "total_seq_length", 1024),
+        # --total-seq-length defaults to None (mock_varlen inherits
+        # --seq-length); this fixed-shape provider keeps its historical 1024.
+        seq_length=getattr(args, "total_seq_length", None) or 1024,
         image_seq_length=getattr(args, "image_seq_length", 256),
         vocab_size=getattr(args, "padded_vocab_size", 248320),
         image_token_id=getattr(args, "image_token_id", 248056),

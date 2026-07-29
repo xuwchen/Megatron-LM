@@ -354,10 +354,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         processor_path, trust_remote_code=True,
     )
 
-    seq_length = (
-        getattr(args, "total_seq_length", None)
-        or getattr(args, "seq_length", 2048)
-    )
+    # --total-seq-length now defaults to None (mock_varlen inherits
+    # --seq-length); preserve this provider's historical 1024 default.
+    total_seq_length = getattr(args, "total_seq_length", None)
+    seq_length = total_seq_length if total_seq_length is not None else 1024
     image_token_id = getattr(args, "image_token_id", None)
 
     # Load real data
