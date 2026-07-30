@@ -9,7 +9,10 @@ import transformer_engine.pytorch as te
 from transformer_engine.pytorch import is_mxfp8_available, is_nvfp4_available
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
-from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+    GTPShardedParam,
+    reset_gtp_state,
+)
 from tests.unit_tests.test_utilities import Utils
 
 # ---------------------------------------------------------------------------
@@ -33,9 +36,9 @@ def reset_fp8_state():
 
 @pytest.fixture(autouse=True)
 def reset_gtp_globals():
-    """Reset GTP mutable class-level state between tests."""
+    """Reset GTP mutable class-level state between tests (fwd/bwd AND recompute chains)."""
     yield
-    GTPShardedParam._chain_state = {}
+    reset_gtp_state()
 
 
 # ---------------------------------------------------------------------------
