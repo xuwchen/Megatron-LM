@@ -48,6 +48,17 @@ Each weight is sharded 1/N across a GTP_remat group along `out_features`, stored
 
 - **Independent state per param**: each has its own AG state (`state`) and RS state (`rs_state`) machines, both cycling `NONE → ASYNC_WAIT → DATA_READY → NONE` and tracked separately so fwd and bwd async ops don't interfere.
 - **Prefetch chain for AG** (doubly-linked `prev_w` / `next_w`): during fwd, each weight's `all_gather_and_prefetch` issues async AG for `next_w`; during bwd, `all_gather_and_prefetch_bwd` issues async AG for `prev_w`. Layer *i*'s AG overlaps with layer *i−1*'s GEMM. For an L-layer model, L−1 all-gathers are fully hidden behind compute. When activation recompute is enabled, a **third** chain prefetches the recompute-forward gathers during backward — see §3.1 *Recompute-forward prefetch chain*.
+  A weight that opts out of incoming prefetch starts a new chain segment. In multimodal models,
+  this keeps vision weights before the embedding independent from the embedding's on-demand
+  forward and gather-free backward paths. Known boundary limitations: the segment rule lives on
+  the UNGRAPHED chain — per-layer CUDA graphs put vision and language attention weights on one
+  GRAPHED chain with no embedding between them, so multimodal GTP currently requires CG off or
+  full-iteration CG; the chain is built lazily in first-execution order, so data-dependent
+  module order (a text-only FIRST batch in a mixed dataset) builds out-of-order links — keep
+  conditional towers exercised from the first batch (interleaved-VPP chunks initializing
+  across microbatches are the legitimate late-link case, which is why no runtime detector
+  exists); each extra segment tail pins one additional bwd AG buffer and the embedding's
+  wgrad RS runs synchronously (it is a segment head).
 - **Deferred RS finalize for wgrad**: `wgrad_reduce_scatter` on param *i* launches an **async** reduce-scatter (handle stashed in `_wgrad_rs_handle`) and returns `None` to autograd — the wgrad is NOT finalized into `main_grad` yet. Finalization is **deferred one step**: the next bwd step (param *i−1*'s `wgrad_reduce_scatter`) calls `self.next_w._wait_reduce_scatter()` + `_finalize_wgrad()`, which waits on the stashed handle, accumulates the reduced wgrad into `main_grad`, and fires the DDP `register_grad_ready` hook. The chain's head (first-in-fwd, last-in-bwd) uses a synchronous RS since nothing follows it. This one-step deferral is what lets layer *i*'s RS overlap with layer *i−1*'s bwd GEMMs.
 - **Cold start only**: every weight's very first AG is synchronous (`DATA_READY_SYNC`, no prefetch has run yet); the async prefetch chain kicks in from the second forward onward.
 

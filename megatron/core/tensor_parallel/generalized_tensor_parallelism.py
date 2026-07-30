@@ -253,6 +253,18 @@ def classify_gtp_chains(model) -> None:
         # Bwd-prefetch opt-out: embedding weight needs no bwd AG (wgrad is a
         # scatter-add on sharded rows, input has no dgrad) — saves one collective.
         if "embedding" in name:
+            # The prefetch link encodes BOTH directions, so bwd opt-out is only sound for
+            # weights that also opt out of fwd prefetch (custom-backward embeddings set
+            # _need_weight_prefetch=False at construction). A regular GEMM weight whose
+            # module path merely contains "embedding" would silently consume a bwd
+            # all-gather that no producer issues — refuse it loudly instead.
+            if param._need_weight_prefetch:
+                raise RuntimeError(
+                    f"classify_gtp_chains: {name} matches the embedding bwd-prefetch opt-out "
+                    "but still expects fwd prefetch. Only custom-backward embedding weights "
+                    "(fwd opt-out too) may match this name pattern; rename the module or "
+                    "extend the boundary handling for this weight."
+                )
             param._need_weight_prefetch_bwd = False
     if conflicts:
         raise RuntimeError(
@@ -1355,7 +1367,9 @@ class GTPShardedParam(torch.nn.Parameter):
         if in_recompute and not self._recompute_initialized:
             rchain = cls._get_recompute_chain_state(self.chain_id)
             last_r = rchain["last_weight"]
-            if last_r is not None and last_r._recompute_next is None:
+            # Same segment-boundary rule as the fwd/bwd chain below (defensive: embeddings do
+            # not run under activation recompute today).
+            if last_r is not None and last_r._recompute_next is None and self._need_weight_prefetch:
                 last_r._recompute_next = self
                 self._recompute_prev = last_r
             self._recompute_initialized = True
@@ -1366,10 +1380,29 @@ class GTPShardedParam(torch.nn.Parameter):
         chain = cls._get_chain_state(self.chain_id)
         if not self.prefetch_initialized:
             last_w = chain["last_weight"]
-            if last_w is not None and last_w.next_w is None:
+            # A weight that cannot be prefetched starts a new chain segment. In multimodal
+            # models, vision weights execute before the embedding, while embedding backward
+            # bypasses the regular weight-gather path. Linking the vision tail into that
+            # embedding would make both directions consume a prefetch that is never issued.
+            # NOTE: the chain is built lazily in first-execution order, so conditional towers
+            # (e.g. a text-only FIRST batch followed by image batches) build out-of-order
+            # links — a known limitation documented in the GTP design doc; interleaved-VPP
+            # chunks initializing across microbatches are the legitimate late-link case.
+            if last_w is not None and last_w.next_w is None and self._need_weight_prefetch:
                 cls._buffer_link_table_row(last_w, self, chain)
                 last_w.next_w = self
                 self.prev_w = last_w
+            elif (
+                last_w is not None
+                and last_w.next_w is None
+                and not self._need_weight_prefetch
+                and not chain["link_table_flushed"]
+            ):
+                # Record the boundary in the (not yet flushed) link table for observability.
+                chain["link_table_buffer"].append(
+                    f"[GTP chain] segment break: {getattr(self, '_debug_name', '<param>')} "
+                    "starts a new on-demand segment"
+                )
 
             cache = get_global_GTP_cache()
 
@@ -2010,7 +2043,13 @@ class GTPEmbeddingWeight(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        """Reduce-scatter the gradient back to this rank's vocab-dim shard."""
+        """Reduce-scatter the gradient back to this rank's vocab-dim shard.
+
+        INVARIANT: this must never call ``all_gather_and_prefetch_bwd``. The embedding may
+        have ``next_w`` set (it is a fwd producer for the following segment) while its
+        ``_need_weight_prefetch_bwd`` is False, so the bwd consume path would read a buffer
+        no producer ever fills.
+        """
         (weight,) = ctx.saved_tensors
         return weight.wgrad_reduce_scatter(grad_output)
 
