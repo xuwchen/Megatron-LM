@@ -212,6 +212,13 @@ class DistributedDataParallel(_BaseDataParallel):
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
+        import os as _os
+        if _os.environ.get('GTP_GRAD_PROBE', '0') == '1' and torch.distributed.get_rank() < 3:
+            print(f"[GTP-PROBE rank{torch.distributed.get_rank()}] DDP groups: "
+                  f"dp_cp={self.dp_cp_group.size()} intra_dp_cp={self.intra_dp_cp_group.size()} "
+                  f"expt_dp={self.expt_dp_group.size()} intra_expt_dp={self.intra_expt_dp_group.size()} "
+                  f"scale={gradient_scaling_factor} expert_scale={expert_gradient_scaling_factor} "
+                  f"distopt={self.ddp_config.use_distributed_optimizer}", flush=True)
         # Allocate buffers for each group.
         self.buffers = []
         self.expert_parallel_buffers = []

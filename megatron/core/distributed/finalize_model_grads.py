@@ -478,7 +478,17 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
 
     dense_active = gtp_remat_group is not None and gtp_remat_group.size() > 1
     expert_active = egtp_remat_group is not None and egtp_remat_group.size() > 1
+    import os as _os
+    _dbg = _os.environ.get('GTP_GRAD_PROBE', '0') == '1'
+    if _dbg and torch.distributed.get_rank() < 3:
+        print(f"[GTP-PROBE rank{torch.distributed.get_rank()}] completion called: "
+              f"gtp_group={'None' if gtp_remat_group is None else gtp_remat_group.size()} "
+              f"egtp_group={'None' if egtp_remat_group is None else egtp_remat_group.size()} "
+              f"per_token={calculate_per_token_loss}", flush=True)
     if not dense_active and not expert_active:
+        if _dbg and torch.distributed.get_rank() < 3:
+            print(f"[GTP-PROBE rank{torch.distributed.get_rank()}] EARLY RETURN — no active group",
+                  flush=True)
         return
 
     dense_params, dense_grads = [], []
@@ -504,7 +514,15 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
         (expert_params, expert_grads, egtp_remat_group),
     ):
         if not grads or group is None or group.size() <= 1:
+            if _dbg and torch.distributed.get_rank() < 3:
+                print(f"[GTP-PROBE rank{torch.distributed.get_rank()}] SKIP bucket: "
+                      f"n_grads={len(grads)} group={'None' if group is None else group.size()}",
+                      flush=True)
             continue
+        if _dbg and torch.distributed.get_rank() < 3:
+            _tot = sum(g.norm().item()**2 for g in grads) ** 0.5
+            print(f"[GTP-PROBE rank{torch.distributed.get_rank()}] pre-reduce: n_params={len(params)} "
+                  f"group_size={group.size()} total_norm={_tot:.6f}", flush=True)
         coalesced = _flatten_dense_tensors(grads)
         # SUM vs AVG per the loss-normalization regime documented above.
         op = (
@@ -513,6 +531,11 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
             else torch.distributed.ReduceOp.AVG
         )
         torch.distributed.all_reduce(coalesced, op=op, group=group)
+        if _dbg and torch.distributed.get_rank() < 3:
+            _post = _unflatten_dense_tensors(coalesced, grads)
+            _tot2 = sum(g.norm().item()**2 for g in _post) ** 0.5
+            print(f"[GTP-PROBE rank{torch.distributed.get_rank()}] post-reduce({op}): "
+                  f"total_norm={_tot2:.6f}", flush=True)
         for param, buf, synced in zip(params, grads, _unflatten_dense_tensors(coalesced, grads)):
             buf.copy_(synced)
             grad_attr = _get_main_grad_attr(param)
