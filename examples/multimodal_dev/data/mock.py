@@ -79,10 +79,17 @@ class MockQwen35VLDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
+        # Deterministic per-index generation: sample content must be a pure function of idx so
+        # the data-parallel sampler's index assignment (not each rank's ambient CPU RNG stream)
+        # decides who sees what. With the previous ambient-RNG draws, every rank generated the
+        # same sample stream (equal CPU seeds when data_parallel_random_init is off), collapsing
+        # the effective unique batch to num_microbatches-per-rank and making runs with different
+        # data-parallel layouts incomparable.
+        gen = torch.Generator().manual_seed(0x51DE + int(idx))
         # Reserve 1 slot for the vision_start sentinel before image tokens.
         text_length = self.seq_length - self.image_seq_length - 1
         text_tokens = torch.randint(
-            1, self.vocab_size, (text_length,), dtype=torch.long,
+            1, self.vocab_size, (text_length,), dtype=torch.long, generator=gen,
         )
         special_ids = {
             self.image_token_id,
@@ -120,7 +127,7 @@ class MockQwen35VLDataset(Dataset):
             * self.patch_size
             * self.patch_size
         )
-        pixel_values = torch.randn(self.total_patches, pixel_dim)
+        pixel_values = torch.randn(self.total_patches, pixel_dim, generator=gen)
 
         image_grid_thw = self.grid_thw.clone()
 
