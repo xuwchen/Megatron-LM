@@ -2539,6 +2539,33 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
+        # DEBUG(throwaway): GTP_WEIGHT_PROBE prints a topology-independent fp64 checksum of the
+        # loaded weights. GTP shards a param across the gtp axis and 3D parallelism does not, so
+        # a per-rank checksum is not comparable; summing |w| over the whole world after
+        # de-duplicating TP/GTP replicas is. If GTP and 3D agree here, the checkpoint restores
+        # bit-identical weights and any forward difference is in the compute path, not the load.
+        if os.environ.get("GTP_WEIGHT_PROBE"):
+            import torch.distributed as _dist
+            from megatron.core.tensor_parallel import (
+                param_is_not_gtp_duplicate,
+                param_is_not_tensor_parallel_duplicate,
+            )
+            from megatron.training.utils import unwrap_model as _unwrap
+
+            _tot = torch.zeros(2, dtype=torch.float64, device="cuda")
+            for _chunk in _unwrap(model):
+                for _n, _p in _chunk.named_parameters():
+                    if not param_is_not_tensor_parallel_duplicate(_p):
+                        continue
+                    if not param_is_not_gtp_duplicate(_p):
+                        continue
+                    _d = _p.detach().to(torch.float64)
+                    _tot[0] += _d.abs().sum()
+                    _tot[1] += _d.numel()
+            _dist.all_reduce(_tot)
+            if _dist.get_rank() == 0:
+                print(f"GTP_WEIGHT_PROBE abs_sum={_tot[0].item():.10E} numel={int(_tot[1].item())}",
+                      flush=True)
         one_logger and one_logger.log_metrics(
             {
                 'load_checkpoint_finish_time': one_logger_utils.get_timestamp_in_ms(),

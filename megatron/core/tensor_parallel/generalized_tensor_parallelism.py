@@ -436,6 +436,14 @@ def configure_gtp_remat_from_recipe(
     elif fp8:
         update_gtp_config(pad_for_alignment=16)
 
+    # DEBUG(throwaway): GTP_PAD_ALIGN overrides the alignment padding so a run can be made
+    # shape-identical to a non-GTP topology (0 = no padding; requires dim0 divisible by the
+    # gtp_remat degree). Used to test whether the padded allocation is what keeps the GTP
+    # forward from being bitwise-equal to plain 3D parallelism.
+    _pad_override = os.environ.get("GTP_PAD_ALIGN")
+    if _pad_override is not None:
+        update_gtp_config(pad_for_alignment=int(_pad_override))
+
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         logger.info("> GTP_remat enabled. %s", GTP_CONFIG)
 
