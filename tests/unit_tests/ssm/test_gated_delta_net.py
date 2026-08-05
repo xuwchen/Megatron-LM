@@ -6,8 +6,10 @@ from unittest import mock
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
+import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
@@ -146,6 +148,49 @@ def test_gdn_headwise_cp_head_divisibility_includes_cp_size():
             linear_num_key_heads=4,
             linear_num_value_heads=8,
         )
+
+
+@pytest.mark.parametrize(
+    "recompute_modules", [["gdn_qkv"], ["gdn_norm_out"], ["gdn_qkv", "gdn_norm_out"]]
+)
+def test_gdn_fine_grained_recompute_config_accepts_gdn_variant(recompute_modules):
+    config = _make_gdn_config(
+        recompute_granularity="selective", recompute_modules=recompute_modules
+    )
+    assert config.recompute_modules == recompute_modules
+
+
+@pytest.mark.parametrize("recompute_module", ["gdn_qkv", "gdn_norm_out"])
+def test_gdn_fine_grained_recompute_config_requires_gdn_variant(recompute_module):
+    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
+        _make_gdn_config(
+            experimental_attention_variant=None,
+            linear_attention_freq=None,
+            recompute_granularity="selective",
+            recompute_modules=[recompute_module],
+        )
+
+
+@pytest.mark.parametrize("recompute_module", ["gdn_qkv", "gdn_norm_out"])
+def test_gdn_fine_grained_recompute_config_rejects_whole_gdn(recompute_module):
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _make_gdn_config(
+            recompute_granularity="selective", recompute_modules=["gdn", recompute_module]
+        )
+
+
+def test_gdn_whole_recompute_config_allows_dense_gtp_remat():
+    config = _make_gdn_config(
+        recompute_granularity="selective", recompute_modules=["gdn"], gtp_weight_remat_size=2
+    )
+    assert config.recompute_modules == ["gdn"]
+
+
+def test_gdn_whole_recompute_config_allows_expert_gtp_only():
+    config = _make_gdn_config(
+        recompute_granularity="selective", recompute_modules=["gdn"], expert_gtp_weight_remat_size=2
+    )
+    assert config.recompute_modules == ["gdn"]
 
 
 @pytest.mark.parametrize(
@@ -323,6 +368,183 @@ class TestGatedDeltaNet:
                 rtol=1e-4,
                 atol=1e-4,
                 msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
+            )
+
+    @pytest.mark.parametrize(
+        "recompute_modules", [("gdn_qkv",), ("gdn_norm_out",), ("gdn_qkv", "gdn_norm_out")]
+    )
+    @pytest.mark.flaky_in_dev  # Issue #5473
+    def test_selective_recompute_gdn_fine_grained(self, recompute_modules):
+        """Fine-grained GDN recompute must preserve outputs and every gradient."""
+        gdn = self.gdn
+        gdn.train()
+
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
+        seq_length = 64
+        torch.manual_seed(1234)
+        base_input = torch.randn(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        def run(modules):
+            gdn.recompute_qkv = "gdn_qkv" in modules
+            gdn.recompute_norm_out = "gdn_norm_out" in modules
+            gdn.zero_grad(set_to_none=True)
+            hidden_states = base_input.clone().detach().requires_grad_(True)
+            output, _ = gdn(hidden_states, None)
+            output.float().square().mean().backward()
+            param_grads = {
+                name: param.grad.detach().clone()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            return output.detach().clone(), hidden_states.grad.detach().clone(), param_grads
+
+        try:
+            out_ref, dinput_ref, pgrad_ref = run(())
+            out_rc, dinput_rc, pgrad_rc = run(recompute_modules)
+        finally:
+            gdn.recompute_qkv = False
+            gdn.recompute_norm_out = False
+
+        torch.testing.assert_close(out_rc, out_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dinput_rc, dinput_ref, rtol=1e-4, atol=1e-4)
+        assert pgrad_ref.keys() == pgrad_rc.keys(), "recompute changed the set of grad params"
+        assert len(pgrad_ref) > 0, "expected at least one parameter gradient"
+        for name in pgrad_ref:
+            torch.testing.assert_close(
+                pgrad_rc[name],
+                pgrad_ref[name],
+                rtol=1e-4,
+                atol=1e-4,
+                msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
+            )
+
+    @pytest.mark.flaky_in_dev  # Issue #5473
+    @pytest.mark.parametrize("recompute_boundary", ["gdn_qkv", "gdn"])
+    def test_gdn_recompute_marks_gtp_in_proj_replay(self, recompute_boundary):
+        """Both GDN checkpoint boundaries mark BF16 in_proj replay as GTP recompute."""
+        if not (self.tp_size == 1 and self.sp_size == 1 and self.cp_size == 1):
+            pytest.skip("Run this GTP2 integration once on the TP1/SP0/CP1 fixture.")
+        if not gtp_module.HAVE_TE:
+            pytest.skip(f"GTP companion TE is unavailable: {gtp_module.GTP_UNAVAILABLE_REASON}")
+
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        if world_size < 2 or world_size % 2:
+            pytest.skip("The GTP2 integration requires an even distributed world size >= 2.")
+
+        # All ranks create every pair in the same order; each rank then selects its own
+        # adjacent GTP2 subgroup. This keeps the test valid in the usual 4-GPU CI job.
+        gtp_group = None
+        for start in range(0, world_size, 2):
+            ranks = [start, start + 1]
+            group = dist.new_group(ranks=ranks)
+            if rank in ranks:
+                gtp_group = group
+        assert gtp_group is not None
+
+        gdn = self.gdn
+        gdn.train()
+        gtp_module.reset_gtp_state()
+        original_gtp_size = gdn.config.gtp_weight_remat_size
+        gdn.config.gtp_weight_remat_size = 2
+        gdn.in_proj.gtp_remat_size = 2
+        gtp_module.wrap_module_params_gtp(gdn.in_proj, ["weight"], gtp_group)
+        assert gtp_module.is_gtp_param(gdn.in_proj.weight)
+        gdn.in_proj.weight.main_grad = torch.zeros_like(gdn.in_proj.weight)
+
+        torch.manual_seed(1234)
+        hidden_states = torch.randn(
+            (32, 2, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        dist.broadcast(hidden_states, src=0)
+
+        gather_phases = []
+        original_gather = gtp_module.gather_along_first_dim
+
+        def counted_gather(*args, **kwargs):
+            gather_phases.append(bool(gtp_module.in_fp8_activation_recompute_phase()))
+            return original_gather(*args, **kwargs)
+
+        gtp_module.gather_along_first_dim = counted_gather
+        gdn.recompute_qkv = recompute_boundary == "gdn_qkv"
+        gdn.recompute_gdn = recompute_boundary == "gdn"
+        try:
+            output, _ = gdn(hidden_states, None)
+            output.float().square().mean().backward()
+        finally:
+            gdn.recompute_qkv = False
+            gdn.recompute_gdn = False
+            gdn.config.gtp_weight_remat_size = original_gtp_size
+            gtp_module.gather_along_first_dim = original_gather
+            gtp_module.reset_gtp_state()
+
+        assert gather_phases == [False, True, False], (
+            "Expected GDN in_proj gathers for original forward, marker-tagged recompute forward, "
+            f"and dgrad; got phases={gather_phases}"
+        )
+        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+        assert torch.isfinite(gdn.in_proj.weight.main_grad).all()
+        assert torch.any(gdn.in_proj.weight.main_grad != 0)
+
+    @pytest.mark.flaky_in_dev  # Issue #5473
+    def test_selective_recompute_gdn_qkv_thd_headwise_cp(self):
+        """Packed THD recompute keeps integer CP permutation metadata out of autograd."""
+        if self.sp_size > 1 or self.cp_size_headwise == 1:
+            pytest.skip("This regression targets packed THD with headwise CP>1.")
+
+        gdn = self.gdn
+        gdn.train()
+        sequence_length = 32
+        micro_batch_size = 4
+        sub_sequence_length = sequence_length // self.cp_size
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 128])
+
+        torch.manual_seed(1234)
+        base_sbhd = torch.randn(
+            (sub_sequence_length, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        base_thd = base_sbhd.transpose(0, 1).contiguous().view(-1, 1, gdn.config.hidden_size)
+
+        def run(recompute_qkv):
+            gdn.recompute_qkv = recompute_qkv
+            gdn.recompute_norm_out = False
+            gdn.zero_grad(set_to_none=True)
+            hidden_states = base_thd.clone().detach().requires_grad_(True)
+            output, _ = gdn(hidden_states, None, packed_seq_params=packed_seq_params)
+            output.float().square().mean().backward()
+            param_grads = {
+                name: param.grad.detach().clone()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            return output.detach().clone(), hidden_states.grad.detach().clone(), param_grads
+
+        try:
+            out_ref, dinput_ref, pgrad_ref = run(False)
+            out_rc, dinput_rc, pgrad_rc = run(True)
+        finally:
+            gdn.recompute_qkv = False
+            gdn.recompute_norm_out = False
+
+        torch.testing.assert_close(out_rc, out_ref, rtol=3e-4, atol=3e-4)
+        torch.testing.assert_close(dinput_rc, dinput_ref, rtol=3e-4, atol=3e-4)
+        assert pgrad_ref.keys() == pgrad_rc.keys(), "recompute changed the set of grad params"
+        for name in pgrad_ref:
+            torch.testing.assert_close(
+                pgrad_rc[name],
+                pgrad_ref[name],
+                rtol=3e-4,
+                atol=3e-4,
+                msg=lambda m, n=name: f"THD gradient mismatch for parameter '{n}': {m}",
             )
 
     def test_gpu_forward_rejects_sbhd_chunkwise_cp_batch_gt_one(self):

@@ -953,6 +953,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     ),
                     False,
                     pre_mlp_layernorm_output,
+                    te_activation_recompute=(
+                        self.config.gtp_weight_remat_size > 1
+                        or self.config.expert_gtp_weight_remat_size > 1
+                    ),
                 )
         elif should_chunk_mlp_for_prefill or should_chunk_mlp_for_training:
             # Chunk input along sequence dimension
@@ -2129,6 +2133,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                     functools.partial(self.mlp, padding_mask=padding_mask, **moe_kwargs),
                     False,
                     pre_mlp_layernorm_output,
+                    te_activation_recompute=(
+                        self.config.gtp_weight_remat_size > 1
+                        or self.config.expert_gtp_weight_remat_size > 1
+                    ),
                 )
         elif should_chunk_mlp_for_prefill:
             num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
@@ -2584,6 +2592,10 @@ class MoETransformerLayer(TransformerLayer):
                         ),
                         False,
                         hidden_states,
+                        te_activation_recompute=(
+                            self.config.gtp_weight_remat_size > 1
+                            or self.config.expert_gtp_weight_remat_size > 1
+                        ),
                     )
             else:
                 return _forward_mlp_partial_cudagraphs(

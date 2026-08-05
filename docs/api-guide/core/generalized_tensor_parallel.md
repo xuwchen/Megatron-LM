@@ -357,6 +357,42 @@ When a GTP_remat-sharded module is in `--recompute-modules` (e.g. `shared_expert
 
 The recompute weights form a **separate** linked list (`_recompute_next`), **self-populated** on the first backward from the weights actually re-gathered while `in_fp8_activation_recompute_phase()` is true — membership is *observed*, not configured (no tagging, so it tracks exactly what each checkpointed module re-gathers). Each recompute-forward consume prefetches the next recompute weight, so every gather **except the global-first** overlaps preceding recompute / dgrad / wgrad compute:
 
+The TransformerEngine phase marker is required in BF16 as well as FP8. Its historical name,
+`in_fp8_activation_recompute_phase()`, describes where the marker originated, not a precision
+restriction. `CheckpointWithoutOutput(te_activation_recompute=True)` enters that context without
+enabling FP8. GDN uses this independent marker when `gdn_qkv` checkpoints a GTP-remat-sharded
+`in_proj`; otherwise the replay would be mistaken for an ordinary forward and could overwrite
+the normal forward/backward gather state instead of using the isolated recompute slot.
+
+GDN's two fine-grained targets have deliberately different communication costs. The
+last column counts only **GTP weight communication**; when CP is larger than one,
+replay also repeats the CP layout collectives named in the boundary column.
+
+| recompute target | replay boundary (including CP work) | GTP-remat weight effect |
+|---|---|---|
+| `gdn_qkv` | `in_proj` → zigzag-to-contiguous / CP-to-HP A2A → conv1d → QKV/gate/beta preparation | Re-materializes the sharded `in_proj` weight, adding the third rowwise AG shown above. |
+| `gdn_norm_out` | gated RMSNorm → contiguous-to-zigzag / HP-to-CP A2A | Contains no GTP-remat linear weight, so it adds no weight AG. |
+| both | the two boundaries above, replayed in dependency order | One manager replays `gdn_qkv` before `gdn_norm_out`; the only extra weight-remat AG is for `in_proj`, while both selected CP layout conversions are replayed. |
+
+BF16 full activation recompute uses the same TE phase marker through Megatron's ordinary
+`tensor_parallel.checkpoint`. HybridStack, TransformerBlock, and MTP pass
+`te_activation_recompute=True` whenever dense GTP or expert GTP is active. This preserves
+Megatron's CUDA-graph warmup/capture bypass while ensuring a replayed layer uses the isolated
+recompute gather chain. FP8/FP4 continue to use TE's native checkpoint directly, so they do
+not receive a nested marker.
+
+BF16 standard selective checkpoints use the marker too: dense/mixture MLP, partial-graph MoE,
+whole MoE, shared experts, and whole-module `gdn` all opt in when their configuration has a dense
+or expert GTP axis. The whole-GDN path contains two non-expert projections, so it keys off dense
+GTP specifically. FP8/FP4 whole-GDN recompute follows the same TE-native checkpoint path as the
+other whole-module boundaries, preserving the quantization recipe without nesting the BF16
+marker. Fine-grained `gdn_qkv` and `gdn_norm_out` remain preferable when whole-GDN replay would
+recompute substantially more activation work than the memory target requires.
+
+Packed THD headwise CP also produces an integer inverse permutation. That metadata is computed
+outside the output-discarding checkpoint and captured by both forward and replay; only the six
+floating QKV/gate/beta outputs participate in checkpoint autograd.
+
 ```
 recompute-fwd of shared_experts  (per layer: GEMM fc1 → SReLU → GEMM fc2, then dgrad+wgrad)
 

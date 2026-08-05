@@ -592,33 +592,45 @@ class CheckpointFunction(torch.autograd.Function):
         ctx: Any,
         run_function: Callable[[Unpack[_Ts]], _R],
         distribute_saved_activations: bool,
+        te_activation_recompute: bool,
         *args: Unpack[_Ts],
     ) -> _R:
         """Forward pass."""
-        _set_checkpointing()
-
-        ctx.run_function = run_function
-        ctx.distribute_saved_activations = distribute_saved_activations
-
-        # Copy the rng states.
-        ctx.rng_states = _get_all_rng_states()
-
-        with torch.no_grad():
-            outputs = run_function(*args)
-
-        # Divide hidden states across model parallel group and only keep
-        # the chunk corresponding to the current rank.
-        if distribute_saved_activations:
-            ctx.input_0_shape = args[0].data.shape
-            safely_set_viewless_tensor_data(
-                args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
+        ctx.te_activation_recompute = bool(te_activation_recompute)
+        if ctx.te_activation_recompute and not HAVE_TE:
+            raise RuntimeError(
+                "Megatron checkpoint requires TransformerEngine when "
+                "te_activation_recompute=True."
             )
+        _set_checkpointing()
+        try:
+            ctx.run_function = run_function
+            ctx.distribute_saved_activations = distribute_saved_activations
 
-        # Store everything.
-        ctx.save_for_backward(*args)
+            # Copy the rng states.
+            ctx.rng_states = _get_all_rng_states()
 
-        _unset_checkpointing()
-        return outputs
+            recompute_ctx = (
+                activation_recompute_forward(activation_recompute=True, recompute_phase=False)
+                if ctx.te_activation_recompute
+                else contextlib.nullcontext()
+            )
+            with torch.no_grad(), recompute_ctx:
+                outputs = run_function(*args)
+
+            # Divide hidden states across model parallel group and only keep
+            # the chunk corresponding to the current rank.
+            if distribute_saved_activations:
+                ctx.input_0_shape = args[0].data.shape
+                safely_set_viewless_tensor_data(
+                    args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
+                )
+
+            # Store everything.
+            ctx.save_for_backward(*args)
+            return outputs
+        finally:
+            _unset_checkpointing()
 
     # pylint: disable=missing-function-docstring
     @staticmethod
@@ -632,41 +644,56 @@ class CheckpointFunction(torch.autograd.Function):
                 "please use .backward() if possible"
             )
         _set_checkpointing()
+        try:
+            inputs = ctx.saved_tensors
+            if ctx.distribute_saved_activations:
+                safely_set_viewless_tensor_data(
+                    inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
+                )
 
-        inputs = ctx.saved_tensors
-        if ctx.distribute_saved_activations:
-            safely_set_viewless_tensor_data(
-                inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
+            with _fork_rng():
+                # Set the states to what it used to be before the forward pass.
+                _set_all_rng_states(*ctx.rng_states)
+
+                # Compute the forward pass.
+                detached_inputs = detach_variable(inputs)
+                recompute_ctx = (
+                    activation_recompute_forward(activation_recompute=True, recompute_phase=True)
+                    if ctx.te_activation_recompute
+                    else contextlib.nullcontext()
+                )
+                with torch.enable_grad(), recompute_ctx:
+                    outputs = ctx.run_function(*detached_inputs)
+
+            if isinstance(outputs, torch.Tensor):
+                outputs = (outputs,)
+
+            # filter out non tensor outputs for backward pass
+            outputs, args = zip(
+                *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
             )
-
-        with _fork_rng():
-            # Set the states to what it used to be before the forward pass.
-            _set_all_rng_states(*ctx.rng_states)
-
-            # Compute the forward pass.
-            detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
-                outputs = ctx.run_function(*detached_inputs)
-
-        if isinstance(outputs, torch.Tensor):
-            outputs = (outputs,)
-
-        # filter out non tensor outputs for backward pass
-        outputs, args = zip(
-            *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
-        )
-        torch.autograd.backward(outputs, args)
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
-
-        _unset_checkpointing()
-        return (None, None) + grads
+            torch.autograd.backward(outputs, args)
+            grads = tuple(
+                inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs
+            )
+            return (None, None, None) + grads
+        finally:
+            _unset_checkpointing()
 
 
 def checkpoint(
-    function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
+    function: Callable[[Unpack[_Ts]], _R],
+    distribute_saved_activations: bool,
+    *args: Unpack[_Ts],
+    te_activation_recompute: bool = False,
 ) -> _R:
     """Checkpoint a model or part of the model.
-    This has been directly copied from torch.utils.checkpoint."""
+
+    ``te_activation_recompute`` is independent of FP8. GTP callers set it for BF16
+    activation checkpoints so the original forward and backward replay enter TE's
+    recompute phases and use the isolated GTP weight-materialization lifecycle.
+    This has been directly copied from torch.utils.checkpoint.
+    """
     from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 
     # Skip checkpointing during CUDA graph warmup and capture, matching the behavior of
@@ -674,7 +701,9 @@ def checkpoint(
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
         return function(*args)
-    return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+    return CheckpointFunction.apply(
+        function, distribute_saved_activations, bool(te_activation_recompute), *args
+    )
 
 
 def _save_args_to_ctx(ctx, args):
@@ -752,10 +781,13 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
             fp8 = FP8GlobalStateManager.is_fp8_enabled()
             ctx.fp8 = fp8
             ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
-            fwd_ctx = activation_recompute_forward(activation_recompute=True, recompute_phase=False)
         else:
             ctx.fp8 = False
             ctx.fp8_recipe = None
+
+        if checkpoint_without_output_obj.te_activation_recompute:
+            fwd_ctx = activation_recompute_forward(activation_recompute=True, recompute_phase=False)
+        else:
             fwd_ctx = contextlib.nullcontext()
 
         with torch.no_grad(), fwd_ctx:
@@ -844,7 +876,7 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False, ckpt_manager=None):
+    def __init__(self, fp8=False, ckpt_manager=None, te_activation_recompute=False):
         """
         Initialize CheckpointWithoutOutput.
 
@@ -854,8 +886,18 @@ class CheckpointWithoutOutput(object):
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
+            te_activation_recompute: Whether to mark forward replay as a TransformerEngine
+                         activation-recompute phase independently of FP8. GTP uses this marker
+                         for BF16 recompute forwards so their weight all-gathers use the dedicated
+                         recompute prefetch chain instead of clobbering backward gather state.
         """
         self.fp8 = bool(fp8)
+        self.te_activation_recompute = self.fp8 or bool(te_activation_recompute)
+        if self.te_activation_recompute and not HAVE_TE:
+            raise RuntimeError(
+                "CheckpointWithoutOutput requires TransformerEngine when "
+                "te_activation_recompute=True or fp8=True."
+            )
         self.ckpt_manager = ckpt_manager
         self.run_function = None
         self.fwd_cpu_rng_state = None
@@ -913,13 +955,16 @@ class CheckpointWithoutOutput(object):
         with _fork_rng():
             _set_all_rng_states(*self.rng_states)
 
-            if self.fp8:
+            if self.te_activation_recompute:
                 recompute_ctx = activation_recompute_forward(
                     activation_recompute=True, recompute_phase=True
                 )
-                fp8_ctx = fp8_autocast(enabled=self.ctx.fp8, fp8_recipe=self.ctx.fp8_recipe)
             else:
                 recompute_ctx = contextlib.nullcontext()
+
+            if self.fp8:
+                fp8_ctx = fp8_autocast(enabled=self.ctx.fp8, fp8_recipe=self.ctx.fp8_recipe)
+            else:
                 fp8_ctx = contextlib.nullcontext()
 
             # Reconstruct full args list from saved ctx

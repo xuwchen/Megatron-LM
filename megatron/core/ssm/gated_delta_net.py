@@ -35,6 +35,7 @@ from megatron.core.ssm.mamba_context_parallel import (
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp import HAVE_GTP
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -285,8 +286,12 @@ class GatedDeltaNet(MegatronModule):
         # the entire GatedDeltaNet compute is wrapped in a normal checkpoint and recomputed
         # in the backward pass.
         self.recompute_gdn = False
+        self.recompute_qkv = False
+        self.recompute_norm_out = False
         if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_gdn = "gdn" in self.config.recompute_modules
+            self.recompute_qkv = "gdn_qkv" in self.config.recompute_modules
+            self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
 
         # Cache for CP context objects consumed by FLA kernels. Rebuilding these per-forward
         # is unsafe under CUDA graph capture because build_cp_context allocates
@@ -476,7 +481,26 @@ class GatedDeltaNet(MegatronModule):
                     chunkwise_cp_context,
                 )
 
-            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+            if self.config.fp8 or self.config.fp4:
+                # Match every other whole-module checkpoint: TE owns the quantization
+                # recipe/state in FP8/FP4, whereas the Megatron marker below is the BF16
+                # path that only selects GTP's replay weight lifecycle.
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                out, out_bias = te_checkpoint(
+                    _checkpointed_compute,
+                    False,
+                    get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                )
+            else:
+                out, out_bias = tensor_parallel.checkpoint(
+                    _checkpointed_compute,
+                    False,
+                    hidden_states,
+                    te_activation_recompute=self.config.gtp_weight_remat_size > 1,
+                )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,
@@ -515,7 +539,138 @@ class GatedDeltaNet(MegatronModule):
         Returns:
             Tuple of (output, output_bias).
         """
-        # Input projection
+        recompute_qkv = self.recompute_qkv and self.training
+        recompute_norm_out = self.recompute_norm_out and self.training
+        recompute_manager = CheckpointManager() if (recompute_qkv or recompute_norm_out) else None
+
+        # CheckpointWithoutOutput can only own floating-point outputs that participate in
+        # autograd. Packed THD headwise CP also produces an integer inverse permutation, so
+        # materialize that deterministic metadata outside the checkpoint and capture it for
+        # both the original forward and the replay.
+        precomputed_thd_cp_a2a = None
+        if (
+            recompute_qkv
+            and cp_size_headwise > 1
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+        ):
+            precomputed_thd_cp_a2a = _build_thd_cp_a2a_perm(
+                cu_seqlens_q, cp_size_headwise, seq_len_post_headwise
+            )
+
+        def _qkv_proj_and_prepare(hidden_states):
+            return self._compute_qkv_for_gated_delta_rule(
+                hidden_states,
+                batch,
+                seq_len_post_headwise,
+                cp_size_headwise,
+                cp_group_headwise,
+                cp_size_chunkwise,
+                cp_group_chunkwise,
+                cu_seqlens_q,
+                packed_seq_params,
+                chunkwise_cp_context,
+                precomputed_thd_cp_a2a,
+            )[:6]
+
+        if recompute_qkv:
+            uses_gtp = HAVE_GTP and is_gtp_param is not None and is_gtp_param(self.in_proj.weight)
+            query, key, value, gate, beta, g = tensor_parallel.CheckpointWithoutOutput(
+                fp8=(self.config.fp8 or self.config.fp4),
+                ckpt_manager=recompute_manager,
+                # BF16 GTP still needs TE's recompute marker so the replay all-gather uses
+                # the dedicated recompute chain instead of corrupting backward gather state.
+                te_activation_recompute=uses_gtp,
+            ).checkpoint(_qkv_proj_and_prepare, hidden_states)
+            thd_cp_a2a_inv = (
+                precomputed_thd_cp_a2a[1] if precomputed_thd_cp_a2a is not None else None
+            )
+        else:
+            query, key, value, gate, beta, g, thd_cp_a2a_inv = (
+                self._compute_qkv_for_gated_delta_rule(
+                    hidden_states,
+                    batch,
+                    seq_len_post_headwise,
+                    cp_size_headwise,
+                    cp_group_headwise,
+                    cp_size_chunkwise,
+                    cp_group_chunkwise,
+                    cu_seqlens_q,
+                    packed_seq_params,
+                    chunkwise_cp_context,
+                    precomputed_thd_cp_a2a,
+                )
+            )
+
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, _ = self.gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+            cp_context=chunkwise_cp_context,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        def _gated_norm_and_restore_layout(core_attn_out, gate):
+            return self._compute_norm_out_for_gated_delta_rule(
+                core_attn_out,
+                gate,
+                batch,
+                seq_len_post_headwise,
+                cp_size_headwise,
+                cp_group_headwise,
+                cp_size_chunkwise,
+                cp_group_chunkwise,
+                cu_seqlens_q,
+                packed_seq_params,
+                thd_cp_a2a_inv,
+            )
+
+        if recompute_norm_out:
+            norm_out = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=recompute_manager
+            ).checkpoint(_gated_norm_and_restore_layout, core_attn_out, gate)
+        else:
+            norm_out = _gated_norm_and_restore_layout(core_attn_out, gate)
+
+        # Output projection
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        # The output projection has consumed every discardable activation. Register one hook on
+        # its output so dependent checkpoints replay in forward order (qkv before norm_out).
+        if recompute_manager is not None:
+            recompute_manager.discard_all_outputs_and_register_unified_recompute(out)
+
+        return out, out_bias
+
+    def _compute_qkv_for_gated_delta_rule(
+        self,
+        hidden_states,
+        batch,
+        seq_len_post_headwise,
+        cp_size_headwise,
+        cp_group_headwise,
+        cp_size_chunkwise,
+        cp_group_chunkwise,
+        cu_seqlens_q,
+        packed_seq_params,
+        chunkwise_cp_context,
+        precomputed_thd_cp_a2a=None,
+    ):
+        """Project and prepare QKV, gate, beta, and decay tensors for the GDN kernel.
+
+        This is the gdn_qkv discard-output checkpoint boundary. The returned THD inverse
+        permutation is deterministic integer metadata and is intentionally kept outside the
+        checkpoint's floating-point output tuple.
+        """
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
@@ -544,6 +699,7 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_q,
             seq_len_post_headwise,
             packed_seq_params,
+            precomputed_thd_cp_a2a,
         )
 
         if self.gdn_pre_gated_delta_rule_fusion:
@@ -589,22 +745,23 @@ class GatedDeltaNet(MegatronModule):
             )
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-            cp_context=chunkwise_cp_context,
-        )
-        nvtx_range_pop(suffix="gated_delta_rule")
+        return query, key, value, gate, beta, g, thd_cp_a2a_inv
 
-        # RMSNorm
+    def _compute_norm_out_for_gated_delta_rule(
+        self,
+        core_attn_out,
+        gate,
+        batch,
+        seq_len_post_headwise,
+        cp_size_headwise,
+        cp_group_headwise,
+        cp_size_chunkwise,
+        cp_group_chunkwise,
+        cu_seqlens_q,
+        packed_seq_params,
+        thd_cp_a2a_inv,
+    ):
+        """Apply the GDN gated norm and restore the downstream sequence layout."""
         nvtx_range_push(suffix="gated_norm")
         norm_out = self._apply_gated_norm(core_attn_out, gate)
         nvtx_range_pop(suffix="gated_norm")
@@ -631,16 +788,9 @@ class GatedDeltaNet(MegatronModule):
                 )
             nvtx_range_pop(suffix="contiguous_to_zigzag")
 
-        norm_out = self._a2a_hp_to_cp(
+        return self._a2a_hp_to_cp(
             norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
         )
-
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        return out, out_bias
 
     def pre_gated_delta_rule(
         self,
@@ -812,6 +962,7 @@ class GatedDeltaNet(MegatronModule):
         cu_seqlens_q: Optional[torch.Tensor],
         seq_len: int,
         packed_seq_params: Optional[PackedSeqParams],
+        precomputed_thd_cp_a2a: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run GDN context-parallel to hidden-parallel A2A and return its inverse context."""
         if cp_size > 1:
@@ -843,9 +994,12 @@ class GatedDeltaNet(MegatronModule):
                 # Permute at the seq dim so that a single unsectioned a2a
                 # is equivalent to per-sequence a2a.
                 # This also folds the ``_undo_attention_load_balancing`` step.
-                thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
-                    cu_seqlens_q, cp_size, seq_len
-                )
+                if precomputed_thd_cp_a2a is None:
+                    thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
+                        cu_seqlens_q, cp_size, seq_len
+                    )
+                else:
+                    thd_cp_a2a_idx, thd_cp_a2a_inv = precomputed_thd_cp_a2a
                 qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
         else:
             qkvzba = tensor_a2a_cp2hp(qkvzba, seq_dim=0, head_dim=-1, cp_group=cp_group)

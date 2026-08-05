@@ -15,6 +15,7 @@ Test groups
 - TestGTPPrefetchChain       - linked-list next_w/prev_w wiring
 - TestGTPWgradRS             - wgrad reduce-scatter shape + multi-layer deferred path
 - TestGTPMicrobatches        - output consistency across microbatches
+- TestGTPActivationRecompute - BF16 recompute marker + prefetch-handle consumption
 - TestMXFP8LinearGTP         - Linear + MXFP8 recipe: quantized shard setup, fwd/bwd, padding
 - TestGTPGroupSizeOne        - wrap_module_params_gtp no-op when gtp_remat_group.size()==1
 - TestGTPPrefetchDisabled    - weight_prefetch=False single-pass forward
@@ -46,6 +47,7 @@ from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTPShardedParam,
     wrap_module_params_gtp,
 )
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutput, checkpoint
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
     _make_gtp_remat_grouped_linear,
@@ -228,6 +230,196 @@ class TestLinearGTP:
     def test_forward_backward_correctness(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_linear_correctness, 4)
+
+
+# ---------------------------------------------------------------------------
+# BF16 activation recompute: marker phases and replay-prefetch handle lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _worker_bf16_recompute_weight_materialization(rank, world_size, port, checkpoint_kind):
+    torch.manual_seed(0)
+    in_f, out_f = 64, 128
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+    layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+
+    inp = torch.randn(16, in_f, dtype=dtype, device="cuda", requires_grad=True)
+    dist.broadcast(inp, src=0)
+    layer.weight.main_grad = torch.zeros(layer.weight.shape, dtype=dtype, device="cuda")
+
+    gather_phases = []
+    original_gather = gtp_module.gather_along_first_dim
+
+    def counted_gather(*args, **kwargs):
+        gather_phases.append(bool(gtp_module.in_fp8_activation_recompute_phase()))
+        return original_gather(*args, **kwargs)
+
+    gtp_module.gather_along_first_dim = counted_gather
+    try:
+        if checkpoint_kind == "without_output":
+            checkpoint_obj = CheckpointWithoutOutput(te_activation_recompute=True)
+            activation = checkpoint_obj.checkpoint(
+                lambda x: layer(x, is_first_microbatch=True), inp
+            )
+            loss = activation.square().mean()
+            checkpoint_obj.discard_output_and_register_recompute(loss)
+        else:
+            assert checkpoint_kind == "standard"
+            activation = checkpoint(
+                lambda x: layer(x, is_first_microbatch=True),
+                False,
+                inp,
+                te_activation_recompute=True,
+            )
+            loss = activation.square().mean()
+        loss.backward()
+    finally:
+        gtp_module.gather_along_first_dim = original_gather
+
+    assert gather_phases == [False, True, False], (
+        "Expected one normal-forward gather, one marker-tagged recompute-forward gather, "
+        f"and one dgrad gather; got phases={gather_phases}"
+    )
+
+
+def _worker_bf16_recompute_consumes_prefetched_weight(rank, world_size, port):
+    """Recompute must preserve gradients and consume its predecessor's exact prefetch handle."""
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+    l0 = _make_gtp_linear(64, 128, gtp_remat_group, dtype)
+    l1 = _make_gtp_linear(128, 64, gtp_remat_group, dtype)
+    w0, w1 = l0.weight, l1.weight
+
+    base_input = torch.randn(16, 64, dtype=dtype, device="cuda")
+    dist.broadcast(base_input, src=0)
+    for weight in (w0, w1):
+        weight.main_grad = torch.zeros_like(weight)
+
+    def block(x):
+        x = l0(x, is_first_microbatch=True)
+        x = torch.nn.functional.gelu(x)
+        return l1(x, is_first_microbatch=True)
+
+    def run_without_checkpoint():
+        inp = base_input.detach().clone().requires_grad_(True)
+        activation = block(inp)
+        output_snapshot = activation.detach().clone()
+        activation.float().square().mean().backward()
+        return output_snapshot, inp.grad.detach().clone()
+
+    def run_recompute_cycle():
+        inp = base_input.detach().clone().requires_grad_(True)
+        checkpoint_obj = CheckpointWithoutOutput(te_activation_recompute=True)
+        activation = checkpoint_obj.checkpoint(block, inp)
+        output_snapshot = activation.detach().clone()
+        loss = activation.float().square().mean()
+        checkpoint_obj.discard_output_and_register_recompute(loss)
+        loss.backward()
+        return output_snapshot, inp.grad.detach().clone()
+
+    # Pin output, input-grad, and GTP shard main-grad against a non-checkpointed reference.
+    output_ref, grad_ref = run_without_checkpoint()
+    main_grad_ref = tuple(weight.main_grad.detach().clone() for weight in (w0, w1))
+    for weight in (w0, w1):
+        weight.main_grad.zero_()
+
+    # The first replay runs on demand and lazily builds the independent recompute chain.
+    output_1, grad_1 = run_recompute_cycle()
+    main_grad_1 = tuple(weight.main_grad.detach().clone() for weight in (w0, w1))
+    torch.testing.assert_close(output_1, output_ref)
+    torch.testing.assert_close(grad_1, grad_ref)
+    for replay_grad, reference_grad in zip(main_grad_1, main_grad_ref):
+        torch.testing.assert_close(replay_grad, reference_grad)
+    assert w0._recompute_prev is None
+    assert w0._recompute_next is w1
+    assert w1._recompute_prev is w0
+    assert w1._recompute_next is None
+
+    events = []
+    issued = {}
+    calls = {"w1_recompute_gathers": [], "w1_recompute_on_demand": 0, "w1_prefetched_consumes": 0}
+    original_weight_prefetch = gtp_module.GTP_CONFIG.weight_prefetch
+    original_prefetch_next = w0._recompute_prefetch_next
+    original_consume = w1._get_recompute_prefetched_weight
+    original_all_gather = w1._all_gather_weight
+    original_on_demand = w1._all_gather_weight_on_demand
+
+    def record_prefetch_next(target, nvtx_label=None):
+        assert target is w1
+        assert gtp_module.in_fp8_activation_recompute_phase()
+        assert target._recompute_prefetch_handle is None
+        original_prefetch_next(target, nvtx_label=nvtx_label)
+        handle = target._recompute_prefetch_handle
+        assert handle is not None
+        assert handle.handle is not None
+        issued["wrapper"] = handle
+        issued["inner"] = handle.handle
+        events.append("issue:w1")
+
+    def record_consume():
+        assert gtp_module.in_fp8_activation_recompute_phase()
+        handle = w1._recompute_prefetch_handle
+        assert handle is issued["wrapper"]
+        assert handle.handle is issued["inner"]
+        calls["w1_prefetched_consumes"] += 1
+        events.append("consume:w1:enter")
+        result = original_consume()
+        assert w1._recompute_prefetch_handle is None
+        assert handle.handle is None
+        events.append("consume:w1:exit")
+        return result
+
+    def record_all_gather(*args, **kwargs):
+        if gtp_module.in_fp8_activation_recompute_phase():
+            calls["w1_recompute_gathers"].append(
+                (bool(kwargs.get("async_op", False)), bool(kwargs.get("fwd", True)))
+            )
+        return original_all_gather(*args, **kwargs)
+
+    def record_on_demand(*args, **kwargs):
+        if gtp_module.in_fp8_activation_recompute_phase():
+            calls["w1_recompute_on_demand"] += 1
+        return original_on_demand(*args, **kwargs)
+
+    try:
+        gtp_module.GTP_CONFIG.weight_prefetch = True
+        w0._recompute_prefetch_next = record_prefetch_next
+        w1._get_recompute_prefetched_weight = record_consume
+        w1._all_gather_weight = record_all_gather
+        w1._all_gather_weight_on_demand = record_on_demand
+        output_2, grad_2 = run_recompute_cycle()
+    finally:
+        w0._recompute_prefetch_next = original_prefetch_next
+        w1._get_recompute_prefetched_weight = original_consume
+        w1._all_gather_weight = original_all_gather
+        w1._all_gather_weight_on_demand = original_on_demand
+        gtp_module.GTP_CONFIG.weight_prefetch = original_weight_prefetch
+
+    assert events == ["issue:w1", "consume:w1:enter", "consume:w1:exit"]
+    assert calls == {
+        "w1_recompute_gathers": [(True, True)],
+        "w1_recompute_on_demand": 0,
+        "w1_prefetched_consumes": 1,
+    }
+    torch.testing.assert_close(output_2, output_1)
+    torch.testing.assert_close(grad_2, grad_1)
+    for weight, first_cycle_grad, reference_grad in zip((w0, w1), main_grad_1, main_grad_ref):
+        second_cycle_grad = weight.main_grad.detach() - first_cycle_grad
+        torch.testing.assert_close(second_cycle_grad, reference_grad)
+        assert torch.isfinite(weight.main_grad).all()
+
+
+class TestGTPActivationRecompute:
+    @pytest.mark.parametrize("checkpoint_kind", ["without_output", "standard"])
+    def test_bf16_recompute_marks_third_weight_materialization(self, checkpoint_kind):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_bf16_recompute_weight_materialization, 4, checkpoint_kind)
+
+    def test_bf16_recompute_consumes_prefetched_weight(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_bf16_recompute_consumes_prefetched_weight, 4)
 
 
 # ---------------------------------------------------------------------------

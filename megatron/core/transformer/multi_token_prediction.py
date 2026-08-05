@@ -1714,6 +1714,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                     rotary_pos_cos,
                     rotary_pos_sin,
                     sequence_len_offset,
+                    te_activation_recompute=(
+                        self.config.gtp_weight_remat_size > 1
+                        or self.config.expert_gtp_weight_remat_size > 1
+                    ),
                 )
 
         if self.config.recompute_method == 'uniform':

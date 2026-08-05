@@ -549,7 +549,13 @@ class MoELayer(BaseMoELayer):
                     )
                 else:
                     shared_expert_output = tensor_parallel.checkpoint(
-                        apply_module(self.shared_experts), False, hidden_states
+                        apply_module(self.shared_experts),
+                        False,
+                        hidden_states,
+                        te_activation_recompute=(
+                            self.config.gtp_weight_remat_size > 1
+                            or self.config.expert_gtp_weight_remat_size > 1
+                        ),
                     )
             else:
                 shared_expert_output = apply_module(self.shared_experts)(hidden_states)
@@ -798,7 +804,15 @@ class MoELayer(BaseMoELayer):
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
+                    custom_forward,
+                    False,
+                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
+                    te_activation_recompute=(
+                        self.config.gtp_weight_remat_size > 1
+                        or self.config.expert_gtp_weight_remat_size > 1
+                    ),
                 )
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)

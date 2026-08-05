@@ -566,7 +566,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc", "gdn".
+             "shared_experts", "mhc", "gdn", "gdn_qkv", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -581,8 +581,12 @@ class TransformerConfig(ModelParallelConfig):
     "gdn": recompute the entire GatedDeltaNet module (in_proj, conv1d, gated delta rule,
             gated norm, CP all-to-all and out_proj). Requires
             experimental_attention_variant="gated_delta_net".
-    "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
+    "gdn_qkv": recompute the GatedDeltaNet input projection, CP layout conversion,
+            convolution, and QKV/gate/beta preparation.
+    "gdn_norm_out": recompute the GatedDeltaNet gated norm and inverse CP layout conversion.
+    "moe_act", "layernorm", "mla_up_proj", "mhc", "gdn_qkv", and "gdn_norm_out" use
+    output-discarding checkpointing. "core_attn", "mlp", "moe", "shared_experts", and "gdn"
+    use normal checkpointing.
     """
 
     ####################
@@ -2022,6 +2026,8 @@ class TransformerConfig(ModelParallelConfig):
                     "shared_experts",
                     "mhc",
                     "gdn",
+                    "gdn_qkv",
+                    "gdn_norm_out",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -2047,6 +2053,22 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "gdn in recompute_modules is only supported with "
                     "experimental_attention_variant='gated_delta_net'."
+                )
+
+            fine_grained_gdn_modules = {"gdn_qkv", "gdn_norm_out"} & set(self.recompute_modules)
+            if (
+                fine_grained_gdn_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    f"{sorted(fine_grained_gdn_modules)} in recompute_modules are only supported "
+                    "with experimental_attention_variant='gated_delta_net'."
+                )
+
+            if "gdn" in self.recompute_modules and fine_grained_gdn_modules:
+                raise ValueError(
+                    "gdn whole-module recompute cannot be combined with fine-grained "
+                    f"GDN recompute modules: {sorted(fine_grained_gdn_modules)}."
                 )
 
             if "core_attn" in self.recompute_modules:

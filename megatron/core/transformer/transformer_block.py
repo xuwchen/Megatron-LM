@@ -570,6 +570,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    te_activation_recompute=(
+                        self.config.gtp_weight_remat_size > 1
+                        or self.config.expert_gtp_weight_remat_size > 1
+                    ),
                 )
 
         if self.config.recompute_method == 'uniform':

@@ -1,8 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import contextmanager
+
 import pytest
 import torch
 
+import megatron.core.tensor_parallel.random as random_module
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
@@ -236,6 +239,114 @@ def test_checkpoint_without_output():
     output1.backward(torch.ones((4, 4)), retain_graph=True)
     output2.backward(torch.ones((4, 4)), retain_graph=True)
     assert torch.equal(input1.grad, input2.grad)
+
+
+def test_checkpoint_te_recompute_marker_is_independent_of_fp8(monkeypatch):
+    phases = []
+
+    @contextmanager
+    def activation_recompute_context(*, activation_recompute, recompute_phase):
+        assert activation_recompute
+        phases.append(recompute_phase)
+        yield
+
+    monkeypatch.setattr(random_module, "HAVE_TE", True)
+    monkeypatch.setattr(
+        random_module, "activation_recompute_forward", activation_recompute_context, raising=False
+    )
+    monkeypatch.setattr(random_module, "_get_all_rng_states", lambda: ())
+    monkeypatch.setattr(random_module, "_set_all_rng_states", lambda *args: None)
+
+    @contextmanager
+    def fork_rng():
+        yield
+
+    monkeypatch.setattr(random_module, "_fork_rng", fork_rng)
+
+    input_tensor = torch.randn(4, 4, requires_grad=True)
+    output = checkpoint(torch.nn.functional.gelu, False, input_tensor, te_activation_recompute=True)
+    output.sum().backward()
+
+    assert phases == [False, True]
+    assert input_tensor.grad is not None
+
+
+def test_checkpoint_restores_state_after_forward_exception(monkeypatch):
+    monkeypatch.setattr(random_module, "IS_CHECKPOINTING", False)
+    monkeypatch.setattr(random_module, "_get_all_rng_states", lambda: ())
+
+    def failing_forward(input_tensor):
+        assert random_module.is_checkpointing()
+        raise RuntimeError("forward failed")
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        checkpoint(failing_forward, False, torch.randn(4, requires_grad=True))
+
+    assert not random_module.is_checkpointing()
+
+
+def test_checkpoint_restores_state_after_backward_replay_exception(monkeypatch):
+    monkeypatch.setattr(random_module, "IS_CHECKPOINTING", False)
+    monkeypatch.setattr(random_module, "_get_all_rng_states", lambda: ())
+    monkeypatch.setattr(random_module, "_set_all_rng_states", lambda *args: None)
+
+    @contextmanager
+    def fork_rng():
+        yield
+
+    monkeypatch.setattr(random_module, "_fork_rng", fork_rng)
+    calls = 0
+
+    def fail_during_replay(input_tensor):
+        nonlocal calls
+        calls += 1
+        assert random_module.is_checkpointing()
+        if calls == 2:
+            raise RuntimeError("backward replay failed")
+        return input_tensor.square()
+
+    input_tensor = torch.randn(4, requires_grad=True)
+    output = checkpoint(fail_during_replay, False, input_tensor)
+    assert not random_module.is_checkpointing()
+
+    with pytest.raises(RuntimeError, match="backward replay failed"):
+        output.sum().backward()
+
+    assert calls == 2
+    assert not random_module.is_checkpointing()
+
+
+def test_checkpoint_without_output_te_recompute_marker_is_independent_of_fp8(monkeypatch):
+    phases = []
+
+    @contextmanager
+    def activation_recompute_context(*, activation_recompute, recompute_phase):
+        assert activation_recompute
+        phases.append(recompute_phase)
+        yield
+
+    monkeypatch.setattr(random_module, "HAVE_TE", True)
+    monkeypatch.setattr(
+        random_module, "activation_recompute_forward", activation_recompute_context, raising=False
+    )
+    monkeypatch.setattr(random_module, "_get_all_rng_states", lambda: ())
+    monkeypatch.setattr(random_module, "_set_all_rng_states", lambda *args: None)
+
+    @contextmanager
+    def fork_rng():
+        yield
+
+    monkeypatch.setattr(random_module, "_fork_rng", fork_rng)
+    monkeypatch.setattr(random_module, "_get_share_storage", lambda: lambda *_: None)
+
+    input_tensor = torch.randn(4, 4, requires_grad=True)
+    checkpoint = CheckpointWithoutOutput(te_activation_recompute=True)
+    assert not checkpoint.fp8
+
+    checkpoint.checkpoint(torch.nn.functional.gelu, input_tensor)
+    checkpoint._recompute(None)
+
+    assert phases == [False, True]
 
 
 class _ViewSavingLinear(torch.autograd.Function):

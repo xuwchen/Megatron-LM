@@ -130,7 +130,13 @@ def checkpointed_forward(
                 )
             else:
                 hidden_states, context = tensor_parallel.checkpoint(
-                    cf, self.config.distribute_saved_activations, *args
+                    cf,
+                    self.config.distribute_saved_activations,
+                    *args,
+                    te_activation_recompute=(
+                        self.config.gtp_weight_remat_size > 1
+                        or self.config.expert_gtp_weight_remat_size > 1
+                    ),
                 )
         else:
             # Note: original block-branch no-checkpoint path omitted padding_mask
