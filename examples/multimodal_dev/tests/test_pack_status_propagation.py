@@ -264,3 +264,68 @@ class TestFetchBatchWithStatus:
         assert len(calls) == 2
         assert calls[0].tolist() == [0, 0]
         assert calls[1].tolist() == [1]
+
+
+class TestBshdOverLengthGuardCpu:
+    """Drive the real padded (BSHD) branch of ``pack_or_pad_batch`` on CPU."""
+
+    @staticmethod
+    def _setup(monkeypatch):
+        # TP world 1 (handshake short-circuits, no collectives needed for the
+        # failure path) with a CP-aware mpu stub for pack_or_pad_batch.
+        mpu_stub = SimpleNamespace(
+            get_tensor_model_parallel_world_size=lambda: 1,
+            get_context_parallel_world_size=lambda: 1,
+            get_tensor_model_parallel_rank=lambda: 0,
+            get_tensor_model_parallel_src_rank=lambda: 0,
+            get_tensor_model_parallel_group=lambda: "fake-tp-group",
+        )
+        monkeypatch.setattr(forward_step, "mpu", mpu_stub)
+        monkeypatch.setattr(forward_step, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(forward_step, "get_tensor_model_parallel_src_rank", lambda: 0)
+        monkeypatch.setattr(
+            forward_step, "get_tensor_model_parallel_group", lambda: "fake-tp-group"
+        )
+        args = SimpleNamespace(
+            sequence_parallel=False,
+            pad_packed_seq_alignment=None,
+            cuda_graph_impl="none",
+            max_vision_patches_per_microbatch=None,
+            max_vision_patches_per_image=None,
+            seq_length=8,
+        )
+        monkeypatch.setattr(forward_step, "get_args", lambda: args)
+        # broadcast is a rank-0 no-op at TP world 1 (only the happy path
+        # reaches broadcast_data_batch; the source keeps its own tensors).
+        monkeypatch.setattr(torch.distributed, "broadcast", lambda *a, **k: None)
+
+    @staticmethod
+    def _sample(length):
+        return {
+            "input_ids": torch.arange(length, dtype=torch.long),
+            "labels": torch.arange(length, dtype=torch.long),
+            "loss_mask": torch.ones(length, dtype=torch.float32),
+            "pixel_values": torch.zeros(0, 1176, dtype=torch.float32),
+            "image_grid_thw": torch.zeros(0, 3, dtype=torch.long),
+        }
+
+    def test_over_length_sample_raises_value_error(self, monkeypatch):
+        self._setup(monkeypatch)
+        with pytest.raises(
+            ValueError, match=r"A sample of length 12 exceeds the --seq-length cap 8"
+        ):
+            forward_step.pack_or_pad_batch(
+                [self._sample(12)], use_packed_sequence=False, seq_length=8, device="cpu"
+            )
+
+    def test_in_range_sample_pads_on_cpu(self, monkeypatch):
+        # Companion check: the padded branch genuinely runs end-to-end on CPU
+        # with these stubs, so the guard test above fails in the guard, not in
+        # the setup.
+        self._setup(monkeypatch)
+        batch = forward_step.pack_or_pad_batch(
+            [self._sample(6)], use_packed_sequence=False, seq_length=8, device="cpu"
+        )
+        assert batch["input_ids"].shape == (1, 6)
+        assert batch["labels"].shape == (1, 6)
+        assert batch["loss_mask"].shape == (1, 6)
