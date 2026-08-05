@@ -147,6 +147,71 @@ def broadcast_data_batch(data, device="cuda"):
 
     return result
 
+# -------------------------------------------------------------------
+# Pack-status handshake across TP ranks
+# -------------------------------------------------------------------
+
+_PACK_ERROR_MSG_MAX_BYTES = 2048
+
+
+def _propagate_pack_status(is_src, error, device="cuda"):
+    """Synchronize the source rank's fetch/pack/validation outcome across TP ranks.
+
+    This converts source-only failures — data-fetch errors in
+    :func:`_fetch_batch_with_status` (a DataLoader worker crash, a dataset
+    ``__getitem__`` error) as well as pack/validation failures (a ``seq_lens``
+    sum mismatch, BSHD multi-segment or over-length rejects, any future pack
+    error) — from a collective hang into a synchronized loud failure on every
+    rank: without this handshake the TP source rank would raise before the
+    next collective (``has_data`` broadcast or ``broadcast_data_batch``) while
+    the peer ranks sit in that collective until the NCCL timeout.
+
+    Every TP rank must call this right after the source-side fetch or packing
+    block and before the following broadcast. The source rank broadcasts a
+    ``[failed, msg_len]`` int64 header (plus the UTF-8 error message bytes,
+    truncated to ``_PACK_ERROR_MSG_MAX_BYTES``, when failed); on failure all
+    ranks raise together — the source re-raises the original exception, the
+    peers raise a ``RuntimeError`` carrying the source's message.
+    """
+    if mpu.get_tensor_model_parallel_world_size() == 1:
+        if error is not None:
+            raise error
+        return
+
+    # Same source rank / group as broadcast_data_batch, so the handshake and
+    # the payload broadcast are ordered on the same communicator.
+    src = mpu.get_tensor_model_parallel_src_rank()
+    group = mpu.get_tensor_model_parallel_group()
+
+    if is_src:
+        msg_bytes = (
+            str(error).encode("utf-8")[:_PACK_ERROR_MSG_MAX_BYTES] if error is not None else b""
+        )
+        header = torch.tensor(
+            [1 if error is not None else 0, len(msg_bytes)], dtype=torch.int64, device=device
+        )
+    else:
+        header = torch.zeros(2, dtype=torch.int64, device=device)
+    torch.distributed.broadcast(header, src, group=group)
+
+    failed, msg_len = int(header[0].item()), int(header[1].item())
+    if not failed:
+        return
+
+    if is_src:
+        msg_tensor = torch.tensor(list(msg_bytes), dtype=torch.uint8, device=device)
+    else:
+        msg_tensor = torch.zeros(msg_len, dtype=torch.uint8, device=device)
+    torch.distributed.broadcast(msg_tensor, src, group=group)
+
+    if is_src:
+        raise error
+    msg = bytes(msg_tensor.cpu().tolist()).decode("utf-8", errors="replace")
+    raise RuntimeError(
+        "TP source rank failed while fetching/packing/validating the microbatch: " + msg
+    )
+
+
 
 # -------------------------------------------------------------------
 # THD (packed sequence) helpers
@@ -532,27 +597,54 @@ def pack_or_pad_batch(
 # -------------------------------------------------------------------
 
 
-def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
-    """Get a batch from *data_iterator* and broadcast across TP ranks."""
-    device = "cuda"
-    args = get_args()
+def _fetch_batch_with_status(
+    data_iterator: Optional[Iterator[list[Dict[str, Any]]]], device="cuda"
+):
+    """Fetch the next batch on the TP source rank and synchronize the outcome.
 
-    if get_tensor_model_parallel_rank() == 0:
+    ``StopIteration`` is a normal end-of-data signal, not an error: it maps to
+    ``has_data = 0`` with no failure handshake, and every rank returns
+    ``(None, False)`` after the ``has_data`` broadcast. Any OTHER source-side
+    fetch failure (a DataLoader worker crash, a dataset ``__getitem__`` error)
+    is propagated to every TP rank via :func:`_propagate_pack_status` BEFORE
+    the ``has_data`` broadcast, so all ranks raise together instead of the
+    peers hanging in that collective until the NCCL timeout.
+
+    Returns ``(data, has_data)``: the fetched sample list (``None`` on
+    non-source ranks and at end of data) and whether this step carries data.
+    """
+    data = None
+    fetch_error: Optional[Exception] = None
+    is_src = get_tensor_model_parallel_rank() == 0
+    if is_src:
         try:
             data = next(data_iterator)
             has_data = torch.tensor([1], dtype=torch.uint8, device=device)
         except StopIteration:
             has_data = torch.tensor([0], dtype=torch.uint8, device=device)
-            data = None
+        except Exception as exc:
+            fetch_error = exc
+            has_data = None  # unreachable past the handshake below
     else:
         has_data = torch.empty(1, dtype=torch.uint8, device=device)
-        data = None
+
+    # Synchronize the fetch outcome BEFORE the has_data broadcast; on failure
+    # every rank raises here (source re-raises the original exception).
+    _propagate_pack_status(is_src, fetch_error, device=device)
 
     src = get_tensor_model_parallel_src_rank()
     group = get_tensor_model_parallel_group()
     torch.distributed.broadcast(has_data, src, group=group)
+    return data, bool(has_data.item())
 
-    if has_data.item() == 0:
+
+def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
+    """Get a batch from *data_iterator* and broadcast across TP ranks."""
+    device = "cuda"
+    args = get_args()
+
+    data, has_data = _fetch_batch_with_status(data_iterator, device=device)
+    if not has_data:
         return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
