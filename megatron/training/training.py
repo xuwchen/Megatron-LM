@@ -2390,6 +2390,8 @@ def setup_model_and_optimizer(
             fp8_recipe=getattr(args, 'fp8_recipe', None),
             fp8=getattr(args, 'fp8', None) is not None,
             calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False),
+            weight_prefetch=getattr(args, 'gtp_weight_prefetch', True),
+            async_reduction=getattr(args, 'gtp_async_reduction', True),
         )
 
     model = get_model(

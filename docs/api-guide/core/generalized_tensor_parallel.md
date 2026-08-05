@@ -260,18 +260,48 @@ GTP_remat enabled. GTPRematConfig(pad_for_alignment=16, check_param_states=False
 
 ### 2.4 Tuning knobs
 
-Set via `from megatron.core.tensor_parallel.gtp import GTP_CONFIG, update_gtp_config`:
+The overlap controls are enabled by default. They are exposed as negative CLI flags so normal
+training keeps the optimized path without extra recipe settings:
+
+```bash
+# Diagnostic A/B only: gather each weight on demand.
+--no-gtp-weight-prefetch
+
+# Diagnostic A/B only: make every weight-gradient reduce-scatter synchronous and inline.
+--no-gtp-async-reduction
+```
+
+When launching through the agentic-mcore `job-launch` YAML adapter, use the negative boolean
+keys `no_gtp_weight_prefetch: true` and `no_gtp_async_reduction: true`; that adapter serializes
+them to the CLI flags above. Both settings are intended to measure the benefit of overlap, not as
+recommended production defaults.
+
+The standard `training.py` integration explicitly forwards
+`ModelParallelConfig.gtp_weight_prefetch` and `gtp_async_reduction` into the module-level
+`GTP_CONFIG` before model construction. Instantiating `ModelParallelConfig(...)` by itself only
+stores those fields; it does **not** change the GTP hot path, which reads `GTP_CONFIG`. Direct
+Megatron-Core integrations must bridge the fields explicitly, either by passing them to
+`configure_gtp_remat_from_recipe(...)` or by calling
+`from megatron.core.tensor_parallel.gtp import update_gtp_config`:
 
 ```python
 update_gtp_config(
     pad_for_alignment=16,         # NVFP4: 16, MXFP8: 32, BF16: any; auto-set in training.py
-    weight_prefetch=True,         # Disable to debug the cold-start path
-    async_reduction=True,         # Whether to perform GTP_remat gradient reduction asynchronously
+    weight_prefetch=True,         # CLI: enabled unless --no-gtp-weight-prefetch
+    async_reduction=True,         # CLI: enabled unless --no-gtp-async-reduction
     calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
 )
 ```
 
-`training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction. The other knobs are usually left at defaults.
+For backward compatibility, omitting `weight_prefetch` or `async_reduction` from
+`configure_gtp_remat_from_recipe(...)` preserves any value that the direct integration already
+installed with `update_gtp_config(...)`. The standard training entry point passes both resolved
+booleans explicitly, including the enabled-by-default values.
+
+`training.py` derives `pad_for_alignment` from the quantization recipe (`--fp4`,
+`--fp8-recipe=mxfp8`, etc.) before model construction. Alignment is a format-correctness
+requirement and deliberately has no CLI override. `check_param_states` is also debug-only and is
+kept off by the training integration. The two overlap controls above are normally left enabled.
 
 > **CUDA-graph warmup under GTP_remat.** When CUDA graphs are enabled, GTP_remat forces a minimum of **2** per-graph warmup steps regardless of `--cuda-graph-warmup-steps` (e.g. a user-set `0` is bumped to `2`): the first warmup builds the weight-prefetch chain and the second exercises the prefetch path before capture.
 

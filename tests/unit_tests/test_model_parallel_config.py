@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
 from megatron.training.arguments import parse_args, validate_args
 
 
@@ -21,6 +22,44 @@ def test_native_cross_entropy_loss_fusion_is_allowed():
 
     assert config.cross_entropy_loss_fusion
     assert config.cross_entropy_fusion_impl == 'native'
+
+
+def test_gtp_overlap_controls_default_enabled():
+    config = ModelParallelConfig()
+
+    assert config.gtp_weight_prefetch is True
+    assert config.gtp_async_reduction is True
+
+
+def test_gtp_overlap_controls_can_be_disabled_in_config():
+    runtime_before = (GTP_CONFIG.weight_prefetch, GTP_CONFIG.async_reduction)
+    config = ModelParallelConfig(gtp_weight_prefetch=False, gtp_async_reduction=False)
+
+    assert config.gtp_weight_prefetch is False
+    assert config.gtp_async_reduction is False
+    assert (GTP_CONFIG.weight_prefetch, GTP_CONFIG.async_reduction) == runtime_before
+
+
+def test_gtp_overlap_training_args_default_enabled(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['test_model_parallel_config.py'])
+
+    args = parse_args()
+
+    assert args.gtp_weight_prefetch is True
+    assert args.gtp_async_reduction is True
+
+
+def test_gtp_overlap_controls_can_be_disabled_by_training_args(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['test_model_parallel_config.py', '--no-gtp-weight-prefetch', '--no-gtp-async-reduction'],
+    )
+
+    args = parse_args()
+
+    assert args.gtp_weight_prefetch is False
+    assert args.gtp_async_reduction is False
 
 
 def test_te_cross_entropy_loss_fusion_is_disabled_by_training_args(monkeypatch):

@@ -411,10 +411,16 @@ def tag_gtp_params_with_names(model):
 
 
 def configure_gtp_remat_from_recipe(
-    *, fp4=False, fp8_recipe=None, fp8=False, calculate_per_token_loss=False
+    *,
+    fp4=False,
+    fp8_recipe=None,
+    fp8=False,
+    calculate_per_token_loss=False,
+    weight_prefetch=None,
+    async_reduction=None,
 ):
     """
-    Configure GTP weight-remat (padding + loss reduction) from the quantization recipe.
+    Configure GTP weight-remat (padding, loss reduction, and overlap controls) from the recipe.
     Must be called once BEFORE model construction.
     """
     # Callers reach this only when GTP is requested (is_gtp_remat_active), so a missing/
@@ -428,7 +434,18 @@ def configure_gtp_remat_from_recipe(
     # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
     # check_param_states=False: GTP buffer reuse (notably under CUDA-graph capture) trips the
     # param-state debug asserts, so keep them off for GTP runs.
-    update_gtp_config(calculate_per_token_loss=calculate_per_token_loss, check_param_states=False)
+    runtime_options = {
+        "calculate_per_token_loss": calculate_per_token_loss,
+        "check_param_states": False,
+    }
+    # None preserves values installed by direct Megatron-Core integrations via
+    # update_gtp_config(). The standard training entry point always passes its resolved
+    # boolean arguments explicitly, so CLI defaults still select the optimized path.
+    if weight_prefetch is not None:
+        runtime_options["weight_prefetch"] = weight_prefetch
+    if async_reduction is not None:
+        runtime_options["async_reduction"] = async_reduction
+    update_gtp_config(**runtime_options)
     if fp4:
         update_gtp_config(pad_for_alignment=16)
     elif fp8_recipe == "mxfp8":
@@ -1586,7 +1603,10 @@ class GTPShardedParam(torch.nn.Parameter):
             None or tuple of Nones for async — backward returns this.
         """
         batched = isinstance(wgrad, (list, tuple))
-        wgrads = list(wgrad) if batched else [wgrad]
+        # Keep the pool-owned full-wgrad inputs distinct from the reduce-scatter outputs.
+        # The synchronous collective returns shard-sized output tensors; only the original
+        # full-wgrad scratch buffers came from _wgrad_pool_get() and may be recycled there.
+        wgrad_inputs = list(wgrad) if batched else [wgrad]
         weights = self._weights
 
         # UNGRAPHED wgrads recycle via the standalone pool (_wgrad_pool_put); GRAPHED wgrads
@@ -1596,25 +1616,27 @@ class GTPShardedParam(torch.nn.Parameter):
         if GTP_CONFIG.async_reduction and self.prev_w is not None:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
-            _, rs_handle = self._reduce_scatter(wgrads, async_op=True, nvtx_label=nvtx_label)
+            _, rs_handle = self._reduce_scatter(wgrad_inputs, async_op=True, nvtx_label=nvtx_label)
             self._wgrad_rs_handle = GTPShardHandle(rs_handle, weights, reduce_scatter=True)
             # Stash wgrad input buffers — cannot recycle yet because the async RS
             # kernel is still reading them on rs_stream.
-            self._wgrad_input_bufs = wgrads
-            ret = tuple([None] * len(wgrads)) if batched else None
+            self._wgrad_input_bufs = wgrad_inputs
+            ret = tuple([None] * len(wgrad_inputs)) if batched else None
         else:
             # Sync reduce-scatter — reached as the natural chain-head case, recycle immediately
-            wgrads, _ = self._reduce_scatter(wgrads, async_op=False, nvtx_label=nvtx_label)
+            reduced_wgrads, _ = self._reduce_scatter(
+                wgrad_inputs, async_op=False, nvtx_label=nvtx_label
+            )
             nvtx_range_push(f"{nvtx_label}.gtp_wgrad_accum")
             if len(weights) == 1:
-                weights[0].main_grad.add_(wgrads[0])
+                weights[0].main_grad.add_(reduced_wgrads[0])
             else:
-                torch._foreach_add_([p.main_grad for p in weights], wgrads)
+                torch._foreach_add_([p.main_grad for p in weights], reduced_wgrads)
             nvtx_range_pop(f"{nvtx_label}.gtp_wgrad_accum")
             result = [self._handle_megatron_grad_accum(p) for p in weights]
 
             if poolable:
-                for buf in wgrads:
+                for buf in wgrad_inputs:
                     _wgrad_pool_put(buf)
             ret = result if batched else result[0]
 

@@ -93,6 +93,27 @@ class ModelParallelConfig:
        ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
     """
 
+    gtp_weight_prefetch: bool = True
+    """Prefetch the next GTP-rematerialized weight while the current weight's GEMM runs.
+
+       This is enabled by default. Disable it only for controlled overlap diagnostics with
+       ``--no-gtp-weight-prefetch``; disabling it makes every weight gather on demand.
+       The standard training entry point forwards this field to the global GTP runtime config;
+       direct Megatron-Core integrations must call configure_gtp_remat_from_recipe() or
+       update_gtp_config() explicitly.
+    """
+
+    gtp_async_reduction: bool = True
+    """Reduce-scatter GTP weight gradients asynchronously and defer their finalization.
+
+       This is enabled by default. Disable it only for controlled overlap diagnostics with
+       ``--no-gtp-async-reduction``; disabling it makes each weight-gradient reduce-scatter
+       synchronous and inline.
+       The standard training entry point forwards this field to the global GTP runtime config;
+       direct Megatron-Core integrations must call configure_gtp_remat_from_recipe() or
+       update_gtp_config() explicitly.
+    """
+
     pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
     """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
        If None, the default backend will be used.

@@ -18,7 +18,8 @@ Test groups
 - TestGTPActivationRecompute - BF16 recompute marker + prefetch-handle consumption
 - TestMXFP8LinearGTP         - Linear + MXFP8 recipe: quantized shard setup, fwd/bwd, padding
 - TestGTPGroupSizeOne        - wrap_module_params_gtp no-op when gtp_remat_group.size()==1
-- TestGTPPrefetchDisabled    - weight_prefetch=False single-pass forward
+- TestGTPPrefetchDisabled    - weight_prefetch=False GroupedLinear on-demand AG
+- TestGTPAsyncReductionDisabled - async_reduction=False GroupedLinear synchronous RS
 - TestFuseWgradAccumulation  - fuse_wgrad_accumulation=True: wgrad -> main_grad
 - TestGTPGradAccumHook       - main_grad updated after reduce-scatter backward
 - TestWaitAsyncCommsFallback - inline-accumulation fallback when _wgrad_rs_handle is None
@@ -525,7 +526,7 @@ def _worker_chain_wired(rank, world_size, port):
 
 
 def _worker_chain_async_prefetch(rank, world_size, port):
-    """On the second forward pass, w1 should be in DATA_READY before its forward runs."""
+    """The linked second pass must issue and consume w1's asynchronous prefetch."""
     torch.manual_seed(0)
     in_f, out_f = 32, 64
     dtype = torch.bfloat16
@@ -537,10 +538,41 @@ def _worker_chain_async_prefetch(rank, world_size, port):
     inp = torch.randn(4, in_f, dtype=dtype, device="cuda")
     dist.broadcast(inp, src=0)
 
-    # First pass builds chain, second pass uses async prefetch
-    for _ in range(2):
-        out = l0(inp, is_first_microbatch=True) + l1(inp, is_first_microbatch=True)
-    assert torch.isfinite(out).all(), "Non-finite output on second pass"
+    # First pass builds the chain.
+    first = (l0(inp, is_first_microbatch=True) + l1(inp, is_first_microbatch=True)).detach()
+    w1 = l1.weight
+    assert l0.weight.next_w is w1
+
+    calls = {"collective_modes": [], "on_demand": 0, "prefetched": 0}
+    original_gather = w1._all_gather_weight
+    original_on_demand = w1._all_gather_weight_on_demand
+    original_prefetched = w1._get_prefetched_weight
+
+    def _record_gather(*args, **kwargs):
+        calls["collective_modes"].append(kwargs["async_op"])
+        return original_gather(*args, **kwargs)
+
+    def _record_on_demand(*args, **kwargs):
+        calls["on_demand"] += 1
+        return original_on_demand(*args, **kwargs)
+
+    def _record_prefetched(*args, **kwargs):
+        calls["prefetched"] += 1
+        return original_prefetched(*args, **kwargs)
+
+    w1._all_gather_weight = _record_gather
+    w1._all_gather_weight_on_demand = _record_on_demand
+    w1._get_prefetched_weight = _record_prefetched
+    try:
+        second = l0(inp, is_first_microbatch=True) + l1(inp, is_first_microbatch=True)
+    finally:
+        w1._all_gather_weight = original_gather
+        w1._all_gather_weight_on_demand = original_on_demand
+        w1._get_prefetched_weight = original_prefetched
+
+    assert calls == {"collective_modes": [True], "on_demand": 0, "prefetched": 1}
+    torch.testing.assert_close(second, first)
+    assert torch.isfinite(second).all(), "Non-finite output on second pass"
 
 
 class TestGTPPrefetchChain:
@@ -792,32 +824,174 @@ class TestGTPGroupSizeOne:
 
 def _worker_prefetch_disabled(rank, world_size, port):
     torch.manual_seed(0)
-    in_f, out_f = 32, 64
+    num_gemms, in_f, out_f = 2, 32, 64
+    total_tokens = num_gemms * 4
+    m_splits = [total_tokens // num_gemms] * num_gemms
     dtype = torch.bfloat16
     gtp_remat_group = dist.new_group(list(range(world_size)))
 
+    original_weight_prefetch = gtp_module.GTP_CONFIG.weight_prefetch
     gtp_module.update_gtp_config(weight_prefetch=False)
     try:
-        l0 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
-        l1 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+        l0 = _make_gtp_remat_grouped_linear(num_gemms, in_f, out_f, gtp_remat_group, dtype)
+        l1 = _make_gtp_remat_grouped_linear(num_gemms, in_f, out_f, gtp_remat_group, dtype)
 
-        inp = torch.randn(4, in_f, dtype=dtype, device="cuda")
+        inp = torch.randn(total_tokens, in_f, dtype=dtype, device="cuda")
         dist.broadcast(inp, src=0)
 
-        # Single forward pass: builds chain and verifies output is correct
-        out = l0(inp, is_first_microbatch=True) + l1(inp, is_first_microbatch=True)
+        # The first pass only builds the chain. Instrument the linked second pass, where
+        # enabled prefetch would issue l1's AG from l0.
+        first = (
+            l0(inp, m_splits=m_splits, is_first_microbatch=True)
+            + l1(inp, m_splits=m_splits, is_first_microbatch=True)
+        ).detach()
+        w1 = l1.weight0
+        assert l0.weight0.next_w is w1
+        assert len(w1._weights) == num_gemms
 
-        # Chain should still be wired even with prefetch disabled
-        assert l0.weight.next_w is l1.weight
-        assert torch.isfinite(out).all(), "Non-finite output with prefetch disabled"
+        calls = {"collective_modes": [], "on_demand": 0, "prefetched": 0}
+        coalesced_ag_modes = []
+        original_gather = w1._all_gather_weight
+        original_on_demand = w1._all_gather_weight_on_demand
+        original_prefetched = w1._get_prefetched_weight
+        original_grouped_gather = gtp_module.grouped_gather_along_first_dim
+
+        def _record_gather(*args, **kwargs):
+            calls["collective_modes"].append(kwargs["async_op"])
+            return original_gather(*args, **kwargs)
+
+        def _record_on_demand(*args, **kwargs):
+            calls["on_demand"] += 1
+            return original_on_demand(*args, **kwargs)
+
+        def _record_prefetched(*args, **kwargs):
+            calls["prefetched"] += 1
+            return original_prefetched(*args, **kwargs)
+
+        def _record_grouped_gather(*args, **kwargs):
+            coalesced_ag_modes.append(kwargs["async_op"])
+            return original_grouped_gather(*args, **kwargs)
+
+        w1._all_gather_weight = _record_gather
+        w1._all_gather_weight_on_demand = _record_on_demand
+        w1._get_prefetched_weight = _record_prefetched
+        gtp_module.grouped_gather_along_first_dim = _record_grouped_gather
+        try:
+            second = l0(inp, m_splits=m_splits, is_first_microbatch=True) + l1(
+                inp, m_splits=m_splits, is_first_microbatch=True
+            )
+        finally:
+            w1._all_gather_weight = original_gather
+            w1._all_gather_weight_on_demand = original_on_demand
+            w1._get_prefetched_weight = original_prefetched
+            gtp_module.grouped_gather_along_first_dim = original_grouped_gather
+
+        assert calls == {"collective_modes": [False], "on_demand": 1, "prefetched": 0}
+        assert coalesced_ag_modes == [False, False]
+        torch.testing.assert_close(second, first)
+        assert torch.isfinite(second).all(), "Non-finite output with prefetch disabled"
     finally:
-        gtp_module.update_gtp_config(weight_prefetch=True)
+        gtp_module.update_gtp_config(weight_prefetch=original_weight_prefetch)
 
 
 class TestGTPPrefetchDisabled:
-    def test_forward_works_without_prefetch(self):
+    def test_second_grouped_forward_uses_coalesced_on_demand_gathers(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_prefetch_disabled, 4)
+
+
+# ---------------------------------------------------------------------------
+# async_reduction=False: every wgrad reduce-scatter completes inline
+# ---------------------------------------------------------------------------
+
+
+def _worker_async_reduction_disabled(rank, world_size, port):
+    torch.manual_seed(0)
+    num_gemms, in_f, out_f = 2, 32, 64
+    total_tokens = num_gemms * 4
+    m_splits = [total_tokens // num_gemms] * num_gemms
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    original_async_reduction = gtp_module.GTP_CONFIG.async_reduction
+    original_per_token_loss = gtp_module.GTP_CONFIG.calculate_per_token_loss
+    gtp_module.update_gtp_config(async_reduction=False, calculate_per_token_loss=False)
+    try:
+        l0 = _make_gtp_remat_grouped_linear(num_gemms, in_f, out_f, gtp_remat_group, dtype)
+        l1 = _make_gtp_remat_grouped_linear(num_gemms, in_f, out_f, gtp_remat_group, dtype)
+        for layer in (l0, l1):
+            for expert_idx in range(num_gemms):
+                weight = getattr(layer, f"weight{expert_idx}")
+                weight.main_grad = torch.zeros(weight.shape, dtype=dtype, device="cuda")
+
+        inp = torch.randn(total_tokens, in_f, dtype=dtype, device="cuda", requires_grad=True)
+        dist.broadcast(inp, src=0)
+
+        rs_modes = {"l0": [], "l1": []}
+        leaders = {"l0": l0.weight0, "l1": l1.weight0}
+        original_reduce_scatter = {name: leader._reduce_scatter for name, leader in leaders.items()}
+        batched_rs_tensor_calls = []
+        original_rs_tensor = gtp_module.reduce_scatter_along_first_dim
+
+        def _instrument_leader(name):
+            original = original_reduce_scatter[name]
+
+            def _record(wgrads, async_op, nvtx_label=None):
+                rs_modes[name].append((len(wgrads), async_op))
+                return original(wgrads, async_op=async_op, nvtx_label=nvtx_label)
+
+            return _record
+
+        def _record_rs_tensor(*args, **kwargs):
+            batched_rs_tensor_calls.append(args[0].shape)
+            return original_rs_tensor(*args, **kwargs)
+
+        for name, leader in leaders.items():
+            leader._reduce_scatter = _instrument_leader(name)
+        gtp_module.reduce_scatter_along_first_dim = _record_rs_tensor
+        try:
+            out = l0(inp, m_splits=m_splits, is_first_microbatch=True) + l1(
+                inp, m_splits=m_splits, is_first_microbatch=True
+            )
+            assert l0.weight0.next_w is l1.weight0
+            assert l1.weight0.prev_w is l0.weight0
+            out.sum().backward()
+        finally:
+            for name, leader in leaders.items():
+                leader._reduce_scatter = original_reduce_scatter[name]
+            gtp_module.reduce_scatter_along_first_dim = original_rs_tensor
+
+        # l1 has a predecessor and therefore uses async RS when the knob is enabled.
+        # Seeing async_op=False here proves the disabled knob changed that hot path.
+        assert rs_modes == {"l0": [(num_gemms, False)], "l1": [(num_gemms, False)]}
+        assert len(batched_rs_tensor_calls) == 2 * num_gemms
+
+        local_rows = out_f // world_size
+        token_start = 0
+        expected_by_expert = []
+        for split in m_splits:
+            expected_row = inp.detach()[token_start : token_start + split].float().sum(dim=0)
+            expected_by_expert.append(expected_row.repeat(local_rows, 1))
+            token_start += split
+
+        for layer in (l0, l1):
+            for expert_idx, expected in enumerate(expected_by_expert):
+                weight = getattr(layer, f"weight{expert_idx}")
+                assert torch.isfinite(weight.main_grad).all()
+                assert torch.any(weight.main_grad != 0)
+                assert weight._wgrad_rs_handle is None
+                torch.testing.assert_close(weight.main_grad.float(), expected, rtol=2e-2, atol=2e-2)
+    finally:
+        gtp_module.update_gtp_config(
+            async_reduction=original_async_reduction,
+            calculate_per_token_loss=original_per_token_loss,
+        )
+
+
+class TestGTPAsyncReductionDisabled:
+    def test_grouped_backward_uses_coalesced_synchronous_reduction(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_async_reduction_disabled, 4)
 
 
 # ---------------------------------------------------------------------------
