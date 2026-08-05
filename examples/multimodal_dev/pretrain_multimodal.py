@@ -142,13 +142,9 @@ def datasets_provider(train_val_test_num_samples):
     return provider_fn(train_val_test_num_samples)
 
 
-if __name__ == "__main__":
-    datasets_provider.is_distributed = True
-
-    args = parse_and_validate_args(
-        extra_args_provider=add_multimodal_args,
-        args_defaults={},
-    )
+def validate_entry_args(args) -> None:
+    """Reject statically-decidable misconfigurations before any model
+    construction (fail in seconds, not after multi-node setup)."""
     # multimodal_dev's model_provider builds the full model on every rank and
     # does not honor pre_process / post_process pipeline-stage flags. PP>1
     # would silently violate Megatron's pipeline-parallel contract.
@@ -159,6 +155,34 @@ if __name__ == "__main__":
             "builds the full model on every rank; pipeline-stage splitting is "
             "not wired through. Run with --pipeline-model-parallel-size 1."
         )
+    if getattr(args, "mtp_num_layers", 0):
+        raise ValueError(
+            "MTP is not wired through on this entry "
+            "(scatter_embedding_sequence_parallel=False breaks MTP under "
+            "sequence parallelism); run with --mtp-num-layers 0."
+        )
+    # Statically decidable misconfig: the multimodal packed THD path does not
+    # support CUDA graphs (forward_step keeps a runtime guard as defense in
+    # depth); reject the combination at startup instead of at the first step.
+    if getattr(args, "use_packed_sequence", False) and getattr(
+        args, "cuda_graph_impl", "none"
+    ) not in (None, "none"):
+        raise ValueError(
+            "--use-packed-sequence is incompatible with "
+            f"--cuda-graph-impl {args.cuda_graph_impl}: the multimodal packed "
+            "THD path does not support CUDA Graph. Run with "
+            "--cuda-graph-impl none."
+        )
+
+
+if __name__ == "__main__":
+    datasets_provider.is_distributed = True
+
+    args = parse_and_validate_args(
+        extra_args_provider=add_multimodal_args,
+        args_defaults={},
+    )
+    validate_entry_args(args)
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
         full_config,
