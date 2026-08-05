@@ -40,6 +40,28 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 
 
+def configure_vision_recompute(vision_config) -> None:
+    """--recompute-vision: whole-tower full recompute, ONE uniform block.
+
+    Uniform blocks of size num_layers save only the block input (the
+    patch-embed output) instead of every layer's input. At heavy
+    long-window payloads the per-layer saves dominate vision memory
+    (raw_patches x vision_hidden x num_layers); the recompute FLOPs are
+    the same for one whole-tower block as for per-layer blocks (any
+    full recompute re-runs the tower in backward). The trade-off: forward saves only the
+    patch-embed output, but backward recompute of the single block
+    re-materializes ALL layers' internal activations simultaneously;
+    per-layer blocks would bound that backward spike to one layer at the
+    cost of saving every layer's input. The whole-tower choice is the
+    measured winner for this stack's payload envelope (the saved
+    per-layer inputs dominated at large raw-patch payloads; validated by
+    the 128K qualification with allocation-point margin forensics).
+    """
+    vision_config.recompute_granularity = "full"
+    vision_config.recompute_method = "uniform"
+    vision_config.recompute_num_layers = vision_config.num_layers
+
+
 def model_provider(
     pre_process: bool = True,
     post_process: bool = True,
@@ -81,9 +103,7 @@ def model_provider(
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
 
     if getattr(args, "recompute_vision", False):
-        vision_config.recompute_granularity = "full"
-        vision_config.recompute_method = "uniform"
-        vision_config.recompute_num_layers = 1
+        configure_vision_recompute(vision_config)
 
     # --- vision FLOPs metadata ---
     vision_flops_fn = registry.get("vision_flops_fn")

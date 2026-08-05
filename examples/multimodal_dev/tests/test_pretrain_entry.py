@@ -7,8 +7,26 @@ from types import SimpleNamespace
 import pytest
 
 from examples.multimodal_dev.pretrain_multimodal import (
+    configure_vision_recompute,
     validate_entry_args,
 )
+
+
+def test_recompute_vision_uses_one_whole_tower_block():
+    # Whole-tower contract: full recompute must configure ONE uniform block
+    # spanning every layer, so only the patch-embed output is saved. A
+    # one-layer block size (the value this entry started from) saves every
+    # layer's input and dominates vision memory at heavy payloads — invisible
+    # to CPU tests and to the 4K smoke, it only shows up as a 128K OOM.
+    vision_config = SimpleNamespace(
+        num_layers=24, recompute_granularity=None, recompute_method=None, recompute_num_layers=None
+    )
+    configure_vision_recompute(vision_config)
+    assert (
+        vision_config.recompute_granularity,
+        vision_config.recompute_method,
+        vision_config.recompute_num_layers,
+    ) == ("full", "uniform", 24)
 
 
 @pytest.mark.parametrize(

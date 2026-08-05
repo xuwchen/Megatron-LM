@@ -75,7 +75,8 @@ def add_multimodal_args(parser):
         default=False,
         help=(
             "Enable full activation recomputation for vision encoder layers. "
-            "Uses uniform method and recomputes every layer. "
+            "Configures the vision tower as ONE uniform recompute block "
+            "spanning all layers (only the patch-embed output is saved). "
             "Independent of the decoder --recompute-* flags."
         ),
     )
