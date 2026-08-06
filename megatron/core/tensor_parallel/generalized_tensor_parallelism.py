@@ -1578,7 +1578,7 @@ class GTPShardedParam(torch.nn.Parameter):
             return outputs, cm if async_op else None
 
     def wgrad_reduce_scatter(self, wgrad, nvtx_label=None):
-        """Reduce-scatter wgrad(s): sync for the last weight, async+deferred for others.
+        """Reduce-scatter wgrad(s): sync at a wgrad-chain head, async+deferred otherwise.
         Accepts a single tensor (non-routed) or a list (routed experts).
 
         Returns:
@@ -1609,7 +1609,19 @@ class GTPShardedParam(torch.nn.Parameter):
             self._wait_reduce_scatter(finalize_grad=True)
             self._already_finalized = False
 
-        if GTP_CONFIG.async_reduction and self.prev_w is not None:
+        # ``prev_w``/``next_w`` primarily encode the forward AG-prefetch chain. A custom-
+        # backward embedding may still drive the first decoder weight's forward prefetch, but it
+        # is not a valid wgrad-cascade predecessor: a model that reuses that embedding on a side
+        # branch has an autograd node that can run before the main decoder has produced any RS
+        # ticket. The backward-prefetch opt-out is the existing marker for that custom path, so
+        # terminate the wgrad cascade on both sides of such a boundary while preserving the
+        # forward AG edge.
+        has_wgrad_predecessor = (
+            self.prev_w is not None
+            and self._need_weight_prefetch_bwd
+            and self.prev_w._need_weight_prefetch_bwd
+        )
+        if GTP_CONFIG.async_reduction and has_wgrad_predecessor:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
             _, rs_handle = self._reduce_scatter(wgrad_inputs, async_op=True, nvtx_label=nvtx_label)
@@ -1638,7 +1650,12 @@ class GTPShardedParam(torch.nn.Parameter):
 
         # Wait for last reduce scatter if it was async
         # Currently only support reduce scattering in reverse order
-        if GTP_CONFIG.async_reduction and self.next_w is not None:
+        has_wgrad_successor = (
+            self.next_w is not None
+            and self._need_weight_prefetch_bwd
+            and self.next_w._need_weight_prefetch_bwd
+        )
+        if GTP_CONFIG.async_reduction and has_wgrad_successor:
             self.next_w._wait_reduce_scatter()
 
             if getattr(self.next_w, "_already_finalized", False):
