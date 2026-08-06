@@ -23,9 +23,12 @@ Test groups
 - TestWaitAsyncCommsFallback - inline-accumulation fallback when _wgrad_rs_handle is None
 - TestGTPDDPBucketAlignment  - GTP/regular DDP bucket ends padded for dist-opt alignment
 - TestGTPDDPGradReadyWiring  - GTP params drive DDP grad-ready via the manual hook, not autograd
+- TestGTPMultiUseBoundary    - mark_gtp_multi_use_boundary opts a param out of both chains
 
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != the required world size (4).
 """
+
+from unittest import mock
 
 import pytest
 import torch
@@ -44,6 +47,9 @@ from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTPShardedParam,
+    _init_gtp_runtime_attrs,
+    classify_gtp_chains,
+    mark_gtp_multi_use_boundary,
     wrap_module_params_gtp,
 )
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
@@ -1234,3 +1240,54 @@ class TestGTPMTPSharedEmbeddingGraph:
     def test_aux_embedding_backward_precedes_main_decoder_ticket(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_mtp_like_shared_embedding_graph, 4)
+
+
+class TestGTPMultiUseBoundary:
+    """mark_gtp_multi_use_boundary() is the declaration side of the multi-use handling.
+
+    The runtime fixes are exercised elsewhere; what needs guarding here is that the marker
+    actually reaches the flags the runtime reads, and that a marked parameter cannot silently
+    end up back in a prefetch chain — where the single ticket and handle slots it opted out of
+    would be reused across its two uses.
+    """
+
+    def _param(self):
+        param = torch.nn.Parameter(torch.zeros(4, 4))
+        _init_gtp_runtime_attrs(param)
+        return param
+
+    def test_marker_opts_out_of_both_prefetch_directions(self):
+        param = self._param()
+        assert param._gtp_multi_use is False
+        with mock.patch(
+            "megatron.core.tensor_parallel.generalized_tensor_parallelism.is_gtp_param",
+            return_value=True,
+        ):
+            mark_gtp_multi_use_boundary(param)
+
+        assert param._gtp_multi_use is True
+        assert param._need_weight_prefetch is False
+        assert param._need_weight_prefetch_bwd is False
+
+    def test_marker_ignores_a_non_gtp_parameter(self):
+        """Models call this unconditionally; a plain parameter must pass through untouched."""
+        param = torch.nn.Parameter(torch.zeros(4, 4))
+        mark_gtp_multi_use_boundary(param)
+        assert not hasattr(param, "_gtp_multi_use")
+
+    def test_a_linked_boundary_param_is_rejected(self):
+        """Marking after the chains are built would leave the opt-outs unenforced."""
+        param = self._param()
+        param._gtp_multi_use = True
+        param.next_w = self._param()
+        param.chain_id = 0
+        param.prefetch_initialized = False
+
+        model = mock.MagicMock()
+        model.named_parameters.return_value = [("output_layer.weight", param)]
+        with mock.patch(
+            "megatron.core.tensor_parallel.generalized_tensor_parallelism.is_gtp_param",
+            return_value=True,
+        ):
+            with pytest.raises(RuntimeError, match="multi-use boundary"):
+                classify_gtp_chains(model)

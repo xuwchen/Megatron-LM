@@ -26,6 +26,7 @@ try:
         gtp_remat_shard_dim0,
         is_gtp_param,
         make_sharded_tensors_for_checkpoint_with_gtp_remat,
+        mark_gtp_multi_use_boundary,
         set_cuda_graph_mempool,
         wait_async_comms,
         wait_for_gtp_grad_reduction_on_current_stream,
@@ -43,6 +44,7 @@ except ImportError as _gtp_import_error:
 __all__ = [
     "HAVE_GTP",
     "GTP_UNAVAILABLE_REASON",
+    "mark_gtp_multi_use_boundary",
     "GTPChain",
     "GTPEmbeddingWeight",
     "attach_gtp_to_presharded_module",
