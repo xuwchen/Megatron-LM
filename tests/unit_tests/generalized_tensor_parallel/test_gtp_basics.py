@@ -1022,3 +1022,69 @@ class TestGTPDDPGradReadyWiring:
         """GTP params route DDP grad-ready through register_grad_accum_hook, not autograd."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_gtp_ddp_grad_ready_wiring, 4)
+
+def _worker_shared_linear_multiple_uses(rank, world_size, port):
+    """A shared TE weight used twice must accumulate both reduced wgrads exactly once."""
+    torch.manual_seed(0)
+    in_f, out_f = 32, 64
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    original_async_reduction = gtp_module.GTP_CONFIG.async_reduction
+    original_per_token_loss = gtp_module.GTP_CONFIG.calculate_per_token_loss
+    gtp_module.update_gtp_config(async_reduction=True, calculate_per_token_loss=False)
+    try:
+        prefix = _make_gtp_linear(in_f, in_f, gtp_remat_group, dtype)
+        shared = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+        for weight in (prefix.weight, shared.weight):
+            weight.main_grad = torch.zeros(weight.shape, dtype=dtype, device="cuda")
+
+        prefix_input = torch.randn(8, in_f, dtype=dtype, device="cuda")
+        aux_hidden = torch.randn(8, in_f, dtype=dtype, device="cuda")
+        dist.broadcast(prefix_input, src=0)
+        dist.broadcast(aux_hidden, src=0)
+
+        prefix_hidden = prefix(prefix_input, is_first_microbatch=True)
+        main_output = shared(prefix_hidden, is_first_microbatch=True)
+        aux_output = shared(aux_hidden, is_first_microbatch=True)
+        assert prefix.weight.next_w is shared.weight
+        assert shared.weight.prev_w is prefix.weight
+
+        shared_rs_calls = 0
+        original_shared_rs = shared.weight.wgrad_reduce_scatter
+
+        def count_shared_rs(wgrad, nvtx_label=None):
+            nonlocal shared_rs_calls
+            shared_rs_calls += 1
+            return original_shared_rs(wgrad, nvtx_label=nvtx_label)
+
+        shared.weight.wgrad_reduce_scatter = count_shared_rs
+        try:
+            (main_output.float().sum() + aux_output.float().sum()).backward()
+        finally:
+            shared.weight.wgrad_reduce_scatter = original_shared_rs
+
+        assert shared_rs_calls == 2
+        expected_row = (
+            prefix_hidden.detach().float().sum(dim=0) + aux_hidden.float().sum(dim=0)
+        )
+        expected = expected_row.repeat(shared.weight.shape[0], 1)
+        torch.testing.assert_close(
+            shared.weight.main_grad.float(), expected, rtol=2e-2, atol=2e-2
+        )
+    finally:
+        gtp_module.update_gtp_config(
+            async_reduction=original_async_reduction,
+            calculate_per_token_loss=original_per_token_loss,
+        )
+
+
+class TestGTPSharedLinearMultipleUses:
+    def test_two_forward_uses_accumulate_both_wgrads(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_shared_linear_multiple_uses, 4)
+
+
+# ---------------------------------------------------------------------------
+# Multiple microbatches: output must be consistent when weight unchanged
+# ---------------------------------------------------------------------------

@@ -1596,6 +1596,19 @@ class GTPShardedParam(torch.nn.Parameter):
         # cannot, since CUDA graphs require stable buffer addresses across replay.
         poolable = self.chain_id == GTPChain.UNGRAPHED.value
 
+        if self._wgrad_rs_handle is not None:
+            # This weight already has a reduce-scatter in flight from an EARLIER use in the same
+            # backward: a parameter consumed twice in one forward reaches this method from two
+            # autograd nodes. The state that carries a collective is single-valued —
+            # ``_wgrad_rs_handle``, the cache buffer behind ``_rs_ticket``, and
+            # ``_wgrad_input_bufs`` — so starting the second reduction while the first is still
+            # in flight makes both write the same buffer and silently drops one contribution.
+            # Drain the in-flight one and fold it into main_grad first; the ticket then hands the
+            # same buffer back for this use. ``_already_finalized`` must be cleared: it stops a
+            # cascade from finalizing a weight twice, but a weight used twice must finalize twice.
+            self._wait_reduce_scatter(finalize_grad=True)
+            self._already_finalized = False
+
         if GTP_CONFIG.async_reduction and self.prev_w is not None:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
