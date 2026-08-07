@@ -231,6 +231,30 @@ def _classify_param_chain(param_name: str) -> str:
     return U
 
 
+def mark_gtp_multi_use_boundary(param) -> None:
+    """Declare that ``param`` is consumed more than once in a single forward.
+
+    GTP keeps ONE slot per parameter for each of the all-gather ticket, the reduce-scatter
+    ticket, the in-flight collective handle, and the stashed wgrad inputs. A second use would
+    overwrite the first use's still-live state, which shows up as a silently wrong gradient
+    rather than an error. Such a parameter is therefore excluded from both prefetch chains and
+    gathered on demand; ``wgrad_reduce_scatter`` drains any in-flight reduce-scatter from the
+    earlier use before starting the next one.
+
+    Call during module construction (e.g. LanguageModule.setup_embeddings_and_output_layer)
+    for the lm-head weight that MTP shares with the main output layer.
+    """
+    if not is_gtp_param(param):
+        return
+    param._gtp_multi_use = True
+    # Neither direction may prefetch a boundary param: a prefetch issued for use #1 would
+    # still be in flight when use #2 gathers, and the single handle slot cannot hold both.
+    # The consume side honours these flags (see all_gather_and_prefetch*), so clearing them
+    # routes both uses through the on-demand gather instead of a ticket nobody refilled.
+    param._need_weight_prefetch = False
+    param._need_weight_prefetch_bwd = False
+
+
 def classify_gtp_chains(model) -> None:
     """Walk model.named_parameters() and set chain_id on every GTPShardedParam.
 
@@ -242,6 +266,12 @@ def classify_gtp_chains(model) -> None:
     for name, param in model.named_parameters():
         if not is_gtp_param(param):
             continue
+        if getattr(param, "_gtp_multi_use", False):
+            # Re-assert the opt-outs the marker set, in case construction order re-enabled
+            # them. prev_w/next_w drive both the AG prefetch and the wgrad RS cascade, and a
+            # cascade running through a twice-used param would finalize it from the wrong side.
+            param._need_weight_prefetch = False
+            param._need_weight_prefetch_bwd = False
         target = _classify_param_chain(name)
         if param.prefetch_initialized and param.chain_id != target:
             conflicts.append((name, param.chain_id, target))
@@ -853,6 +883,12 @@ def _init_gtp_runtime_attrs(obj):
     # (wgrad is a token-indexed scatter-add, input non-differentiable). classify_gtp_chains()
     # sets this False for embedding.word_embeddings.weight.
     obj._need_weight_prefetch_bwd = True
+    # Multi-use hard boundary: True when ONE parameter is consumed more than once per forward
+    # (MTP routes its logits through the shared lm-head), so the single-valued AG/RS state slots
+    # would be clobbered by the second use. Set explicitly at construction via
+    # mark_gtp_multi_use_boundary() — never inferred from an invocation counter, which cannot
+    # distinguish "used twice this step" from "used once in each of two steps".
+    obj._gtp_multi_use = False
     obj.ag_event = torch.cuda.Event(external=True)
     # DDP backward hook (set by register_grad_accum_hook); invoked after
     # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
