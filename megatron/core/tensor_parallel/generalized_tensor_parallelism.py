@@ -1429,10 +1429,23 @@ class GTPShardedParam(torch.nn.Parameter):
             weight_total
         """
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        # Consume must mirror the produce-side guard below: the bwd AG for THIS param is only
+        # issued by next_w when self._need_weight_prefetch and self._need_weight_prefetch_bwd
+        # are both set. Reading the ticket without them returns the PREVIOUS iteration's AG
+        # buffer (cache.get() on a ticket nobody refilled) — silently wrong, and it surfaces
+        # as a NaN on iter 2, not on iter 1. Params opted out of bwd prefetch (the embedding
+        # weight, and any param declared a multi-use boundary) must gather on demand.
+        if (
+            GTP_CONFIG.weight_prefetch
+            and self.next_w is not None
+            and self._need_weight_prefetch
+            and self._need_weight_prefetch_bwd
+        ):
             result = self._get_prefetched_weight(False)
+            _consumed_bwd_ticket = True
         else:
             result = self._all_gather_weight_on_demand(False)
+            _consumed_bwd_ticket = False
 
         if (
             GTP_CONFIG.weight_prefetch
@@ -1452,7 +1465,8 @@ class GTPShardedParam(torch.nn.Parameter):
             for w in self._weights:
                 w._set_state(GTPWeightState.NONE)
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        # Release only the ticket we actually consumed; an on-demand gather never checked one out.
+        if _consumed_bwd_ticket:
             cache = get_global_GTP_cache()
             for w in self._weights:
                 cache.release(w._ag_ticket_bwd)
@@ -1479,10 +1493,20 @@ class GTPShardedParam(torch.nn.Parameter):
         # Consume current weight.
         if use_recompute_chain and self._recompute_prev is not None:
             result = self._get_recompute_prefetched_weight()
-        elif not in_recompute and GTP_CONFIG.weight_prefetch and self.prev_w is not None:
+        elif (
+            not in_recompute
+            and GTP_CONFIG.weight_prefetch
+            and self.prev_w is not None
+            # Mirror the produce-side guard below (`self.next_w._need_weight_prefetch`): the fwd
+            # AG for THIS param is only issued when self._need_weight_prefetch is set. Without
+            # this, an opted-out-but-linked param reads a ticket nobody refilled and gets the
+            # previous iteration's buffer.
+            and self._need_weight_prefetch
+        ):
             result = self._get_prefetched_weight(True)
         else:
-            # On-demand: chain head (fwd or recompute global-first) or first-iter build.
+            # On-demand: chain head (fwd or recompute global-first), prefetch opt-out, or
+            # first-iter build.
             result = self._all_gather_weight_on_demand(True)
 
         # Prefetch next weight on the matching chain.
@@ -1854,41 +1878,81 @@ class GTPShardedParam(torch.nn.Parameter):
             None or tuple of Nones for async — backward returns this.
         """
         batched = isinstance(wgrad, (list, tuple))
-        wgrads = list(wgrad) if batched else [wgrad]
+        # Keep the pool-owned full-wgrad INPUTS distinct from the reduce-scatter OUTPUTS.
+        # _wgrad_pool_get() hands out full (unsharded) wgrad buffers; the collective returns
+        # shard-sized tensors. Rebinding one name to both means the sync path below recycles
+        # shard-sized outputs into a pool whose buffers are expected to be full-sized, and a
+        # later get() hands back a too-small buffer.
+        wgrad_inputs = list(wgrad) if batched else [wgrad]
         weights = self._weights
 
         # UNGRAPHED wgrads recycle via the standalone pool (_wgrad_pool_put); GRAPHED wgrads
         # cannot, since CUDA graphs require stable buffer addresses across replay.
         poolable = not _chain_is_graphed(self.chain_id)
 
-        if GTP_CONFIG.async_reduction and self.prev_w is not None:
+        if self._wgrad_rs_handle is not None:
+            # This weight already has a reduce-scatter in flight from an EARLIER use in the same
+            # backward: a parameter consumed twice in one forward (MTP routing its logits through
+            # the shared lm-head) reaches this method from two autograd nodes. The state that
+            # carries a collective is single-valued — ``_wgrad_rs_handle``, the cache buffer
+            # behind ``_rs_ticket``, and ``_wgrad_input_bufs`` — so starting the second reduction
+            # while the first is still in flight makes both write the same buffer and silently
+            # drops one contribution. Drain the in-flight one and fold it into main_grad first;
+            # the ticket then hands the same buffer back for this use. ``_already_finalized``
+            # must be cleared with it: it stops a cascade from finalizing a weight twice, but a
+            # weight used twice must finalize twice.
+            self._wait_reduce_scatter(finalize_grad=True)
+            self._already_finalized = False
+
+        # prev_w/next_w primarily encode the forward AG-prefetch chain. A custom-backward
+        # weight (e.g. the embedding, or GDN's fused path) may still drive the next weight's
+        # forward prefetch while being an invalid wgrad-cascade neighbour: its autograd node
+        # can run before the main chain has produced any RS ticket. _need_weight_prefetch_bwd
+        # is the existing marker for that custom path, so terminate the wgrad cascade on both
+        # sides of such a boundary while leaving the forward AG edge intact.
+        has_wgrad_predecessor = (
+            self.prev_w is not None
+            and self._need_weight_prefetch_bwd
+            and self.prev_w._need_weight_prefetch_bwd
+        )
+        if GTP_CONFIG.async_reduction and has_wgrad_predecessor:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
-            _, rs_handle = self._reduce_scatter(wgrads, async_op=True, nvtx_label=nvtx_label)
+            _, rs_handle = self._reduce_scatter(wgrad_inputs, async_op=True, nvtx_label=nvtx_label)
             self._wgrad_rs_handle = GTPShardHandle(rs_handle, weights, reduce_scatter=True)
             # Stash wgrad input buffers — cannot recycle yet because the async RS
             # kernel is still reading them on rs_stream.
-            self._wgrad_input_bufs = wgrads
-            ret = tuple([None] * len(wgrads)) if batched else None
+            self._wgrad_input_bufs = wgrad_inputs
+            ret = tuple([None] * len(wgrad_inputs)) if batched else None
         else:
             # Sync reduce-scatter — reached as the natural chain-head case, recycle immediately
-            wgrads, _ = self._reduce_scatter(wgrads, async_op=False, nvtx_label=nvtx_label)
+            reduced_wgrads, _ = self._reduce_scatter(
+                wgrad_inputs, async_op=False, nvtx_label=nvtx_label
+            )
             nvtx_range_push(f"{nvtx_label}.gtp_wgrad_accum")
             if len(weights) == 1:
-                weights[0].main_grad.add_(wgrads[0])
+                weights[0].main_grad.add_(reduced_wgrads[0])
             else:
-                torch._foreach_add_([p.main_grad for p in weights], wgrads)
+                torch._foreach_add_([p.main_grad for p in weights], reduced_wgrads)
             nvtx_range_pop(f"{nvtx_label}.gtp_wgrad_accum")
             result = [self._handle_megatron_grad_accum(p) for p in weights]
 
+            # Recycle the pool-owned INPUTS, never the shard-sized collective outputs.
             if poolable:
-                for buf in wgrads:
+                for buf in wgrad_inputs:
                     _wgrad_pool_put(buf)
             ret = result if batched else result[0]
 
         # Wait for last reduce scatter if it was async
         # Currently only support reduce scattering in reverse order
-        if GTP_CONFIG.async_reduction and self.next_w is not None:
+        # Same boundary rule as has_wgrad_predecessor above: do not finalize across a
+        # custom-backward neighbour, which may not have issued an RS at all.
+        has_wgrad_successor = (
+            self.next_w is not None
+            and self._need_weight_prefetch_bwd
+            and self.next_w._need_weight_prefetch_bwd
+        )
+        if GTP_CONFIG.async_reduction and has_wgrad_successor:
             self.next_w._wait_reduce_scatter()
 
             if getattr(self.next_w, "_already_finalized", False):
