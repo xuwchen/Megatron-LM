@@ -2,12 +2,14 @@
 
 """General utilities."""
 import json
+import logging
 import os
 import sys
 import warnings
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -48,6 +50,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
+logger = logging.getLogger(__name__)
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -912,3 +915,42 @@ def get_local_rank_preinit() -> int:
         "Could not determine local rank from LOCAL_RANK or SLURM_LOCALID. Defaulting to local rank 0."
     )
     return 0
+
+
+def ranked_memory_snapshot_path(snapshot_path: str, rank: int | None = None) -> str:
+    """Return a collision-free per-rank CUDA memory snapshot path."""
+    rank = _safe_get_rank() if rank is None else rank
+    path = Path(snapshot_path)
+    suffix = path.suffix or ".pickle"
+    stem = path.stem if path.suffix else path.name
+    return str(path.with_name(f"{stem}_rank-{rank}{suffix}"))
+
+
+def start_memory_history_recording(profiling: Any | None) -> None:
+    """Enable CUDA allocator history on ranks selected for memory profiling."""
+    if profiling is None or not getattr(profiling, "record_memory_history", False):
+        return
+    profile_ranks = getattr(profiling, "profile_ranks", [])
+    if profile_ranks and _safe_get_rank() not in profile_ranks:
+        return
+
+    torch.cuda.memory._record_memory_history(
+        True, trace_alloc_max_entries=100_000, trace_alloc_record_context=True
+    )
+
+    def _oom_observer(device: int, alloc: int, device_alloc: int, device_free: int) -> None:
+        """Dump a rank-local snapshot when CUDA reports an out-of-memory error."""
+        rank = _safe_get_rank()
+        base, ext = os.path.splitext(profiling.memory_snapshot_path)
+        filename = f"{base}_rank{rank}_oom{ext}"
+        torch.cuda.memory._dump_snapshot(filename)
+        logger.info("[OOM] rank %s saved memory snapshot to %s", rank, filename)
+
+    torch._C._cuda_attach_out_of_memory_observer(_oom_observer)
+    snapshot_path = ranked_memory_snapshot_path(profiling.memory_snapshot_path)
+    Path(snapshot_path).parent.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "Memory history recording enabled on rank %s; snapshot will be written to '%s'.",
+        _safe_get_rank(),
+        snapshot_path,
+    )
