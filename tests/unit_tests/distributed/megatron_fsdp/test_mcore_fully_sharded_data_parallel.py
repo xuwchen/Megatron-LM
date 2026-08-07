@@ -330,7 +330,7 @@ class TestFullyShardedDataParallel:
         torch.cuda.synchronize()
 
     def test_fsdp_expt_device_mesh(self):
-        """Test that expt_device_mesh is None for dense models and not None for MoE models."""
+        """Test that the expert mesh follows MoE config or parameter-level expert ownership."""
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
 
@@ -374,6 +374,18 @@ class TestFullyShardedDataParallel:
             fsdp_moe.megatron_fsdp_dist_index.expt_device_mesh is not None
         ), "MoE model: expt_device_mesh should not be None"
         fsdp_moe.stop_communication()
+
+        # Engram-style parameters require an expert mesh even without MoE configuration.
+        engram_style_model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+        next(engram_style_model.parameters()).allreduce = False
+        fsdp_engram = FullyShardedDataParallel(
+            config=dense_config,
+            ddp_config=fsdp_config,
+            module=engram_style_model,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+        assert fsdp_engram.megatron_fsdp_dist_index.expt_device_mesh is not None
+        fsdp_engram.stop_communication()
 
     def test_fsdp_db_persist_buf_on_alloc_fail(self):
         """When ``fsdp_double_buffer=True`` and

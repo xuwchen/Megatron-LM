@@ -1389,6 +1389,15 @@ class ParameterGroup:
     hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
 
 
+def _is_expert_parallel_parameter(name: str, param: torch.nn.Parameter) -> bool:
+    """Classify parameters that must use the expert-DP FSDP mesh.
+
+    ``allreduce=False`` is the authoritative MCore contract. The name fallback preserves
+    compatibility with legacy grouped-MoE parameters that have not yet been annotated.
+    """
+    return not getattr(param, "allreduce", True) or ".experts." in name
+
+
 def _get_parameter_groups(
     module: torch.nn.Module,
     policy: BucketingPolicy,
@@ -1445,8 +1454,6 @@ def _get_parameter_groups(
             and policy.data_parallel_sharding_strategy != "no_shard"
         )
 
-    is_expert_parameter = lambda n, p: ".experts." in n
-
     def _should_split_from_grouped_expert_bucket(
         is_expert_param: bool,
         param: torch.nn.Parameter,
@@ -1480,7 +1487,7 @@ def _get_parameter_groups(
         is_fp8_meta_device_init = meta_device_init_fp8_params.get(name, (False, False))[0]
         param_attrs = dict(
             dtype="float8" if (is_fp8 or is_fp8_meta_device_init) else param.dtype,
-            is_expert_param=is_expert_parameter(name, param),
+            is_expert_param=_is_expert_parallel_parameter(name, param),
             requires_grad=param.requires_grad,
             fsdp_unit_id=None,
         )
