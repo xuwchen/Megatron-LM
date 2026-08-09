@@ -393,16 +393,7 @@ class DistributedDataParallel(_BaseDataParallel):
                               f"has_hook={hasattr(param,'register_grad_accum_hook')} "
                               f"bwd_pf={getattr(param,'_need_weight_prefetch_bwd',None)} "
                               f"multi={getattr(param,'_gtp_multi_use',None)}", flush=True)
-                    # A multi-use parameter (MTP consumes the embedding twice) opts out of
-                    # both the bwd all-gather and the GTP wgrad reduce-scatter, so
-                    # _handle_megatron_grad_accum never runs for it. Taking the GTP branch
-                    # would hand grad-ready to a driver that never fires while also skipping
-                    # autograd's AccumulateGrad — the grad is then written by nobody and
-                    # main_grad stays uninitialized (iteration-1 `grad norm: nan`).
-                    # Dispatch on whether GTP actually drives the wgrad, not on remat alone.
-                    if getattr(param, 'is_gtp_weight_remat', False) and not getattr(
-                        param, '_gtp_multi_use', False
-                    ) and hasattr(
+                    if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
                         param, 'register_grad_accum_hook'
                     ):
                         # GTP_remat computes wgrad via an async reduce-scatter, so autograd's
