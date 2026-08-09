@@ -1866,6 +1866,20 @@ class GTPShardedParam(torch.nn.Parameter):
         # cannot, since CUDA graphs require stable buffer addresses across replay.
         poolable = not _chain_is_graphed(self.chain_id)
 
+        if self._wgrad_rs_handle is not None:
+            # This weight already has a reduce-scatter in flight from an EARLIER use in the same
+            # backward: a parameter consumed twice in one forward (MTP routing its logits through
+            # the shared lm-head) reaches this method from two autograd nodes. The state that
+            # carries a collective is single-valued — ``_wgrad_rs_handle``, the cache buffer
+            # behind ``_rs_ticket``, and ``_wgrad_input_bufs`` — so starting the second reduction
+            # while the first is still in flight makes both write the same buffer and silently
+            # drops one contribution. Drain the in-flight one and fold it into main_grad first;
+            # the ticket then hands the same buffer back for this use. ``_already_finalized``
+            # must be cleared with it: it stops a cascade from finalizing a weight twice, but a
+            # weight used twice must finalize twice.
+            self._wait_reduce_scatter(finalize_grad=True)
+            self._already_finalized = False
+
         # prev_w/next_w primarily encode the forward AG-prefetch chain. A custom-backward
         # weight (e.g. the embedding, or GDN's fused path) may still drive the next weight's
         # forward prefetch while being an invalid wgrad-cascade neighbour: its autograd node
