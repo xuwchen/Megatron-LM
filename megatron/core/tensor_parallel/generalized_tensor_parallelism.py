@@ -2003,6 +2003,13 @@ class GTPShardedParam(torch.nn.Parameter):
             if len(weights) == 1:
                 weights[0].main_grad.add_(reduced_wgrads[0])
             else:
+                if _GTP_RS_COUNT is not None:
+                    import torch as _t
+                    for _p, _w in zip(weights, reduced_wgrads):
+                        _k = getattr(_p, "_gtp_dbg_name", "?")
+                        _fin = bool(_t.isfinite(_w).all())
+                        _c, _bad = _GTP_RS_COUNT.get(_k, (0, 0))
+                        _GTP_RS_COUNT[_k] = (_c + 1, _bad + (0 if _fin else 1))
                 torch._foreach_add_([p.main_grad for p in weights], reduced_wgrads)
             nvtx_range_pop(f"{nvtx_label}.gtp_wgrad_accum")
             result = [self._handle_megatron_grad_accum(p) for p in weights]
