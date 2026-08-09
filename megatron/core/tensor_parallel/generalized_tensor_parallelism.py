@@ -1961,7 +1961,8 @@ class GTPShardedParam(torch.nn.Parameter):
         poolable = not _chain_is_graphed(self.chain_id)
 
         if _GTP_RS_COUNT is not None and any(
-            "embedding" in str(getattr(w, "_gtp_dbg_name", "")) for w in self._weights
+            getattr(w, "main_grad", None) is not None and w.main_grad.numel() == 31784960
+            for w in self._weights
         ):
             _c, _ = _GTP_RS_COUNT.get("ENTRY", (0, 0))
             _GTP_RS_COUNT["ENTRY"] = (_c + 1, 0)
