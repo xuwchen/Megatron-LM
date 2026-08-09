@@ -2353,9 +2353,9 @@ def wait_async_comms(
                 for w in param._weights:
                     w._set_rs_state(GTPWeightState.NONE)
                     wgrad_rs = cache.get(w._rs_ticket)
-                    if _GTP_RS_COUNT is not None and "embedding" in str(
-                        getattr(w, "_gtp_dbg_name", "")
-                    ):
+                    if _GTP_RS_COUNT is not None and getattr(
+                        w, "main_grad", None
+                    ) is not None and w.main_grad.numel() == 31784960:
                         import torch as _t
                         _t.cuda.synchronize()
                         _fw = _t.isfinite(wgrad_rs)
