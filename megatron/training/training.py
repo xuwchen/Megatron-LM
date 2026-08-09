@@ -2962,7 +2962,10 @@ def train_step(
                         if not globals().get("_GTP_LAYOUT_DONE"):
                             globals()["_GTP_LAYOUT_DONE"] = True
                             _e0 = _g.data_ptr(); _e1 = _e0 + _g.numel() * _g.element_size()
-                            print(f"[LAYOUT] emb [{_e0},{_e1}) numel={_g.numel()}", flush=True)
+                            print(f"[LAYOUT] emb [{_e0},{_e1}) numel={_g.numel()} "
+                                  f"param_shape={tuple(_q.shape)} param_numel={_q.numel()} "
+                                  f"shards={getattr(_q,'tensor_parallel_num_weight_shards',None)} "
+                                  f"remat={getattr(_q,'is_gtp_weight_remat',None)}", flush=True)
                             for _mm in (model if isinstance(model, list) else [model]):
                                 for _nn, _qq in _mm.named_parameters():
                                     _gg = getattr(_qq, "main_grad", None)
