@@ -500,6 +500,7 @@ class DistributedDataParallel(_BaseDataParallel):
             ):
                 _g = getattr(param, "main_grad", None)
                 if _g is not None:
+                    torch.cuda.synchronize()
                     _f = torch.isfinite(_g)
                     param._gtp_dbg_fires = getattr(param, "_gtp_dbg_fires", 0) + 1
                     print(f"[HOOK] fire#{param._gtp_dbg_fires} "
