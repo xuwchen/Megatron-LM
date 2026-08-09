@@ -2959,6 +2959,20 @@ def train_step(
                         if _g is None:
                             continue
                         _f = _t.isfinite(_g)
+                        if not globals().get("_GTP_LAYOUT_DONE"):
+                            globals()["_GTP_LAYOUT_DONE"] = True
+                            _e0 = _g.data_ptr(); _e1 = _e0 + _g.numel() * _g.element_size()
+                            print(f"[LAYOUT] emb [{_e0},{_e1}) numel={_g.numel()}", flush=True)
+                            for _mm in (model if isinstance(model, list) else [model]):
+                                for _nn, _qq in _mm.named_parameters():
+                                    _gg = getattr(_qq, "main_grad", None)
+                                    if _gg is None or "embedding.word_embeddings" in _nn:
+                                        continue
+                                    _a0 = _gg.data_ptr()
+                                    _a1 = _a0 + _gg.numel() * _gg.element_size()
+                                    if _a0 < _e1 and _e0 < _a1:
+                                        print(f"[LAYOUT] OVERLAP {_nn} [{_a0},{_a1}) "
+                                              f"numel={_gg.numel()}", flush=True)
                         print(f"[POST-FB] nan={int(_t.isnan(_g).sum())} "
                               f"absmax={float(_g[_f].abs().max()) if int(_f.sum()) else -1}",
                               flush=True)
