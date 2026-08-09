@@ -503,7 +503,10 @@ class DistributedDataParallel(_BaseDataParallel):
                     torch.cuda.synchronize()
                     _f = torch.isfinite(_g)
                     param._gtp_dbg_fires = getattr(param, "_gtp_dbg_fires", 0) + 1
-                    print(f"[HOOK] fire#{param._gtp_dbg_fires} "
+                    import traceback as _tb
+                    _st = _tb.extract_stack()[-4:-1]
+                    _src = "|".join(f"{f.name}:{f.lineno}" for f in _st)
+                    print(f"[HOOK] src={_src} fire#{param._gtp_dbg_fires} "
                           f"nan={int(torch.isnan(_g).sum())} "
                           f"absmax={float(_g[_f].abs().max()) if int(_f.sum()) else -1}",
                           flush=True)
