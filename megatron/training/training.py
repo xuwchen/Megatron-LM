@@ -2969,7 +2969,11 @@ def train_step(
                                   f"dbgname={hasattr(_q,'_gtp_dbg_name')} "
                                   f"is_gtp={__import__('megatron.core.tensor_parallel.generalized_tensor_parallelism', fromlist=['is_gtp_param']).is_gtp_param(_q)} "
                                   f"chain={getattr(_q,'chain_id',None)} "
-                                  f"nweights={len(getattr(_q,'_weights',[]) or [])}", flush=True)
+                                  f"nweights={len(getattr(_q,'_weights',[]) or [])} "
+                                  f"remat_size={getattr(_q,'gtp_remat_size',None)} "
+                                  f"w0_shape={tuple(getattr(_q,'_weights',[None])[0].shape) if getattr(_q,'_weights',None) else None} "
+                                  f"w0_mg={getattr(getattr(_q,'_weights',[None])[0],'main_grad',None).numel() if getattr(_q,'_weights',None) and getattr(getattr(_q,'_weights',[None])[0],'main_grad',None) is not None else None}",
+                                  flush=True)
                             for _mm in (model if isinstance(model, list) else [model]):
                                 for _nn, _qq in _mm.named_parameters():
                                     _gg = getattr(_qq, "main_grad", None)
