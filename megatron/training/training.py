@@ -2998,6 +2998,24 @@ def train_step(
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    if int(__import__("os").environ.get("GTP_DIAG_RSCOUNT", "0")):
+        import torch as _t
+        _r = _t.distributed.get_rank() if _t.distributed.is_initialized() else 0
+        if _r == 0:
+            for _m in (model if isinstance(model, list) else [model]):
+                for _n, _q in _m.named_parameters():
+                    if "embedding" not in _n:
+                        continue
+                    _g = getattr(_q, "main_grad", None)
+                    if _g is None:
+                        print(f"[MG] {_n} main_grad=None", flush=True)
+                    else:
+                        _f = _t.isfinite(_g)
+                        print(f"[MG] {_n} numel={_g.numel()} finite={int(_f.sum())} "
+                              f"nan={int(_t.isnan(_g).sum())} zero={int((_g==0).sum())} "
+                              f"absmax={float(_g[_f].abs().max()) if int(_f.sum()) else -1}",
+                              flush=True)
+
     if int(__import__("os").environ.get("GTP_DIAG_GRADSCAN", "0")):
         import torch as _t
         _r = _t.distributed.get_rank() if _t.distributed.is_initialized() else 0
