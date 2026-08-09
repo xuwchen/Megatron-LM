@@ -1907,7 +1907,14 @@ class GTPShardedParam(torch.nn.Parameter):
 
         # Wait for last reduce scatter if it was async
         # Currently only support reduce scattering in reverse order
-        if GTP_CONFIG.async_reduction and self.next_w is not None:
+        # Same boundary rule as has_wgrad_predecessor above: do not finalize across a
+        # custom-backward neighbour, which may not have issued an RS at all.
+        has_wgrad_successor = (
+            self.next_w is not None
+            and self._need_weight_prefetch_bwd
+            and self.next_w._need_weight_prefetch_bwd
+        )
+        if GTP_CONFIG.async_reduction and has_wgrad_successor:
             self.next_w._wait_reduce_scatter()
 
             if getattr(self.next_w, "_already_finalized", False):
