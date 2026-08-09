@@ -609,6 +609,22 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
 
+    def _gtp_dbg(self, tag):
+        import os
+        if not os.environ.get("GTP_DIAG_RSCOUNT"):
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        for _n, _q in self.module.named_parameters():
+            if "embedding.word_embeddings" not in _n:
+                continue
+            _g = getattr(_q, "main_grad", None)
+            if _g is None:
+                continue
+            _f = torch.isfinite(_g)
+            print(f"[DDP:{tag}] nan={int(torch.isnan(_g).sum())} "
+                  f"absmax={float(_g[_f].abs().max()) if int(_f.sum()) else -1}", flush=True)
+
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
@@ -618,8 +634,11 @@ class DistributedDataParallel(_BaseDataParallel):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
+        self._gtp_dbg("pre-finish-sync")
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
+
+        self._gtp_dbg("post-finish-sync")
 
     def free_overlap_buffers(self):
         """Free overlap param-gather GPU buffers across all bucket groups."""
