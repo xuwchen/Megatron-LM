@@ -1711,6 +1711,14 @@ class GTPShardedParam(torch.nn.Parameter):
                         wgrad_rs = cache.get(w._rs_ticket)
                         w.main_grad.add_(wgrad_rs)
                         cache.release(w._rs_ticket)
+                        # A multi-use parameter (MTP consumes the embedding twice) is
+                        # reduce-scattered once per use. Clearing the ticket forces the next
+                        # use to reserve a fresh slot; leaving it set makes that use read a
+                        # released ticket whose buffer the pool has already handed out.
+                        # Embedding opts out of the bwd AG entirely, so the RS path is the
+                        # only place its wgrad can be corrupted.
+                        if getattr(w, "_gtp_multi_use", False):
+                            w._rs_ticket = None
                     # Fire grad-ready AFTER all adds (separate loop so a bucket-completing
                     # grad-ready can't dispatch the RS before a sibling's add). With autograd
                     # grad-ready suppressed for GTP params (DDP register_grad_accum_hook), this
