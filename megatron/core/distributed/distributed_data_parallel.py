@@ -363,7 +363,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # Accumulation function for the gradients need to be stored so they
         # don't go out of scope.
         self.grad_accs = []
-        for param in self.module.parameters():
+        for name, param in self.module.named_parameters():
             if param.requires_grad:
                 # When delay_wgrad_compute is True and the param is marked with
                 # skip_backward_post_hook, register the backward post hook for its module
@@ -386,6 +386,11 @@ class DistributedDataParallel(_BaseDataParallel):
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                    if __import__("os").environ.get("GTP_DIAG_RSCOUNT") and "embedding" in str(name):
+                        print(f"[FLAGS] {name} remat={getattr(param,'is_gtp_weight_remat',None)} "
+                              f"has_hook={hasattr(param,'register_grad_accum_hook')} "
+                              f"bwd_pf={getattr(param,'_need_weight_prefetch_bwd',None)} "
+                              f"multi={getattr(param,'_gtp_multi_use',None)}", flush=True)
                     if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
                         param, 'register_grad_accum_hook'
                     ):
