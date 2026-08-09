@@ -2848,6 +2848,20 @@ def train_step(
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
+        if int(__import__("os").environ.get("GTP_DIAG_RSCOUNT", "0")):
+            import torch as _t
+            if (not _t.distributed.is_initialized()) or _t.distributed.get_rank() == 0:
+                for _m in model:
+                    for _n, _q in _m.named_parameters():
+                        if "embedding" not in _n:
+                            continue
+                        _g = getattr(_q, "main_grad", None)
+                        if _g is not None:
+                            _f = _t.isfinite(_g)
+                            print(f"[MG-PRE] {_n} nan={int(_t.isnan(_g).sum())} "
+                                  f"nonzero={int((_g!=0).sum())} "
+                                  f"absmax={float(_g[_f].abs().max()) if int(_f.sum()) else -1}",
+                                  flush=True)
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
