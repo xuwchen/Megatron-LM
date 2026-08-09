@@ -161,6 +161,24 @@ def _get_position_embedding_weight(model_module: torch.nn.Module) -> torch.nn.Pa
     return getattr(model_module, 'position_embeddings').weight  # type: ignore[attr-defined]
 
 
+def _gtp_dbg_emb(model, tag):
+    import os, torch
+    if not os.environ.get("GTP_DIAG_RSCOUNT"):
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    for _m in model:
+        for _n, _q in _m.named_parameters():
+            if "embedding.word_embeddings" not in _n:
+                continue
+            _g = getattr(_q, "main_grad", None)
+            if _g is None:
+                continue
+            _f = torch.isfinite(_g)
+            print(f"[FMG:{tag}] nan={int(torch.isnan(_g).sum())} "
+                  f"absmax={float(_g[_f].abs().max()) if int(_f.sum()) else -1}", flush=True)
+
+
 def _allreduce_word_embedding_grads(
     model: List[torch.nn.Module],
     config: TransformerConfig,
@@ -192,6 +210,7 @@ def _allreduce_word_embedding_grads(
             assert pp_group is None
             pp_group = parallel_state.get_pipeline_model_parallel_group()
 
+    _gtp_dbg_emb(model, "pre-wordemb-ar")
     _allreduce_embedding_grad(
         model,
         embd_group,
@@ -528,6 +547,7 @@ def finalize_model_grads(
     embedding grads across first and last pipeline stages (if not tied),
     scale gradients by `num_tokens`.
     """
+    _gtp_dbg_emb(model, "fmg-enter")
 
     config = get_model_config(model[0])
     tp_dp_cp_group = None
