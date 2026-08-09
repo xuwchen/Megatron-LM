@@ -179,6 +179,9 @@ table-specific learning-rate and weight-decay override still forms a separate Ad
 group. MFSDP replacement DTensors preserve both the authoritative `allreduce=False` expert-DP
 ownership marker and `is_engram_embedding=True`, including parameters rematerialized from meta
 initialization, so table ownership and the optimizer override survive parameter replacement.
+Each table also receives an independent MFSDP bucket. Its EP-owned rows are therefore sliced
+directly across expert-DP instead of being flattened beside unrelated MoE expert weights, which
+could skew the entire table payload onto one expert-DP rank.
 
 ## Distributed checkpointing
 

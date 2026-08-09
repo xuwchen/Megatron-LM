@@ -1466,14 +1466,18 @@ def _get_parameter_groups(
 
     def _does_param_require_new_bucket(param):
         """
-        Split shared embedding parameters into separate bucket if using distributed
-        optimizer that makes use of reduce-scatters instead of all-reduces.
-        This ensures that the first and last pipeline stage partition optimizer state
-        for the shared embedding parameters the same way across DP replicas, allowing
-        the DP reduce-scatter to be before the embedding all-reduce.
+        Split parameters whose ownership semantics require an independent bucket.
+
+        Shared embeddings need matching optimizer-state partitions on the first and
+        last pipeline stage. Engram tables need each EP-owned row shard to be split
+        across expert-DP instead of sharing one flat bucket with unrelated MoE expert
+        weights, which can otherwise place the complete table payload on one rank.
         """
         return (
-            getattr(param, "shared_embedding", False)
+            (
+                getattr(param, "shared_embedding", False)
+                or getattr(param, "is_engram_embedding", False)
+            )
             and policy.data_parallel_sharding_strategy != "no_shard"
         )
 
@@ -1553,10 +1557,9 @@ def _get_parameter_groups(
         }
         for param in group.params:
             if _does_param_require_new_bucket(param):
-                # We may share the embedding model weight and the final output layer,
-                # which will cause the gradient of this parameter to be generated twice.
-                # To reduce and identify both gradients of these parameters, create a new
-                # bucket for every instance of these parameters in our parameter groups.
+                # Create a distinct bucket for every parameter carrying special
+                # ownership semantics. Shared embeddings can generate gradients twice;
+                # Engram tables must be independently sliced over expert-DP.
                 if len(bucket) > 0:
                     # Append the current bucket to the list of bucket groups.
                     bucket_groups.append(ParameterGroup(bucket, **basic_attrs))

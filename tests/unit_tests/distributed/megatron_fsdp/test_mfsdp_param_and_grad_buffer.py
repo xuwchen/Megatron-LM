@@ -102,3 +102,36 @@ def test_allreduce_false_parameter_uses_expert_fsdp_bucket_without_moe_name():
     assert _is_expert_parallel_parameter("engram.embedding.weight", module.engram.embedding.weight)
     assert len(parameter_groups) == 1
     assert parameter_groups[0].is_expert_param
+
+
+def test_engram_tables_use_independent_expert_fsdp_buckets():
+    """Engram payload cannot land entirely beside unrelated MoE weights on one expert-DP rank."""
+    module = torch.nn.Module()
+    module.layer = torch.nn.Module()
+    module.layer.experts = torch.nn.ParameterDict(
+        {"weight": torch.nn.Parameter(torch.empty(16, 4))}
+    )
+    module.layer.experts.weight.allreduce = False
+    module.engram = torch.nn.Module()
+    module.engram.embedding = torch.nn.Module()
+    module.engram.embedding.tables = torch.nn.ParameterList(
+        [torch.nn.Parameter(torch.empty(16, 4)) for _ in range(2)]
+    )
+    for table in module.engram.embedding.tables:
+        table.allreduce = False
+        table.is_engram_embedding = True
+
+    parameter_groups, param_to_group, _ = _get_parameter_groups(
+        module,
+        BucketingPolicy(
+            suggested_bucket_size=None,
+            data_parallel_sharding_strategy="optim_grads_params",
+        ),
+        meta_device_init_fp8_params={},
+    )
+
+    expert_weight_group = param_to_group[module.layer.experts.weight]
+    table_groups = [param_to_group[table] for table in module.engram.embedding.tables]
+    assert len(set([expert_weight_group, *table_groups])) == 3
+    assert all(parameter_groups[group_id].is_expert_param for group_id in table_groups)
+    assert all(len(parameter_groups[group_id].params) == 1 for group_id in table_groups)
