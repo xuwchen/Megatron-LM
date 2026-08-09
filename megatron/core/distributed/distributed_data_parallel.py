@@ -495,6 +495,23 @@ class DistributedDataParallel(_BaseDataParallel):
         def hook(*unused):
             if is_graph_capturing():
                 return
+            if __import__("os").environ.get("GTP_DIAG_RSCOUNT") and not getattr(
+                self, "_gtp_culprit_found", False
+            ):
+                _emb = getattr(self, "_gtp_emb_param", None)
+                if _emb is None:
+                    for _n2, _p2 in self.module.named_parameters():
+                        if "embedding.word_embeddings" in _n2:
+                            self._gtp_emb_param = _emb = _p2
+                            break
+                _eg = getattr(_emb, "main_grad", None) if _emb is not None else None
+                if _eg is not None and bool(torch.isnan(_eg).any()):
+                    self._gtp_culprit_found = True
+                    _who = getattr(param, "_gtp_dbg_name", None) or getattr(
+                        param, "_gtp_dbg_is_emb", "?"
+                    )
+                    print(f"[CULPRIT] embedding corrupt first seen at hook of {_who} "
+                          f"shape={tuple(param.shape)}", flush=True)
             if __import__("os").environ.get("GTP_DIAG_RSCOUNT") and getattr(
                 param, "_gtp_dbg_is_emb", False
             ):
