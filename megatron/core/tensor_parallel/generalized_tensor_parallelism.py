@@ -1992,7 +1992,11 @@ class GTPShardedParam(torch.nn.Parameter):
             result = [self._handle_megatron_grad_accum(p) for p in weights]
 
             # Recycle the pool-owned INPUTS, never the shard-sized collective outputs.
-            if poolable:
+            # A multi-use parameter (MTP consumes the embedding twice) must NOT recycle:
+            # the second backward use still references the buffer the first use would
+            # hand back, so another param checking out the same slot corrupts it.
+            multi_use = any(getattr(p, "_gtp_multi_use", False) for p in weights)
+            if poolable and not multi_use:
                 for buf in wgrad_inputs:
                     _wgrad_pool_put(buf)
             ret = result if batched else result[0]
