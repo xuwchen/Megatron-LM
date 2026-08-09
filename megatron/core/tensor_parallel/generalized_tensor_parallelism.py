@@ -1960,6 +1960,14 @@ class GTPShardedParam(torch.nn.Parameter):
         # cannot, since CUDA graphs require stable buffer addresses across replay.
         poolable = not _chain_is_graphed(self.chain_id)
 
+        if _GTP_RS_COUNT is not None and any(
+            "embedding" in str(getattr(w, "_gtp_dbg_name", "")) for w in self._weights
+        ):
+            _c, _ = _GTP_RS_COUNT.get("ENTRY", (0, 0))
+            _GTP_RS_COUNT["ENTRY"] = (_c + 1, 0)
+            print(f"[ENTRY] emb#{_c+1} rs_handle={self._wgrad_rs_handle is not None} "
+                  f"tickets={[w._rs_ticket is not None for w in self._weights]} "
+                  f"finalized={getattr(self, '_already_finalized', None)}", flush=True)
         if self._wgrad_rs_handle is not None:
             # This weight already has a reduce-scatter in flight from an EARLIER use in the same
             # backward: a parameter consumed twice in one forward (MTP routing its logits through
