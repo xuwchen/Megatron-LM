@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Optional, Union
 
@@ -42,7 +42,18 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.utils import (
+    deprecate_inference_params,
+    make_tp_sharded_tensor_for_checkpoint,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
+
+if HAVE_GTP:
+    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+else:
+    is_gtp_param = None
 
 try:
     from fla.modules.convolution import causal_conv1d
@@ -1056,6 +1067,46 @@ class GatedDeltaNet(MegatronModule):
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
         in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
+        # The semantic [q|k|v|z|beta|alpha] boundaries can cross GTP shard boundaries. Gather the
+        # physical GTP shards back to the logical TP-local projection before splitting so the
+        # checkpoint layout stays identical to non-GTP and independent of the save-time topology.
+        in_proj_gtp_remat_size = getattr(self.in_proj.weight, "gtp_remat_size", 1)
+        in_proj_uses_gtp = (
+            in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight)
+        )
+        if in_proj_uses_gtp:
+            gtp_remat_group = self.in_proj.weight.group
+            gtp_rank = torch.distributed.get_rank(gtp_remat_group)
+            # The submodule checkpoint helper has already converted native-FP8 GTP data to BF16.
+            # This all-gather runs on every sharded_state_dict() call — including load-time
+            # target-dict construction — which is safe (all GTP peers build the dict together)
+            # but not free; keep it out of any per-iteration path.
+            local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
+            gathered = torch.empty(
+                (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
+                dtype=local.dtype,
+                device=local.device,
+            )
+            torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_remat_group)
+            if gathered.shape[0] > in_proj_dim_local_tp:
+                # Strip GTP alignment padding (always at the tail of the last shard).
+                gathered = gathered[:in_proj_dim_local_tp].contiguous()
+
+            # The gathered value is replicated across the GTP peers AND across DP/CP. Fold the
+            # GTP rank into the replica id explicitly so writer election stays correct even
+            # when metadata['dp_cp_group'] is a GTP-excluded group (explicit pg_collection
+            # grids pass pg_collection.dp_cp, where GTP peers share a rank).
+            dp_cp_rank = torch.distributed.get_rank(metadata['dp_cp_group'])
+            sharded_state_dict[f"{prefix}in_proj.weight"] = make_tp_sharded_tensor_for_checkpoint(
+                gathered,
+                f"{prefix}in_proj.weight",
+                tp_axis=0,
+                replica_id=(0, gtp_rank, dp_cp_rank),
+                prepend_offsets=sharded_offsets,
+                tp_group=tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
+            )
+
         assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
             in_proj_dim_local_tp,
             sharded_state_dict[f"{prefix}in_proj.weight"],
@@ -1074,6 +1125,42 @@ class GatedDeltaNet(MegatronModule):
             ["query", "key", "value", "z", "beta", "alpha"],
             0,
         )
+
+        # Loading is the inverse of the save-time gather above. The default factory merge
+        # concatenates the six logical checkpoint tensors into one unpadded TP-local projection;
+        # pad it exactly as GTP initialization does, then select this rank's physical shard.
+        if in_proj_uses_gtp:
+            factory = sharded_state_dict[f"{prefix}in_proj.weight"]
+            gtp_local_size = self.in_proj.weight.data.size(0)
+            original_merge_fn = factory.merge_fn
+
+            @torch.no_grad()
+            def _gtp_slice_after_cat(
+                sub_state_dict,
+                _orig=original_merge_fn,
+                _rank=gtp_rank,
+                _size=gtp_local_size,
+                _gtp_remat_size=in_proj_gtp_remat_size,
+            ):
+                full = _orig(sub_state_dict)
+                if full.dim() != 2:
+                    # Fail loudly instead of padding/slicing a flattened buffer: only the
+                    # unflattened 2-D model-weight factory is supported (optimizer state
+                    # resolves through the per-shard rebuild, never through this merge).
+                    raise NotImplementedError(
+                        "GTP in_proj merge expects the unflattened 2-D projection; got "
+                        f"a {full.dim()}-D tensor (flattened factories are unsupported)"
+                    )
+                aligned_total = _size * _gtp_remat_size
+                pad_rows = aligned_total - full.shape[0]
+                if pad_rows > 0:
+                    full = F.pad(full, (0, 0, 0, pad_rows))
+                start = _rank * _size
+                return full[start : start + _size].contiguous()
+
+            sharded_state_dict[f"{prefix}in_proj.weight"] = replace(
+                factory, merge_fn=_gtp_slice_after_cat
+            )
 
         conv_layer_name_list = ["conv1d.weight"]
         assert (
