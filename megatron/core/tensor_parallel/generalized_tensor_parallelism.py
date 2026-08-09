@@ -2344,6 +2344,18 @@ def wait_async_comms(
                 for w in param._weights:
                     w._set_rs_state(GTPWeightState.NONE)
                     wgrad_rs = cache.get(w._rs_ticket)
+                    if _GTP_RS_COUNT is not None and "embedding" in str(
+                        getattr(w, "_gtp_dbg_name", "")
+                    ):
+                        import torch as _t
+                        _t.cuda.synchronize()
+                        _fw = _t.isfinite(wgrad_rs)
+                        _c, _ = _GTP_RS_COUNT.get("FB", (0, 0))
+                        _GTP_RS_COUNT["FB"] = (_c + 1, 0)
+                        print(f"[FB] emb fallback#{_c+1} "
+                              f"src_nan={int(_t.isnan(wgrad_rs).sum())} "
+                              f"src_absmax={float(wgrad_rs[_fw].abs().max()) if int(_fw.sum()) else -1} "
+                              f"dst_nan={int(_t.isnan(w.main_grad).sum())}", flush=True)
                     w.main_grad.add_(wgrad_rs)
                     cache.release(w._rs_ticket)
                     if hasattr(w, "grad_added_to_main_grad"):
