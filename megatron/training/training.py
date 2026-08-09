@@ -2947,6 +2947,22 @@ def train_step(
             p2p_communicator=p2p_communicator,
             pg_collection=pg_collection,
         )
+        if int(__import__("os").environ.get("GTP_DIAG_RSCOUNT", "0")):
+            import torch as _t
+            _t.cuda.synchronize()
+            if (not _t.distributed.is_initialized()) or _t.distributed.get_rank() == 0:
+                for _m in (model if isinstance(model, list) else [model]):
+                    for _n, _q in _m.named_parameters():
+                        if "embedding.word_embeddings" not in _n:
+                            continue
+                        _g = getattr(_q, "main_grad", None)
+                        if _g is None:
+                            continue
+                        _f = _t.isfinite(_g)
+                        print(f"[POST-FB] nan={int(_t.isnan(_g).sum())} "
+                              f"absmax={float(_g[_f].abs().max()) if int(_f.sum()) else -1}",
+                              flush=True)
+
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
