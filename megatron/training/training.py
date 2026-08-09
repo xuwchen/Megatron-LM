@@ -2977,7 +2977,12 @@ def train_step(
                             for _mm in (model if isinstance(model, list) else [model]):
                                 for _nn, _qq in _mm.named_parameters():
                                     _gg = getattr(_qq, "main_grad", None)
-                                    if _gg is None or "embedding.word_embeddings" in _nn:
+                                    if _gg is None:
+                                        continue
+                                    if _gg.data_ptr() == _e0 and _nn != _n:
+                                        print(f"[ALIAS] {_nn} shares storage with {_n} "
+                                              f"numel={_gg.numel()}", flush=True)
+                                    if "embedding.word_embeddings" in _nn:
                                         continue
                                     _a0 = _gg.data_ptr()
                                     _a1 = _a0 + _gg.numel() * _gg.element_size()
