@@ -386,6 +386,8 @@ class DistributedDataParallel(_BaseDataParallel):
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                    if "embedding" in str(name):
+                        param._gtp_dbg_is_emb = True
                     if __import__("os").environ.get("GTP_DIAG_RSCOUNT") and "embedding" in str(name):
                         print(f"[FLAGS] {name} remat={getattr(param,'is_gtp_weight_remat',None)} "
                               f"has_hook={hasattr(param,'register_grad_accum_hook')} "
@@ -502,6 +504,17 @@ class DistributedDataParallel(_BaseDataParallel):
         def hook(*unused):
             if is_graph_capturing():
                 return
+            if __import__("os").environ.get("GTP_DIAG_RSCOUNT") and getattr(
+                param, "_gtp_dbg_is_emb", False
+            ):
+                _g = getattr(param, "main_grad", None)
+                if _g is not None:
+                    _f = torch.isfinite(_g)
+                    param._gtp_dbg_fires = getattr(param, "_gtp_dbg_fires", 0) + 1
+                    print(f"[HOOK] fire#{param._gtp_dbg_fires} "
+                          f"nan={int(torch.isnan(_g).sum())} "
+                          f"absmax={float(_g[_f].abs().max()) if int(_f.sum()) else -1}",
+                          flush=True)
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
