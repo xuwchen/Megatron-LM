@@ -47,6 +47,29 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+_FSDP_PARAMETER_ATTRIBUTES = (
+    "requires_grad",
+    "sequence_parallel",
+    "shared",
+    "tensor_model_parallel",
+    "partition_dim",
+    "partition_stride",
+    "allreduce",
+    "is_engram_embedding",
+    "is_embedding_or_output_parameter",
+    "is_embedding_parameter",
+    "_tensor_parallel_mode",
+    "_megatron_fsdp_model",
+)
+
+
+def _copy_fsdp_parameter_attributes(destination, source):
+    """Copy parameter metadata needed after MFSDP materializes a replacement parameter."""
+    for attr_name in _FSDP_PARAMETER_ATTRIBUTES:
+        if hasattr(source, attr_name):
+            setattr(destination, attr_name, getattr(source, attr_name))
+
+
 def _same_tensor_view(a: Optional[torch.Tensor], b: torch.Tensor) -> bool:
     if a is None:
         return False
@@ -2825,9 +2848,7 @@ class ParamAndGradBuffer:
 
             new_param.requires_grad_(old_param.requires_grad)
 
-            for tp_attr in ["_tensor_parallel_mode"]:
-                if getattr(old_param, tp_attr, None) is not None:
-                    setattr(new_param, tp_attr, getattr(old_param, tp_attr))
+            _copy_fsdp_parameter_attributes(new_param, old_param)
 
             # For FSDP with delayed_wgrad_compute, `skip_backward_post_hook` needs
             # to be reset on new param for correct grad accumulation of wgrad computation.
@@ -2994,20 +3015,7 @@ class ParamAndGradBuffer:
 
                 def set_param_attribute_closure(param, orig_param):
                     def set_param_attribute():
-                        for attr_name in [
-                            "requires_grad",
-                            "sequence_parallel",
-                            "shared",
-                            "tensor_model_parallel",
-                            "partition_dim",
-                            "partition_stride",
-                            "is_embedding_or_output_parameter",
-                            "is_embedding_parameter",
-                            "_tensor_parallel_mode",
-                            "_megatron_fsdp_model",
-                        ]:
-                            if hasattr(orig_param, attr_name):
-                                setattr(param, attr_name, getattr(orig_param, attr_name))
+                        _copy_fsdp_parameter_attributes(param, orig_param)
 
                     return set_param_attribute
 

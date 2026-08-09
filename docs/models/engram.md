@@ -176,7 +176,9 @@ expert-parallel parameters are rejected with DistributedOptimizer, and mixed opt
 rejected with Megatron FSDP, because those paths cannot safely split their shared gradient
 buffers. Megatron FSDP therefore requires the model optimizer itself to be Adam; the
 table-specific learning-rate and weight-decay override still forms a separate Adam parameter
-group.
+group. MFSDP replacement DTensors preserve both the authoritative `allreduce=False` expert-DP
+ownership marker and `is_engram_embedding=True`, including parameters rematerialized from meta
+initialization, so table ownership and the optimizer override survive parameter replacement.
 
 ## Distributed checkpointing
 
@@ -223,8 +225,11 @@ also write per-rank JSONL records after model/DDP construction, optimizer constr
 optimizer step, and the final steady-state step. The records contain exact BF16 table, FP32 master
 parameter, and named Adam-state tensor bytes plus CUDA allocated/reserved/peak counters and the
 TP/PP/EP/dense-DP/expert-DP group coordinates. This separates EP row ownership from any further
-distributed-optimizer sharding over expert-DP. `--engram-verify-training` writes the same
-lightweight JSONL residency records without enabling allocator history or pickle snapshots.
+distributed-optimizer sharding over expert-DP. Under MFSDP, the BF16 count comes directly from
+each table's resident model-weight-buffer intersection and the remaining tensors come from their
+optimizer-owned local shards; DTensor logical shapes are never counted as resident storage.
+`--engram-verify-training` writes the same lightweight JSONL residency records without enabling
+allocator history or pickle snapshots.
 
 ## Supported and deferred combinations
 
