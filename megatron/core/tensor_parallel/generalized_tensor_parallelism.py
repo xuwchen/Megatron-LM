@@ -231,6 +231,9 @@ def _classify_param_chain(param_name: str) -> str:
     return U
 
 
+_GTP_RS_COUNT = {} if __import__("os").environ.get("GTP_DIAG_RSCOUNT") else None
+
+
 def mark_gtp_multi_use_boundary(param) -> None:
     """Declare that ``param`` is consumed more than once in a single forward.
 
@@ -272,6 +275,7 @@ def classify_gtp_chains(model) -> None:
             # cascade running through a twice-used param would finalize it from the wrong side.
             param._need_weight_prefetch = False
             param._need_weight_prefetch_bwd = False
+        param._gtp_dbg_name = name
         target = _classify_param_chain(name)
         if param.prefetch_initialized and param.chain_id != target:
             conflicts.append((name, param.chain_id, target))
@@ -1709,6 +1713,10 @@ class GTPShardedParam(torch.nn.Parameter):
                     cache = get_global_GTP_cache()
                     for w in self._weights:
                         wgrad_rs = cache.get(w._rs_ticket)
+                        if _GTP_RS_COUNT is not None:
+                            _GTP_RS_COUNT[getattr(w, "_gtp_dbg_name", "?")] = (
+                                _GTP_RS_COUNT.get(getattr(w, "_gtp_dbg_name", "?"), 0) + 1
+                            )
                         w.main_grad.add_(wgrad_rs)
                         cache.release(w._rs_ticket)
                         # A multi-use parameter (MTP consumes the embedding twice) is

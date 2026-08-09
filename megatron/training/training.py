@@ -3005,6 +3005,14 @@ def train_step(
               if getattr(q,"main_grad",None) is not None and not _t.isfinite(q.main_grad).all()]
         if _r==0: print(f"[GRADSCAN] bad={_bad[:3]} total={len(_bad)}", flush=True)
 
+    if int(__import__("os").environ.get("GTP_DIAG_RSCOUNT", "0")):
+        import torch as _t
+        from megatron.core.tensor_parallel import generalized_tensor_parallelism as _g
+        _r = _t.distributed.get_rank() if _t.distributed.is_initialized() else 0
+        if _r == 0 and _g._GTP_RS_COUNT is not None:
+            print(f"[RSCOUNT] {dict(sorted(_g._GTP_RS_COUNT.items()))}", flush=True)
+            _g._GTP_RS_COUNT.clear()
+
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
