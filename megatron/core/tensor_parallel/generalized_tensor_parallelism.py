@@ -1291,7 +1291,13 @@ class GTPShardedParam(torch.nn.Parameter):
                     cache.release(p._ag_ticket_fwd)
                 out_buffers.append(cache.get(p._ag_ticket_fwd))
             else:
-                if p._ag_ticket_bwd is None:
+                # A multi-use parameter must not reuse its ticket: the cache key is evaluated at
+                # reserve time, so a ticket cached on the param pins ONE buffer for every use.
+                # MTP keeps several backward uses of the output layer live at once, and the
+                # later gather then overwrites the weight an earlier dgrad is still reading —
+                # "clobbering breaks the dgrad consume", which autograd anomaly detection
+                # reports as _LinearBackward returning NaN in its 0th output. Reserve per use.
+                if p._ag_ticket_bwd is None or getattr(p, "_gtp_multi_use", False):
                     p._ag_ticket_bwd = cache.reserve(p, dt, fwd=False)
                 out_buffers.append(cache.get(p._ag_ticket_bwd))
 

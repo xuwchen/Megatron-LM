@@ -2998,6 +2998,13 @@ def train_step(
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    if int(__import__("os").environ.get("GTP_DIAG_GRADSCAN", "0")):
+        import torch as _t
+        _r = _t.distributed.get_rank() if _t.distributed.is_initialized() else 0
+        _bad=[n for m in (model if isinstance(model,list) else [model]) for n,q in m.named_parameters()
+              if getattr(q,"main_grad",None) is not None and not _t.isfinite(q.main_grad).all()]
+        if _r==0: print(f"[GRADSCAN] bad={_bad[:3]} total={len(_bad)}", flush=True)
+
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
