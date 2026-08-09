@@ -108,9 +108,10 @@ Sparse table weights have `allreduce=False`, so DDP synchronizes matching shards
 not across EP owners. The weights are replicated over TP in this milestone. With SP, their and all
 dense Engram parameter gradients are summed across TP by the existing sequence-parallel finalizer.
 All other Engram parameters use normal dense DP synchronization. The opt-in training verifier logs
-per-rank ordered token checksums plus global sparse-table and FP64 full-model checksums before and
-after every optimizer step, in addition to gradient, update, and peak-memory evidence. Normal
-training does not compute these diagnostics.
+global sparse-table and FP64 full-model checksums before and after every optimizer step, in
+addition to gradient, update, and peak-memory evidence. It also writes lightweight per-rank
+table/model/master/Adam residency records at construction, the first step, and the last step.
+Normal training does not compute these diagnostics.
 
 ## Megatron FSDP composition
 
@@ -141,10 +142,12 @@ A sharded run must include:
 --ckpt-format fsdp_dtensor
 ```
 
-`tests/functional_tests/test_cases/engram/engram_proxy_ep4_mfsdp_1node` is the acceptance
-configuration: on eight ranks, EP4 owns the global rows and expert-DP2 shards every owner slice.
-Meta-device construction remains rejected because Engram's table and routing buffers currently
-materialize directly on CPU/CUDA.
+`tests/functional_tests/test_cases/engram/engram_proxy_ep4_mfsdp_1node` is the functional
+acceptance configuration. The toolkit recipe
+`configs/dev/training/engram_hybridep_mfsdp_8gpu.yaml` adds a real eight-rank MoE coexistence
+run: EP4 owns the global rows, expert-DP2 shards every owner slice, and MoE dispatches through
+HybridEP. Meta-device construction remains rejected because Engram's table and routing buffers
+currently materialize directly on CPU/CUDA.
 
 ## TP, SP, and PP data flow
 
@@ -220,13 +223,15 @@ also write per-rank JSONL records after model/DDP construction, optimizer constr
 optimizer step, and the final steady-state step. The records contain exact BF16 table, FP32 master
 parameter, and named Adam-state tensor bytes plus CUDA allocated/reserved/peak counters and the
 TP/PP/EP/dense-DP/expert-DP group coordinates. This separates EP row ownership from any further
-distributed-optimizer sharding over expert-DP.
+distributed-optimizer sharding over expert-DP. `--engram-verify-training` writes the same
+lightweight JSONL residency records without enabling allocator history or pickle snapshots.
 
 ## Supported and deferred combinations
 
 The milestone supports BF16 GPT training with standard residuals or native mHC, EP, TP, PP, SP,
-MoE coexistence, native all-to-all, torch distributed checkpoints, and Megatron FSDP ZeRO-3 over
-expert-DP with same-topology `fsdp_dtensor` save/resume. CP greater than one, packed THD inputs,
+MoE coexistence (including a MoE flex/HybridEP dispatcher), native Engram all-to-all, torch
+distributed checkpoints, and Megatron FSDP ZeRO-3 over expert-DP with same-topology
+`fsdp_dtensor` save/resume. CP greater than one, packed THD inputs,
 VPP, activation recomputation, CUDA graphs, Torch FSDP2, Megatron FSDP meta initialization,
 non-Adam Megatron FSDP, cross-EP-size `fsdp_dtensor` resharding, inference serving, offload, DeepEP,
 communication overlap, request deduplication, FP8 table storage, and fused Engram kernels are

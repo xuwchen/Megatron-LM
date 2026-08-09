@@ -2677,7 +2677,10 @@ def _report_engram_memory_state(model, optimizer, phase):
     """Write exact rank-local Engram model and optimizer tensor bytes for profiling runs."""
     args = get_args()
     if (
-        not getattr(args, "record_memory_history", False)
+        not (
+            getattr(args, "record_memory_history", False)
+            or getattr(args, "engram_verify_training", False)
+        )
         or getattr(args, "engram_vocab_sizes", None) is None
     ):
         return
@@ -3042,7 +3045,9 @@ def train_step(
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     if engram_training_state is not None:
         _verify_engram_table_training_state(engram_training_state, model, iteration + 1)
-    if args.record_memory_history and (iteration == 0 or iteration + 1 == args.train_iters):
+    if (args.record_memory_history or args.engram_verify_training) and (
+        iteration == 0 or iteration + 1 == args.train_iters
+    ):
         phase = "after_first_optimizer_step" if iteration == 0 else "after_steady_state"
         _report_engram_memory_state(model, optimizer, phase)
 
