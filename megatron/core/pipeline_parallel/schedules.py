@@ -887,9 +887,27 @@ def finish_embedding_wgrad_compute(config, embedding_module, is_last_stage, tp_g
             else embedding_module.shared_embedding_or_output_weight()
         )
 
+        import os as _os, torch as _t
+        _dbg = bool(_os.environ.get("GTP_DIAG_RSCOUNT"))
+        if _dbg:
+            _t.cuda.synchronize()
+            _g = getattr(weight, "main_grad", None)
+            if _g is not None and (
+                (not _t.distributed.is_initialized()) or _t.distributed.get_rank() == 0
+            ):
+                print(f"[DRAIN-PRE] nan={int(_t.isnan(_g).sum())} numel={_g.numel()} "
+                      f"tp={tp_group.size()} remat={getattr(weight,'gtp_remat_size',None)}",
+                      flush=True)
         drain_embedding_wgrad_compute(
             config, embedding_activation_buffer, grad_output_buffer, weight, tp_group
         )
+        if _dbg:
+            _t.cuda.synchronize()
+            _g = getattr(weight, "main_grad", None)
+            if _g is not None and (
+                (not _t.distributed.is_initialized()) or _t.distributed.get_rank() == 0
+            ):
+                print(f"[DRAIN-POST] nan={int(_t.isnan(_g).sum())}", flush=True)
 
 
 def get_pp_rank_microbatches(
