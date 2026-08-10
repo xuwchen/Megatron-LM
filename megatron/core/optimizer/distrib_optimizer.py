@@ -1186,6 +1186,41 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
 
+    def gtp_dump_state_fingerprint(self, tag):
+        """Print an fp64 fingerprint of every parameter's optimizer state.
+
+        Env-gated diagnostic for the GTP checkpoint round-trip, which is not bit-exact:
+        a one-step resume differs from a continuous run by ~5e-3 in loss while the same
+        comparison without GTP is exact. Padding, gradient clipping, the checkpoint
+        format and RNG have all been ruled out by experiment, so this reports the state
+        itself — dump before saving and after loading, then diff the two lists to see
+        which parameter and which state tensor changed.
+
+        Norms are accumulated in float64 so the fingerprint is not itself lossy.
+        """
+        import os
+
+        if not int(os.environ.get("GTP_DUMP_OPT_STATE", "0")):
+            return
+        if torch.distributed.get_rank() != 0:
+            return
+        rows = []
+        for gbuf_range_maps in self.gbuf_ranges:
+            for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                    for model_param in gbuf_range_map["param_map"]:
+                        name = getattr(model_param, "_debug_name", None) or "<unnamed>"
+                        st = self._get_main_param_and_optimizer_states(model_param)
+                        parts = []
+                        for k in sorted(st):
+                            v = st[k]
+                            if not torch.is_tensor(v):
+                                continue
+                            parts.append(f"{k}={v.double().norm().item():.12e}")
+                        rows.append(f"[OPTSTATE {tag}] {name} " + " ".join(parts))
+        for r in rows:
+            print(r, flush=True)
+
     def _get_main_param_and_optimizer_states(self, model_param):
         """Return a dict containing the main param and optimizer states corresponding to the input
         model_param.

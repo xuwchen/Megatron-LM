@@ -2645,6 +2645,10 @@ def setup_model_and_optimizer(
             expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
             rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
         )
+        # GTP round-trip diagnostic (GTP_DUMP_OPT_STATE=1): fingerprint the optimizer
+        # state right after loading, to be diffed against the same dump taken before the
+        # save. See DistributedOptimizer.gtp_dump_state_fingerprint.
+        _gtp_dump_opt_state(optimizer, "after-load")
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -3593,6 +3597,27 @@ def force_param_sync(model_chunks: list[DDP], optimizer=None) -> None:
         model_chunk.start_param_sync(force_sync=True)
 
 
+def _gtp_dump_opt_state(optimizer, tag):
+    """Call the GTP round-trip fingerprint on every DistributedOptimizer in the tree.
+
+    With MoE the training flow builds a ChainedOptimizer (dense + expert), which is why
+    the checkpoint keys read `chained_0.optimizer...`; the DistributedOptimizer that owns
+    the state is nested inside it, so a hasattr() on the top-level object finds nothing.
+    """
+    if optimizer is None:
+        return
+    fn = getattr(optimizer, "gtp_dump_state_fingerprint", None)
+    if fn is not None:
+        fn(tag)
+        return
+    for attr in ("chained_optimizers", "optimizers", "_optimizers"):
+        subs = getattr(optimizer, attr, None)
+        if subs:
+            for i, sub in enumerate(subs):
+                _gtp_dump_opt_state(sub, f"{tag}#{i}")
+            return
+
+
 def save_checkpoint_and_time(
     iteration,
     model,
@@ -3606,6 +3631,11 @@ def save_checkpoint_and_time(
     args = get_args()
     timers = get_timers()
     energy_monitor = get_energy_monitor()
+
+    # GTP round-trip diagnostic (GTP_DUMP_OPT_STATE=1): fingerprint the optimizer state
+    # as it stands just before writing it out, to be diffed against the dump taken right
+    # after a later load. See DistributedOptimizer.gtp_dump_state_fingerprint.
+    _gtp_dump_opt_state(optimizer, "before-save")
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
