@@ -2926,6 +2926,24 @@ def train_step(
             seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
             seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
             forward_backward_data_iterator = data_iterator
+        # GTP round-trip diagnostic (GTP_DUMP_RNG_STATE=1): the RNG fingerprints matched
+        # at the moment of save and the moment of load, but that is the RESTORE point, not
+        # the USE point — the resuming process still builds data iterators and finishes
+        # pretrain() setup afterwards, and anything there that draws on the RNG would move
+        # it. Fingerprint at the top of each step so the two arms can be compared where it
+        # actually matters. consumed_samples goes with it: if the resumed run reads a
+        # different batch, that alone explains a first-step divergence.
+        _gtp_dump_rng_state(f"step{args.curr_iteration}")
+        if int(__import__("os").environ.get("GTP_DUMP_RNG_STATE", "0")) and (
+            torch.distributed.get_rank() == 0
+        ):
+            print(
+                f"[STEPINFO step{args.curr_iteration}] "
+                f"consumed_samples={args.consumed_train_samples} "
+                f"lr={optimizer.param_groups[0]['lr']:.12e} "
+                f"num_microbatches={num_microbatches}",
+                flush=True,
+            )
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=forward_backward_data_iterator,
