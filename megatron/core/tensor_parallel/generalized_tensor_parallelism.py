@@ -1420,6 +1420,28 @@ class GTPShardedParam(torch.nn.Parameter):
         cache = get_global_GTP_cache()
         for w in self._weights:
             ticket = w._ag_ticket_fwd if fwd else w._ag_ticket_bwd
+            if ticket is None:
+                # cache.get(None) raises a bare `KeyError: None`, which names neither the
+                # parameter nor the invariant that broke. This weight consumed a prefetch
+                # its chain neighbour never issued: the producer is next_w's backward (or
+                # prev_w's forward), and it only runs when BOTH sides carry the matching
+                # _need_weight_prefetch / _need_weight_prefetch_bwd flags.
+                direction = "fwd" if fwd else "bwd"
+                raise RuntimeError(
+                    f"[GTP] {self._debug_name}: no {direction} all-gather ticket. This "
+                    f"weight consumed a prefetch nobody issued. "
+                    f"self(_need_weight_prefetch={self._need_weight_prefetch}, "
+                    f"_need_weight_prefetch_bwd={self._need_weight_prefetch_bwd}, "
+                    f"chain_id={getattr(self, 'chain_id', None)!r}), "
+                    f"prev_w={getattr(self.prev_w, '_debug_name', None)}, "
+                    f"next_w={getattr(self.next_w, '_debug_name', None)}"
+                    + (
+                        f" (next_w flags: {self.next_w._need_weight_prefetch}/"
+                        f"{self.next_w._need_weight_prefetch_bwd})"
+                        if self.next_w is not None
+                        else ""
+                    )
+                )
             result.append(cache.get(ticket))
 
         result = [self._strip_padding(r) for r in result]
