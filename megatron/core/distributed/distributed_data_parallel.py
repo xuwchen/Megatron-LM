@@ -539,6 +539,19 @@ class DistributedDataParallel(_BaseDataParallel):
                         assert (
                             param.grad is not None
                         ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                if __import__("os").environ.get("GTP_DIAG_RSCOUNT") and getattr(
+                    param, "_gtp_dbg_is_emb", False
+                ):
+                    _pg = param.grad
+                    _will = _pg is not None and (
+                        not param.grad_added_to_main_grad
+                        or getattr(param, 'zero_out_wgrad', False)
+                    )
+                    _bad = -1 if _pg is None else int(torch.isnan(_pg).sum())
+                    print(f"[PREADD] grad={'None' if _pg is None else hex(_pg.data_ptr())} "
+                          f"grad_nan={_bad} added2mg={param.grad_added_to_main_grad} "
+                          f"zero_out={getattr(param, 'zero_out_wgrad', False)} "
+                          f"will_add={_will}", flush=True)
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
