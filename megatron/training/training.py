@@ -2649,6 +2649,8 @@ def setup_model_and_optimizer(
         # state right after loading, to be diffed against the same dump taken before the
         # save. See DistributedOptimizer.gtp_dump_state_fingerprint.
         _gtp_dump_opt_state(optimizer, "after-load")
+        _gtp_dump_model_state(model, "after-load")
+        _gtp_dump_rng_state("after-load")
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -3597,6 +3599,69 @@ def force_param_sync(model_chunks: list[DDP], optimizer=None) -> None:
         model_chunk.start_param_sync(force_sync=True)
 
 
+def _gtp_dump_model_state(model, tag):
+    """Fingerprint model parameters and buffers around the checkpoint round-trip.
+
+    The optimizer state was shown to round-trip exactly (628 params, 1884 tensors,
+    zero difference at rel>1e-9), yet a one-step GTP resume still differs from a
+    continuous run by ~5e-3. The optimizer holds an fp32 master copy; the model's own
+    bf16 parameters are separate data with their own restore path, so they are the next
+    thing to check. Buffers are included because they are non-optimizer state that the
+    checkpoint also carries.
+    """
+    import os
+
+    if not int(os.environ.get("GTP_DUMP_MODEL_STATE", "0")):
+        return
+    if torch.distributed.get_rank() != 0:
+        return
+    for chunk, m in enumerate(model if isinstance(model, list) else [model]):
+        for name, t in list(m.named_parameters()) + list(m.named_buffers()):
+            if not torch.is_tensor(t) or not t.is_floating_point():
+                continue
+            print(
+                f"[MODELSTATE {tag}#{chunk}] {name} "
+                f"norm={t.detach().double().norm().item():.12e}",
+                flush=True,
+            )
+
+
+def _gtp_dump_rng_state(tag):
+    """Fingerprint every RNG stream around the checkpoint round-trip.
+
+    Dropout is 0.0 here, which rules out the obvious consumer but not every one, and
+    nothing so far has confirmed that rng_state is actually restored — it showed up as a
+    MISSING key back when no_load_rng was set. Hash the raw state bytes rather than
+    printing them.
+    """
+    import hashlib
+    import os
+
+    if not int(os.environ.get("GTP_DUMP_RNG_STATE", "0")):
+        return
+    if torch.distributed.get_rank() != 0:
+        return
+
+    def fp(t):
+        if torch.is_tensor(t):
+            return hashlib.blake2b(t.cpu().numpy().tobytes(), digest_size=8).hexdigest()
+        return hashlib.blake2b(str(t).encode(), digest_size=8).hexdigest()
+
+    print(
+        f"[RNGSTATE {tag}] cpu={fp(torch.get_rng_state())} "
+        f"cuda={fp(torch.cuda.get_rng_state())}",
+        flush=True,
+    )
+    try:
+        from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+
+        states = get_cuda_rng_tracker().get_states()
+        for k in sorted(states):
+            print(f"[RNGSTATE {tag}] tracker:{k}={fp(states[k])}", flush=True)
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        print(f"[RNGSTATE {tag}] tracker unavailable: {exc}", flush=True)
+
+
 def _gtp_dump_opt_state(optimizer, tag):
     """Call the GTP round-trip fingerprint on every DistributedOptimizer in the tree.
 
@@ -3636,6 +3701,8 @@ def save_checkpoint_and_time(
     # as it stands just before writing it out, to be diffed against the dump taken right
     # after a later load. See DistributedOptimizer.gtp_dump_state_fingerprint.
     _gtp_dump_opt_state(optimizer, "before-save")
+    _gtp_dump_model_state(model, "before-save")
+    _gtp_dump_rng_state("before-save")
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
