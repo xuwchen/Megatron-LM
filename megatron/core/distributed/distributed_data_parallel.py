@@ -549,6 +549,14 @@ class DistributedDataParallel(_BaseDataParallel):
                     self.param_to_bucket_group[param].register_grad_ready(
                         param, self.force_all_reduce
                     )
+                    if __import__("os").environ.get("GTP_DIAG_RSCOUNT") and getattr(
+                        param, "_gtp_dbg_is_emb", False
+                    ):
+                        _g2 = getattr(param, "main_grad", None)
+                        if _g2 is not None:
+                            torch.cuda.synchronize()
+                            print(f"[POST-RGR] nan={int(torch.isnan(_g2).sum())} "
+                                  f"force_ar={self.force_all_reduce}", flush=True)
 
         return hook
 
