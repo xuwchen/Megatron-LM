@@ -17,6 +17,68 @@ from megatron.core.utils import log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
+
+def _resolve_gtp_sharded_metadata(model_param, model_sharded_state_dict):
+    """Find the model ShardedTensor for a GTP_remat param the identity map missed.
+
+    ``param_to_sharded_metadata`` is keyed by ``id`` of the tensor each model entry
+    carries, and matched against the parameter the grad buffer registered. Two GTP cases
+    put a DIFFERENT tensor in the model entry and so break that match:
+
+    1. Native-FP8 GTP weights: the entry holds a dequantized BF16 copy, which carries a
+       ``_gtp_dequant_src`` backlink to the live param (see
+       ``make_tp_sharded_tensor_for_checkpoint``).
+    2. Factory-backed weights (GDN / Mamba ``in_proj``): the entry is a factory exposing
+       the GATHERED tensor, so nothing matches the per-shard param. Rebuild the same
+       per-shard ShardedTensor every other GTP weight gets.
+
+    This mirrors ``_backfill_gtp_sharded_param_map`` in optimizer.py, which fixes the same
+    two cases for the distributed-Muon path. That helper explicitly does not cover
+    distributed Adam ("Distributed Adam uses its own DistributedOptimizer.sharded_state_dict
+    (flat-buffer path) and is unaffected") — true for the dp_reshardable format, which keys
+    optimizer state by DP-group index and never consults the model entries, but NOT for
+    the fully-reshardable format, which does.
+
+    Returns the ShardedTensor, or None when this is not a GTP param (caller raises).
+    """
+    try:
+        from megatron.core.tensor_parallel.gtp_api import (
+            is_gtp_param,
+            make_sharded_tensors_for_checkpoint_with_gtp_remat,
+        )
+    except ImportError:
+        return None  # GTP not built in.
+
+    if not is_gtp_param(model_param):
+        return None
+
+    # Case 1: the dequantized copy's backlink.
+    for entry in nested_values(model_sharded_state_dict):
+        src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+        if src is model_param:
+            return entry
+
+    # Case 2: rebuild. Not expert-parallel aware — an expert param rebuilt here would write
+    # duplicate shards across expert-parallel groups, so refuse loudly rather than corrupt
+    # the checkpoint. (Same guard as _backfill_gtp_sharded_param_map.)
+    if not getattr(model_param, 'allreduce', True):
+        raise ValueError(
+            f"GTP expert-parallel param '{getattr(model_param, '_debug_name', '')}' has no "
+            "matching model ShardedTensor; refusing the EP-unaware rebuild (it would write "
+            "duplicate shards across expert-parallel groups)."
+        )
+    key = getattr(model_param, '_debug_name', None) or '_gtp_optim_param'
+    rebuilt = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+        {key: model_param},
+        prefix='',
+        tensor_parallel_layers_axis_map={key: 0},
+        tp_group=parallel_state.get_tensor_model_parallel_group(),
+        # Required kwarg; unused for GTP-sharded params, whose offsets and replica_id come
+        # from the gtp_remat axis.
+        dp_cp_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+    )
+    return rebuilt[key]
+
 HAVE_APEX_OR_TE = True
 USING_TE_OPTIMIZER = False
 USING_APEX_OPTIMIZER = False
@@ -36,7 +98,7 @@ except ImportError:
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
-from .. import tensor_parallel
+from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
 from ..dist_checkpointing.dict_utils import nested_values
@@ -1798,9 +1860,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     param_world_end,
                     _,
                 ) in buffer.param_index_map.items():
-                    try:
-                        sharded_metadata = param_to_sharded_metadata[model_param]
-                    except KeyError as e:
+                    sharded_metadata = param_to_sharded_metadata.get(model_param)
+                    if sharded_metadata is None:
+                        # GTP puts a different tensor in the model entry for two cases;
+                        # resolve those before treating this as an error.
+                        sharded_metadata = _resolve_gtp_sharded_metadata(
+                            model_param, model_sharded_state_dict
+                        )
+                    if sharded_metadata is None:
                         # Printing the tensor itself dumps values and names neither the
                         # parameter nor which entry the map does hold, which is what a
                         # reader needs: the map is keyed by object identity, so a mismatch
@@ -1818,7 +1885,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             f" gtp={getattr(model_param, 'is_gtp_weight_remat', False)})"
                             f" not in model_sharded_state_dict."
                             f" Hint: {KEEP_VARS_HINT}"
-                        ) from e
+                        )
                     assert (
                         sharded_metadata.flattened_range is None
                     ), f"Flattened model tensor not supported ({sharded_metadata})"
