@@ -58,6 +58,24 @@ def _resolve_gtp_sharded_metadata(model_param, model_sharded_state_dict):
         if src is model_param:
             return entry
 
+    # Case 1b: a factory-backed weight (GDN / Mamba in_proj). The model gathers the GTP
+    # shards back to TP-local before splitting into [z|x|B|C|dt] (see
+    # mamba_mixer/gated_delta_net sharded_state_dict), because those split boundaries do
+    # not line up with GTP slice boundaries. The optimizer must key its state the same way
+    # or a checkpoint written under GTP cannot be read back without GTP: the model side
+    # emits `...in_proj.weight.z`, the rebuilt-per-shard side emits `...in_proj.weight`.
+    #
+    # Return the model's own factory; the caller gathers the state tensors across the GTP
+    # group to the shape the factory expects. Match by name, since the factory's data is
+    # the gathered tensor and therefore never identical to this shard.
+    from ..optimizer.optimizer import _strip_module_prefix
+
+    name = _strip_module_prefix(getattr(model_param, '_debug_name', '') or '')
+    if name:
+        for entry in nested_values(model_sharded_state_dict):
+            if isinstance(entry, ShardedTensorFactory) and entry.key == name:
+                return entry
+
     # Case 2: rebuild. Not expert-parallel aware — an expert param rebuilt here would write
     # duplicate shards across expert-parallel groups, so refuse loudly rather than corrupt
     # the checkpoint. (Same guard as _backfill_gtp_sharded_param_map.)
@@ -1893,6 +1911,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # Note: replica_id is exactly the same as in the model param
                     replica_id = sharded_metadata.replica_id
 
+                    # A factory whose data is wider than this shard is the gathered+split
+                    # case (GDN / Mamba in_proj): the state tensors below have to be
+                    # gathered across the GTP group before the factory can split them.
+                    gtp_gather_group = None
+                    if (
+                        isinstance(sharded_metadata, ShardedTensorFactory)
+                        and getattr(model_param, 'is_gtp_weight_remat', False)
+                        and sharded_metadata.data.shape[0] != model_param.shape[0]
+                    ):
+                        gtp_gather_group = model_param.group
+
                     tensors = {}
                     for state_key in world_tensor_keys:
                         if state_key == 'step' or state_key == 'numel_unpadded':
@@ -1922,6 +1951,37 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             len(state_ten),
                             param_world_end - param_world_start,
                         )
+                        if gtp_gather_group is not None:
+                            # Factory-backed GTP weight: the factory splits along boundaries
+                            # that do not align with GTP slices, so it expects the full
+                            # TP-local tensor. Gather this shard's optimizer state across the
+                            # GTP group and strip the alignment pad, mirroring what the model
+                            # side already does for the weight itself.
+                            # These slices come off the DP-gathered world tensors, which live
+                            # on CPU; the GTP group is NCCL, so the collective has to run on
+                            # the parameter's device and come back. mem_efficient is off for
+                            # GTP (arguments.py asserts it), which means the world tensors are
+                            # NCCL all-gathered to EVERY rank — so every member of the GTP
+                            # group reaches this point and the collective is symmetric.
+                            host_device = state_ten.device
+                            state_ten = (
+                                state_ten.reshape(model_param.shape)
+                                .to(model_param.device)
+                                .contiguous()
+                            )
+                            gathered = torch.empty(
+                                (state_ten.shape[0] * gtp_gather_group.size(),)
+                                + tuple(state_ten.shape[1:]),
+                                dtype=state_ten.dtype,
+                                device=state_ten.device,
+                            )
+                            torch.distributed.all_gather_into_tensor(
+                                gathered, state_ten, group=gtp_gather_group
+                            )
+                            want_rows = sharded_metadata.data.shape[0]
+                            if gathered.shape[0] != want_rows:
+                                gathered = gathered[:want_rows]
+                            state_ten = gathered.contiguous().to(host_device)
                         state_ten = state_ten.reshape(sharded_metadata.data.shape)
                         replace_kwargs = dict(
                             key=f'{prefix}.{state_key}.{sharded_metadata.key}',
