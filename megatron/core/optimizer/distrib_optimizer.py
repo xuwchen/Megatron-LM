@@ -1801,8 +1801,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     try:
                         sharded_metadata = param_to_sharded_metadata[model_param]
                     except KeyError as e:
+                        # Printing the tensor itself dumps values and names neither the
+                        # parameter nor which entry the map does hold, which is what a
+                        # reader needs: the map is keyed by object identity, so a mismatch
+                        # means the model's sharded_state_dict exposed a DIFFERENT tensor
+                        # (a dequantized copy, or a factory's gathered tensor) for this
+                        # parameter.
+                        name = (
+                            getattr(model_param, '_gtp_dbg_name', None)
+                            or getattr(model_param, '_debug_name', None)
+                            or '<unnamed>'
+                        )
                         raise ValueError(
-                            f"Model param {model_param} not in model_sharded_state_dict."
+                            f"Model param {name} (shape={tuple(model_param.shape)},"
+                            f" type={type(model_param).__name__},"
+                            f" gtp={getattr(model_param, 'is_gtp_weight_remat', False)})"
+                            f" not in model_sharded_state_dict."
                             f" Hint: {KEEP_VARS_HINT}"
                         ) from e
                     assert (
