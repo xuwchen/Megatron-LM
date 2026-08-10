@@ -3075,6 +3075,25 @@ def train_step(
                               f"nan={int(_t.isnan(_g).sum())} zero={int((_g==0).sum())} "
                               f"absmax={float(_g[_f].abs().max()) if int(_f.sum()) else -1}",
                               flush=True)
+                        # LAYOUT probe: characterise WHERE and WHAT the bad
+                        # elements are. absmax == finfo(bfloat16).max suggests
+                        # the buffer holds unwritten memory rather than an
+                        # arithmetic blow-up; the bit histogram and the
+                        # per-chunk / per-row spread tell the two apart.
+                        _bad = (~_f) | (_g.abs() > 1e30)
+                        _nb = int(_bad.sum())
+                        if _nb:
+                            _flat = _bad.reshape(-1)
+                            _idx = _flat.nonzero(as_tuple=True)[0]
+                            _bits = _g.reshape(-1)[_idx].view(_t.int32)
+                            _poison = int((_bits == 0x7F7F7F7F).sum())
+                            _chunks = [int(c.sum()) for c in _flat.chunk(8)]
+                            _rows = (_idx // _g.shape[-1]).unique()
+                            print(f"[LAYOUT] {_n} shape={tuple(_g.shape)} bad={_nb} "
+                                  f"poison7f={_poison} first={int(_idx[0])} "
+                                  f"last={int(_idx[-1])} chunks8={_chunks} "
+                                  f"rows={_rows.numel()} row0={int(_rows[0])} "
+                                  f"rowN={int(_rows[-1])}", flush=True)
 
     if int(__import__("os").environ.get("GTP_DIAG_GRADSCAN", "0")):
         import torch as _t
