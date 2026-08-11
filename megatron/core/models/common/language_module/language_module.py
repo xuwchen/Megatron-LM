@@ -218,6 +218,35 @@ class LanguageModule(MegatronModule):
         ):
             self.output_layer.weight.is_embedding_or_output_parameter = True
 
+        # MTP re-runs the embedding on shifted tokens and re-runs the output layer on its own
+        # hidden states, so with MTP enabled BOTH of those weights are consumed twice in a
+        # single forward. GTP keeps one slot per parameter for its all-gather ticket,
+        # reduce-scatter ticket, in-flight handle and stashed wgrad inputs, so the second use
+        # would overwrite the first use's live state and produce a silently wrong gradient.
+        # Declare the reuse here, where it is a structural fact of the model, rather than
+        # letting GTP infer it from an invocation count at runtime.
+        #
+        # The embedding is the damaging one and is easy to miss: classify_gtp_chains() already
+        # clears its _need_weight_prefetch_bwd ("embedding needs no bwd AG"), which leaves it
+        # opted out of prefetch while still linked into a chain — exactly the state where the
+        # consume side would read a ticket nobody refilled. Marking only the output layer left
+        # embedding.word_embeddings.weight as the single parameter whose main_grad went
+        # non-finite on iteration 1, on every rank.
+        if getattr(self.config, 'mtp_num_layers', None):
+            from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+            if HAVE_GTP:
+                from megatron.core.tensor_parallel.gtp_api import mark_gtp_multi_use_boundary
+
+                if self.pre_process and hasattr(self, 'embedding'):
+                    mark_gtp_multi_use_boundary(self.embedding.word_embeddings.weight)
+                if (
+                    self.post_process
+                    and hasattr(self, 'output_layer')
+                    and self.output_layer.weight is not None
+                ):
+                    mark_gtp_multi_use_boundary(self.output_layer.weight)
+
         # Mark embedding-class parameters for MuP optimizer grouping.
         # Under MuP table-8-style grouping, embeddings/output use base LR/eps while
         # hidden matrix-like params use width-scaled LR/eps.
