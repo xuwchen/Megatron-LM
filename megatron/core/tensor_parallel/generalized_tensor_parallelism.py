@@ -1754,7 +1754,20 @@ class GTPShardedParam(torch.nn.Parameter):
         """
         if hasattr(param, "grad_added_to_main_grad"):
             param.grad_added_to_main_grad = True
-        dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
+        # Honour zero_out_wgrad, exactly as the non-GTP wgrad paths in
+        # tensor_parallel/layers.py do. A weight that is consumed twice in one forward
+        # (MTP, or shared embedding/output weights) has its dummy accumulated into
+        # main_grad by DDP's backward-post hook, so the dummy must be zeros rather than
+        # get_dummy_wgrad's recycled scratch.
+        #
+        # GTP makes this reachable where the non-GTP path is not: DDP drives this hook
+        # manually from here (register_grad_accum_hook), i.e. BEFORE autograd's
+        # AccumulateGrad stores the returned dummy into param.grad. The hook's trailing
+        # `param.grad = None` therefore clears nothing, and the dummy survives into the
+        # next microbatch's hook, where zero_out_wgrad makes it accumulate.
+        dummy_grad = get_dummy_wgrad(
+            list(param.main_grad.shape), param.dtype, zero=getattr(param, "zero_out_wgrad", False)
+        )
         if getattr(param, "_grad_accum_hook", None) is not None:
             param._grad_accum_hook()
 
