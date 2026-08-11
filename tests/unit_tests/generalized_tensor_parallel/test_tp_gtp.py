@@ -17,6 +17,7 @@ Test groups
 4.  TestTPGTPLayerNormLinear      - LayerNormLinear column-parallel smoke test
 5.  TestTPGTPPaddingAlignment     - pre-init pads the per-TP slice for alignment
 6.  TestTPGTPReplicatedBias       - replicated bias and bias-disabled TE placeholder coverage
+7.  TestTPGTPPrefetchBoundary     - multimodal embedding boundary splits the prefetch chain
 
 Tests use (tp_size, gtp_remat_size) = (2, 2) → world_size = 4 (runs on 4-GPU machines).
 
@@ -556,3 +557,74 @@ class TestTPGTPReplicatedBias:
         world_size = tp_size * gtp_remat_size
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_presharded_bias, world_size, tp_size, gtp_remat_size)
+
+
+# ---------------------------------------------------------------------------
+# 7. TestTPGTPPrefetchBoundary
+# ---------------------------------------------------------------------------
+
+
+def _worker_prefetch_boundary(rank, world_size, port, tp_size, gtp_remat_size):
+    """A non-prefetchable embedding boundary must split vision and language chain segments."""
+    torch.manual_seed(0)
+    _, gtp_remat_group, _, _ = _build_groups(rank, world_size, tp_size, gtp_remat_size)
+    original_weight_prefetch = GTP_CONFIG.weight_prefetch
+    update_gtp_config(weight_prefetch=True)
+
+    try:
+        vision = _make_gtp_linear(64, 64, gtp_remat_group)
+        embedding = _make_gtp_linear(64, 64, gtp_remat_group)
+        language = _make_gtp_linear(64, 64, gtp_remat_group)
+        vision_weight = vision.weight
+        embedding_weight = embedding.weight
+        language_weight = language.weight
+
+        # Mirrors VocabParallelEmbedding: its weight is gathered on demand in forward, while
+        # GTPEmbeddingWeight.backward reduce-scatters wgrad without gathering the weight.
+        embedding_weight._need_weight_prefetch = False
+        embedding_weight._need_weight_prefetch_bwd = False
+
+        first_forward = [
+            vision_weight.all_gather_and_prefetch(),
+            embedding_weight.all_gather_and_prefetch(),
+            language_weight.all_gather_and_prefetch(),
+        ]
+        assert vision_weight.next_w is None
+        assert embedding_weight.prev_w is None
+        assert embedding_weight.next_w is language_weight
+        assert language_weight.prev_w is embedding_weight
+        for gathered, weight in zip(
+            first_forward, (vision_weight, embedding_weight, language_weight)
+        ):
+            assert tuple(gathered.shape) == tuple(weight._unsharded_shape)
+
+        # Exercise the established forward chain. The embedding must stay on-demand rather than
+        # reading a persistent ticket whose producer is in the preceding vision segment.
+        second_forward = [
+            vision_weight.all_gather_and_prefetch(),
+            embedding_weight.all_gather_and_prefetch(),
+            language_weight.all_gather_and_prefetch(),
+        ]
+        for gathered, weight in zip(
+            second_forward, (vision_weight, embedding_weight, language_weight)
+        ):
+            assert tuple(gathered.shape) == tuple(weight._unsharded_shape)
+
+        # Backward starts at the language tail. The embedding custom backward then skips weight
+        # gathering, so the vision tail must be an independent on-demand consumer.
+        language_bwd = language_weight.all_gather_and_prefetch_bwd()
+        assert embedding_weight._ag_ticket_bwd is None
+        vision_bwd = vision_weight.all_gather_and_prefetch_bwd()
+        assert vision_weight._ag_ticket_bwd is not None
+        assert tuple(language_bwd.shape) == tuple(language_weight._unsharded_shape)
+        assert tuple(vision_bwd.shape) == tuple(vision_weight._unsharded_shape)
+    finally:
+        update_gtp_config(weight_prefetch=original_weight_prefetch)
+
+
+class TestTPGTPPrefetchBoundary:
+    @pytest.mark.parametrize("tp_size,gtp_remat_size", [(2, 2)])
+    def test_embedding_starts_new_prefetch_segment(self, tp_size, gtp_remat_size):
+        world_size = tp_size * gtp_remat_size
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_prefetch_boundary, world_size, tp_size, gtp_remat_size)
