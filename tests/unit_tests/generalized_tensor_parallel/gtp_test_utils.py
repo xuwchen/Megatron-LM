@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Shared fixtures and helpers for all GTP unit tests.
-"""
+"""Shared fixtures and helpers for all GTP unit tests."""
 
 import pytest
 import torch
@@ -36,7 +35,14 @@ def reset_fp8_state():
 
 @pytest.fixture(autouse=True)
 def reset_gtp_globals():
-    """Reset GTP mutable class-level state between tests (fwd/bwd AND recompute chains)."""
+    """Reset GTP mutable class-level state between tests.
+
+    Defers to the production reset so this cannot drift as new class-level state is added.
+    Note it only clears the process-global cursors: the chain links themselves live on the
+    params (``prev_w`` / ``_recompute_prev`` / ``_ag_ticket_*``, set once in
+    ``_init_gtp_runtime_attrs``), so a test that reuses modules across cases would inherit
+    stale links. Every GTP test builds fresh modules for this reason.
+    """
     yield
     reset_gtp_state()
 
