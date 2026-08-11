@@ -1372,6 +1372,28 @@ class GTPShardedParam(torch.nn.Parameter):
         cache = get_global_GTP_cache()
         for w in self._weights:
             ticket = w._ag_ticket_fwd if fwd else w._ag_ticket_bwd
+            if ticket is None:
+                # cache.get(None) raises a bare `KeyError: None`, which names neither the
+                # parameter nor the invariant that broke. This weight consumed a prefetch
+                # its chain neighbour never issued: the producer is next_w's backward (or
+                # prev_w's forward), and it only runs when BOTH sides carry the matching
+                # _need_weight_prefetch / _need_weight_prefetch_bwd flags.
+                direction = "fwd" if fwd else "bwd"
+                raise RuntimeError(
+                    f"[GTP] {self._debug_name}: no {direction} all-gather ticket. This "
+                    f"weight consumed a prefetch nobody issued. "
+                    f"self(_need_weight_prefetch={self._need_weight_prefetch}, "
+                    f"_need_weight_prefetch_bwd={self._need_weight_prefetch_bwd}, "
+                    f"chain_id={getattr(self, 'chain_id', None)!r}), "
+                    f"prev_w={getattr(self.prev_w, '_debug_name', None)}, "
+                    f"next_w={getattr(self.next_w, '_debug_name', None)}"
+                    + (
+                        f" (next_w flags: {self.next_w._need_weight_prefetch}/"
+                        f"{self.next_w._need_weight_prefetch_bwd})"
+                        if self.next_w is not None
+                        else ""
+                    )
+                )
             result.append(cache.get(ticket))
 
         result = [self._strip_padding(r) for r in result]
@@ -1429,10 +1451,23 @@ class GTPShardedParam(torch.nn.Parameter):
             weight_total
         """
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        # Consume must mirror the produce-side guard below: the bwd AG for THIS param is only
+        # issued by next_w when self._need_weight_prefetch and self._need_weight_prefetch_bwd
+        # are both set. Reading the ticket without them returns the PREVIOUS iteration's AG
+        # buffer (cache.get() on a ticket nobody refilled) — silently wrong, and it surfaces
+        # as a NaN on iter 2, not on iter 1. Params opted out of bwd prefetch (the embedding
+        # weight, and any param declared a multi-use boundary) must gather on demand.
+        if (
+            GTP_CONFIG.weight_prefetch
+            and self.next_w is not None
+            and self._need_weight_prefetch
+            and self._need_weight_prefetch_bwd
+        ):
             result = self._get_prefetched_weight(False)
+            consumed_bwd_ticket = True
         else:
             result = self._all_gather_weight_on_demand(False)
+            consumed_bwd_ticket = False
 
         if (
             GTP_CONFIG.weight_prefetch
@@ -1452,7 +1487,8 @@ class GTPShardedParam(torch.nn.Parameter):
             for w in self._weights:
                 w._set_state(GTPWeightState.NONE)
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        # Release only the ticket we actually consumed; an on-demand gather never checked one out.
+        if consumed_bwd_ticket:
             cache = get_global_GTP_cache()
             for w in self._weights:
                 cache.release(w._ag_ticket_bwd)
@@ -1479,10 +1515,20 @@ class GTPShardedParam(torch.nn.Parameter):
         # Consume current weight.
         if use_recompute_chain and self._recompute_prev is not None:
             result = self._get_recompute_prefetched_weight()
-        elif not in_recompute and GTP_CONFIG.weight_prefetch and self.prev_w is not None:
+        elif (
+            not in_recompute
+            and GTP_CONFIG.weight_prefetch
+            and self.prev_w is not None
+            # Mirror the produce-side guard below (`self.next_w._need_weight_prefetch`): the fwd
+            # AG for THIS param is only issued when self._need_weight_prefetch is set. Without
+            # this, an opted-out-but-linked param reads a ticket nobody refilled and gets the
+            # previous iteration's buffer.
+            and self._need_weight_prefetch
+        ):
             result = self._get_prefetched_weight(True)
         else:
-            # On-demand: chain head (fwd or recompute global-first) or first-iter build.
+            # On-demand: chain head (fwd or recompute global-first), prefetch opt-out, or
+            # first-iter build.
             result = self._all_gather_weight_on_demand(True)
 
         # Prefetch next weight on the matching chain.

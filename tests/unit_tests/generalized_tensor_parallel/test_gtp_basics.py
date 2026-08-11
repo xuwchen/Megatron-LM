@@ -1572,5 +1572,76 @@ class TestGTPSharedLinearMultipleUses:
 
 
 # ---------------------------------------------------------------------------
-# Multiple microbatches: output must be consistent when weight unchanged
+# Prefetch consume side mirrors the produce side
 # ---------------------------------------------------------------------------
+
+
+def _worker_opted_out_param_gathers_on_demand(rank, world_size, port):
+    """A param linked into a chain but opted out of prefetch must gather on demand.
+
+    The produce side only issues an all-gather for a param whose _need_weight_prefetch
+    (and, for backward, _need_weight_prefetch_bwd) flag is set. If the consume side keys
+    solely off prev_w/next_w being linked, an opted-out-but-linked param reads a ticket
+    nobody refilled and gets a stale all-gather buffer — silently wrong data.
+    """
+    torch.manual_seed(0)
+    in_f, out_f = 32, 64
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    original_weight_prefetch = gtp_module.GTP_CONFIG.weight_prefetch
+    gtp_module.update_gtp_config(weight_prefetch=True)
+    try:
+        first = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+        middle = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+        last = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+        weights = (first.weight, middle.weight, last.weight)
+        first_weight, middle_weight, last_weight = weights
+
+        # First forward links the chain: first -> middle -> last.
+        for weight in weights:
+            weight.all_gather_and_prefetch()
+        assert first_weight.next_w is middle_weight
+        assert middle_weight.next_w is last_weight
+
+        # Opt the middle weight out AFTER linking — the linked-but-opted-out state a chain
+        # classifier produces when it clears flags on a param whose links are already wired.
+        middle_weight._need_weight_prefetch = False
+        middle_weight._need_weight_prefetch_bwd = False
+
+        # The ground truth this rank should see for middle's unsharded weight.
+        shard = middle_weight.data.clone()
+        gathered_shards = [torch.zeros_like(shard) for _ in range(world_size)]
+        dist.all_gather(gathered_shards, shard, group=gtp_remat_group)
+        expected = torch.cat(gathered_shards, dim=0)[: middle_weight._unsharded_shape[0]]
+
+        # Forward: first (the producer) skips the prefetch for middle, so middle's consume
+        # must fall back to an on-demand gather instead of reading its stale linked ticket.
+        first_weight.all_gather_and_prefetch()
+        gathered_middle = middle_weight.all_gather_and_prefetch()
+        assert torch.equal(gathered_middle, expected)
+        last_weight.all_gather_and_prefetch()
+
+        # Backward: last's produce side skips its opted-out predecessor, so middle's bwd
+        # ticket is never issued.
+        last_weight.all_gather_and_prefetch_bwd()
+        assert middle_weight._ag_ticket_bwd is None
+
+        # A starved consumer must name the parameter and its flags, not raise KeyError: None.
+        with pytest.raises(RuntimeError, match="no bwd all-gather ticket"):
+            middle_weight._get_prefetched_weight(False)
+
+        # The consume-side guard routes middle to a correct on-demand gather instead; its
+        # produce side still refills first's ticket, so first stays on the prefetched path.
+        bwd_middle = middle_weight.all_gather_and_prefetch_bwd()
+        assert torch.equal(bwd_middle, expected)
+        bwd_first = first_weight.all_gather_and_prefetch_bwd()
+        assert tuple(bwd_first.shape) == tuple(first_weight._unsharded_shape)
+    finally:
+        gtp_module.update_gtp_config(weight_prefetch=original_weight_prefetch)
+
+
+class TestGTPPrefetchConsumeMirrorsProduce:
+    def test_opted_out_param_gathers_on_demand(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_opted_out_param_gathers_on_demand, 4)
