@@ -39,6 +39,8 @@ def test_sync_batched_rs_returns_original_inputs_to_wgrad_pool(monkeypatch):
             self.chain_id = gtp_module.GTPChain.UNGRAPHED.value
             self.prev_w = None
             self.next_w = None
+            # No reduction in flight from an earlier use (the multi-use drain checks this).
+            self._wgrad_rs_handle = None
             self.rs_calls = []
 
         def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
