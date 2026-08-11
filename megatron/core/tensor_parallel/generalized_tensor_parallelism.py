@@ -1866,7 +1866,18 @@ class GTPShardedParam(torch.nn.Parameter):
         # cannot, since CUDA graphs require stable buffer addresses across replay.
         poolable = not _chain_is_graphed(self.chain_id)
 
-        if GTP_CONFIG.async_reduction and self.prev_w is not None:
+        # prev_w/next_w primarily encode the forward AG-prefetch chain. A custom-backward
+        # weight (e.g. the embedding, or GDN's fused path) may still drive the next weight's
+        # forward prefetch while being an invalid wgrad-cascade neighbour: its autograd node
+        # can run before the main chain has produced any RS ticket. _need_weight_prefetch_bwd
+        # is the existing marker for that custom path, so terminate the wgrad cascade on both
+        # sides of such a boundary while leaving the forward AG edge intact.
+        has_wgrad_predecessor = (
+            self.prev_w is not None
+            and self._need_weight_prefetch_bwd
+            and self.prev_w._need_weight_prefetch_bwd
+        )
+        if GTP_CONFIG.async_reduction and has_wgrad_predecessor:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
             _, rs_handle = self._reduce_scatter(wgrad_inputs, async_op=True, nvtx_label=nvtx_label)
@@ -1896,7 +1907,14 @@ class GTPShardedParam(torch.nn.Parameter):
 
         # Wait for last reduce scatter if it was async
         # Currently only support reduce scattering in reverse order
-        if GTP_CONFIG.async_reduction and self.next_w is not None:
+        # Same boundary rule as has_wgrad_predecessor above: do not finalize across a
+        # custom-backward neighbour, which may not have issued an RS at all.
+        has_wgrad_successor = (
+            self.next_w is not None
+            and self._need_weight_prefetch_bwd
+            and self.next_w._need_weight_prefetch_bwd
+        )
+        if GTP_CONFIG.async_reduction and has_wgrad_successor:
             self.next_w._wait_reduce_scatter()
 
             if getattr(self.next_w, "_already_finalized", False):

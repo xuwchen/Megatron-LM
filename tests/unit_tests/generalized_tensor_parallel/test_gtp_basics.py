@@ -1439,3 +1439,75 @@ class TestGTPGraphWgradRing:
         assert rs_input is weights[1]._gtp_graph_wgrad_ring_slot.tensor
         torch.testing.assert_close(rs_input[:4], wgrad)
         assert torch.count_nonzero(rs_input[4:]) == 0
+
+
+def _worker_shared_embedding_wgrad_boundary(rank, world_size, port):
+    """An MTP embedding branch may backward before the main decoder has an RS ticket.
+
+    Keep the embedding -> decoder0 forward-prefetch edge, but make the custom-backward
+    embedding a wgrad-cascade boundary. Both embedding uses must reduce synchronously;
+    decoder0 must become the head of its own wgrad chain and finalize decoder1 normally.
+    """
+    torch.manual_seed(0)
+    in_f, out_f = 32, 64
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    original_async_reduction = gtp_module.GTP_CONFIG.async_reduction
+    original_per_token_loss = gtp_module.GTP_CONFIG.calculate_per_token_loss
+    gtp_module.update_gtp_config(async_reduction=True, calculate_per_token_loss=False)
+    try:
+        embedding = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+        decoder0 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+        decoder1 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+
+        embedding_weight = embedding.weight
+        decoder0_weight = decoder0.weight
+        decoder1_weight = decoder1.weight
+        embedding_weight._need_weight_prefetch = False
+        embedding_weight._need_weight_prefetch_bwd = False
+
+        inp = torch.randn(8, in_f, dtype=dtype, device="cuda")
+        dist.broadcast(inp, src=0)
+        embedding(inp, is_first_microbatch=True)
+        decoder0(inp, is_first_microbatch=True)
+        decoder1(inp, is_first_microbatch=True)
+
+        assert embedding_weight.next_w is decoder0_weight
+        assert decoder0_weight.prev_w is embedding_weight
+        assert decoder0_weight.next_w is decoder1_weight
+
+        for weight in (embedding_weight, decoder0_weight, decoder1_weight):
+            weight.main_grad = torch.zeros(weight.shape, dtype=dtype, device="cuda")
+
+        def full_wgrad(weight):
+            return torch.ones(weight._unsharded_shape, dtype=dtype, device="cuda")
+
+        # Mirrors two shared-embedding autograd nodes (main + MTP). They may execute before
+        # decoder backward, when decoder0 has no ticket. Neither call may inspect decoder0.
+        embedding_weight.wgrad_reduce_scatter(full_wgrad(embedding_weight))
+        embedding_weight.wgrad_reduce_scatter(full_wgrad(embedding_weight))
+        assert decoder0_weight._rs_ticket is None
+        assert torch.count_nonzero(decoder0_weight.main_grad) == 0
+
+        # Reverse decoder order: decoder1 defers asynchronously; decoder0 is a synchronous
+        # wgrad-chain head because its predecessor is the custom-backward embedding.
+        decoder1_weight.wgrad_reduce_scatter(full_wgrad(decoder1_weight))
+        assert decoder1_weight._rs_ticket is not None
+        decoder0_weight.wgrad_reduce_scatter(full_wgrad(decoder0_weight))
+
+        assert torch.all(embedding_weight.main_grad == 2)
+        assert torch.all(decoder0_weight.main_grad == 1)
+        assert torch.all(decoder1_weight.main_grad == 1)
+        assert decoder1_weight._wgrad_rs_handle is None
+    finally:
+        gtp_module.update_gtp_config(
+            async_reduction=original_async_reduction,
+            calculate_per_token_loss=original_per_token_loss,
+        )
+
+
+class TestGTPWgradBoundary:
+    def test_shared_embedding_does_not_drain_decoder_ticket(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_shared_embedding_wgrad_boundary, 4)
