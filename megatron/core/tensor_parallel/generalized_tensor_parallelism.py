@@ -1806,7 +1806,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 and last_w is not None
                 and last_w.next_w is None
                 and not self._need_weight_prefetch
-                and not chain["link_table_flushed"]
+                and not cls._link_tables_flushed
             ):
                 # Record the boundary in the (not yet flushed) link table for observability.
                 chain["link_table_buffer"].append(
