@@ -3969,6 +3969,47 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def _gtp_diag_embedding_grad(model, iteration):
+    """DIAGNOSTIC: is the embedding's autograd grad a real gradient or an uninitialised dummy?
+
+    On the previous base, a GTP arm's embedding gradient was frozen across 18 steps, 5x
+    smaller than a no-GTP control started from the identical checkpoint, and unchanged by
+    disabling MTP. The probe then showed `param.grad = nan` with `zero_out_wgrad` unset:
+    language_module only sets that flag when embeddings are shared OR MTP is on, so with
+    untied embeddings and no MTP `get_dummy_wgrad(..., zero=False)` hands autograd a reused
+    uninitialised buffer. Re-run here to see whether the new base still does this.
+
+    Gated on MCORE_DIAG_EMB_ITERS.
+    """
+    import os
+
+    want = os.environ.get("MCORE_DIAG_EMB_ITERS")
+    if not want or str(iteration) not in want.split(","):
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    chunks = model if isinstance(model, list) else [model]
+
+    def _n(x):
+        if x is None:
+            return "None"
+        v = x.detach().double()
+        return f"{v.pow(2).sum().sqrt().item():.6e}/finite={bool(v.isfinite().all())}"
+
+    for ci, chunk in enumerate(chunks):
+        for name, param in chunk.named_parameters():
+            if "word_embeddings" not in name:
+                continue
+            print(
+                f"[EMB it{iteration} r{rank}] {name} "
+                f"main_grad={_n(getattr(param, 'main_grad', None))} "
+                f"param_grad={_n(param.grad)} "
+                f"added={getattr(param, 'grad_added_to_main_grad', None)} "
+                f"zero_out={getattr(param, 'zero_out_wgrad', None)} "
+                f"multi_use={getattr(param, '_gtp_multi_use', None)}",
+                flush=True,
+            )
+
+
 def train(
     forward_step_func,
     model,
@@ -4631,6 +4672,7 @@ def train(
         params_norm = None
 
         if args.log_params_norm:
+            _gtp_diag_embedding_grad(model, iteration)
             params_norm = calc_params_l2_norm(model)
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
