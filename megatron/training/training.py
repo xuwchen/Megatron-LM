@@ -4017,7 +4017,9 @@ def _gtp_diag_embedding_grad(model, iteration):
                 f"rs_pending={getattr(param, '_wgrad_rs_handle', None) is not None} "
                 f"prev_w={_wname(getattr(param, 'prev_w', None))} "
                 f"next_w={_wname(getattr(param, 'next_w', None))} "
-                f"chain={getattr(param, 'chain_id', None)}",
+                f"chain={getattr(param, 'chain_id', None)} "
+                f"mg_ptr={param.main_grad.data_ptr():#x} "
+                f"mg_shape={tuple(param.main_grad.shape)} p_id={id(param):#x}",
                 flush=True,
             )
 

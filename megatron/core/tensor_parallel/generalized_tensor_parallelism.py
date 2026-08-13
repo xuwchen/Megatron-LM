@@ -2541,7 +2541,9 @@ def _diag_emb(tag, weight, tensor, extra=""):
     print(
         f"[EMBTRACE #{_DIAG_EMB_SEQ[0]:04d} {tag}] {name} shape={tuple(tensor.shape)} "
         f"norm={v.pow(2).sum().sqrt().item():.6e} nonzero_rows="
-        f"{int((v.abs().sum(dim=1) > 0).sum().item()) if v.dim() == 2 else -1}{extra}",
+        f"{int((v.abs().sum(dim=1) > 0).sum().item()) if v.dim() == 2 else -1} "
+        f"mg_ptr={weight.main_grad.data_ptr():#x} mg_shape={tuple(weight.main_grad.shape)} "
+        f"w_id={id(weight):#x}{extra}",
         flush=True,
     )
 
