@@ -3999,13 +3999,25 @@ def _gtp_diag_embedding_grad(model, iteration):
         for name, param in chunk.named_parameters():
             if "word_embeddings" not in name:
                 continue
+            # An async reduce-scatter is finalised by whichever weight has this one as its
+            # next_w, during that weight's own backward. A weight that is not the chain head
+            # (prev_w set) therefore depends on a *later* backward running at all. If the
+            # handle is still attached here — after the whole backward — nobody finalised it,
+            # and main_grad never received this step's gradient.
+            def _wname(w):
+                return getattr(w, "_debug_name", None) if w is not None else None
+
             print(
                 f"[EMB it{iteration} r{rank}] {name} "
                 f"main_grad={_n(getattr(param, 'main_grad', None))} "
                 f"param_grad={_n(param.grad)} "
                 f"added={getattr(param, 'grad_added_to_main_grad', None)} "
                 f"zero_out={getattr(param, 'zero_out_wgrad', None)} "
-                f"multi_use={getattr(param, '_gtp_multi_use', None)}",
+                f"multi_use={getattr(param, '_gtp_multi_use', None)} "
+                f"rs_pending={getattr(param, '_wgrad_rs_handle', None) is not None} "
+                f"prev_w={_wname(getattr(param, 'prev_w', None))} "
+                f"next_w={_wname(getattr(param, 'next_w', None))} "
+                f"chain={getattr(param, 'chain_id', None)}",
                 flush=True,
             )
 
