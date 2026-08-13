@@ -2122,6 +2122,13 @@ class GTPShardedParam(torch.nn.Parameter):
                 next_weights = self.next_w._weights
                 wgrads = [cache.get(w._rs_ticket) for w in next_weights]
                 nvtx_range_push(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
+                for _w, _g in zip(next_weights, wgrads):
+                    _diag_emb(
+                        "rs_out",
+                        _w,
+                        _g,
+                        extra=f" main_grad_before={_w.main_grad.detach().double().pow(2).sum().sqrt().item():.6e}",
+                    )
                 # Only batch with _foreach_add_ when finalizing multiple (routed) weights.
                 if len(next_weights) == 1:
                     next_weights[0].main_grad.add_(wgrads[0])
@@ -2507,6 +2514,38 @@ def grouped_gather_along_first_dim(
     return weights_all, handle
 
 
+_DIAG_EMB_SEQ = [0]
+
+
+def _diag_emb(tag, weight, tensor, extra=""):
+    """DIAGNOSTIC: trace the embedding wgrad from autograd input to main_grad.
+
+    The embedding's main_grad is frozen across iterations under GTP while a no-GTP control
+    started from the same checkpoint decays 8x. `rs_pending=False` ruled out a dropped
+    reduce-scatter, so the question is whether the value arriving from autograd is already
+    frozen (fault upstream of GTP) or only becomes frozen after the collective.
+
+    Gated on MCORE_DIAG_EMB_TRACE; rank 0 only.
+    """
+    import os
+
+    if not os.environ.get("MCORE_DIAG_EMB_TRACE"):
+        return
+    name = getattr(weight, "_debug_name", "") or ""
+    if "word_embeddings" not in name:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    _DIAG_EMB_SEQ[0] += 1
+    v = tensor.detach().double()
+    print(
+        f"[EMBTRACE #{_DIAG_EMB_SEQ[0]:04d} {tag}] {name} shape={tuple(tensor.shape)} "
+        f"norm={v.pow(2).sum().sqrt().item():.6e} nonzero_rows="
+        f"{int((v.abs().sum(dim=1) > 0).sum().item()) if v.dim() == 2 else -1}{extra}",
+        flush=True,
+    )
+
+
 class GTPEmbeddingWeight(torch.autograd.Function):
     """All-gather the embedding weight across the GTP group in forward, reduce-scatter its
     gradient in backward.
@@ -2525,6 +2564,7 @@ class GTPEmbeddingWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Reduce-scatter the gradient back to this rank's vocab-dim shard."""
         (weight,) = ctx.saved_tensors
+        _diag_emb("bwd_in", weight, grad_output)
         return weight.wgrad_reduce_scatter(grad_output)
 
 
