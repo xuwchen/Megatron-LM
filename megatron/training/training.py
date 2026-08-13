@@ -3072,6 +3072,12 @@ def train_step(
 
     # Update parameters.
 
+    # DIAGNOSTIC: main_grad only carries gradient semantics between the end of backward and
+    # the optimizer step. The original probe sat in the logging block, i.e. AFTER step(),
+    # where the distributed optimizer has already consumed the buffer and only this rank's
+    # 1/DP slice of it is meaningful. Probe here instead, where the value is defined.
+    _gtp_diag_embedding_grad(model, args.curr_iteration, where="pre_step")
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
@@ -3969,7 +3975,7 @@ def checkpoint_and_decide_exit(
     return False
 
 
-def _gtp_diag_embedding_grad(model, iteration):
+def _gtp_diag_embedding_grad(model, iteration, where="post_step"):
     """DIAGNOSTIC: is the embedding's autograd grad a real gradient or an uninitialised dummy?
 
     On the previous base, a GTP arm's embedding gradient was frozen across 18 steps, 5x
@@ -4008,7 +4014,7 @@ def _gtp_diag_embedding_grad(model, iteration):
                 return getattr(w, "_debug_name", None) if w is not None else None
 
             print(
-                f"[EMB it{iteration} r{rank}] {name} "
+                f"[EMB it{iteration} r{rank} {where}] {name} "
                 f"main_grad={_n(getattr(param, 'main_grad', None))} "
                 f"param_grad={_n(param.grad)} "
                 f"added={getattr(param, 'grad_added_to_main_grad', None)} "
@@ -4686,7 +4692,7 @@ def train(
         params_norm = None
 
         if args.log_params_norm:
-            _gtp_diag_embedding_grad(model, iteration)
+            _gtp_diag_embedding_grad(model, iteration, where="post_step")
             params_norm = calc_params_l2_norm(model)
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
