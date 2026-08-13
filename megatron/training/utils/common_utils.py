@@ -177,8 +177,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # over-count by gtp_remat. No-op for non-GTP_remat runs.
     _sum_reduce(
         sharded_norm_2,
-        op=torch.distributed.ReduceOp.SUM,
-        group=mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
+        mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
     )
     _sum_reduce(
         gtp_sharded_norm_2,
