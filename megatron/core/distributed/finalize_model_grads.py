@@ -451,6 +451,31 @@ maintain for legacy tests. We can remove this proxy in mcore 0.14.
 _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
+
+def _diag_gtp_axis_probe(kind, grads, group, per_token, tag):
+    """DIAGNOSTIC: report the gtp-axis reduction each parameter class receives.
+
+    With EGTP=1 the expert branch is skipped by the `group.size() <= 1` guard while the dense
+    branch still averages over a size-G group, so dense and expert end up normalised differently.
+    Gated on MCORE_DIAG_NORM.
+    """
+    import os
+
+    if not os.environ.get("MCORE_DIAG_NORM"):
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank != 0:
+        return
+    gsz = group.size() if group is not None else 0
+    sq = sum(g.detach().double().pow(2).sum().item() for g in grads) if grads else 0.0
+    print(
+        f"[GTPAXIS r{rank}] {tag} {kind:6s} n_grads={len(grads):<5d} group_size={gsz} "
+        f"reduced={'yes' if (grads and gsz > 1) else 'NO'} "
+        f"op={'SUM' if per_token else 'AVG'} sumsq={sq:.6e}",
+        flush=True,
+    )
+
+
 def _allreduce_replicated_grads_over_gtp_remat_group(
     model: List[torch.nn.Module],
     gtp_remat_group: Optional[torch.distributed.ProcessGroup],
@@ -495,6 +520,17 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
             else:
                 expert_params.append(param)
                 expert_grads.append(grad.data)
+
+    # DIAGNOSTIC: expert grads carry k = GTP/EGTP times their correct magnitude (expert bucket
+    # sum-of-squares 16.05 at k=1 vs 257.90 at k=4, i.e. x4 in magnitude). This is the one place
+    # where dense and expert take structurally different reductions over the gtp axes, so record
+    # what each branch actually does. Gated on MCORE_DIAG_NORM.
+    _diag_gtp_axis_probe(
+        "dense", dense_grads, gtp_remat_group, calculate_per_token_loss, "pre"
+    )
+    _diag_gtp_axis_probe(
+        "expert", expert_grads, egtp_remat_group, calculate_per_token_loss, "pre"
+    )
 
     for params, grads, group in (
         (dense_params, dense_grads, gtp_remat_group),
