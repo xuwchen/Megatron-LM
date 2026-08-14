@@ -133,7 +133,7 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
 
 
-_DIAG_NORM = {"buckets": {}, "calls": 0}
+_DIAG_NORM = {"buckets": {}, "calls": 0, "top": [], "emit_on": 2, "emitted": False}
 
 
 def _diag_norm_bucket_key(param, kept):
@@ -153,29 +153,43 @@ def _diag_norm_bucket_key(param, kept):
 
 
 def _diag_norm_record(param, grad, grad_not_none, is_not_shared, is_not_tp_dup, is_not_gtp_dup):
-    """Accumulate per-rank sum-of-squares per category. Gated on MCORE_DIAG_NORM."""
+    """Accumulate per-rank sum-of-squares per category, plus the largest individual grads.
+
+    The excess is a precise number: GTP4 contributes 731.2735 locally against 3D's 487.4221,
+    and the difference 243.8514 is exactly 3 x 81.2838 — i.e. one component of size 81.28
+    counted four times instead of once. Naming that component needs per-parameter detail, and
+    it must cover EVERY call to _filter_grads_for_norm, not just the first: the earlier
+    first-call-only version under-reported 3D by 3.3% (471.4 against the true 487.4).
+    """
     import os
 
     if not os.environ.get("MCORE_DIAG_NORM") or not grad_not_none:
         return
     kept = is_not_shared and is_not_tp_dup and is_not_gtp_dup
     key = _diag_norm_bucket_key(param, kept)
+    sq = grad.detach().double().pow(2).sum().item()
     slot = _DIAG_NORM["buckets"].setdefault(key, [0, 0, 0.0])
     slot[0] += 1
     slot[1] += grad.numel()
-    slot[2] += grad.detach().double().pow(2).sum().item()
+    slot[2] += sq
+    if kept:
+        _DIAG_NORM["top"].append((sq, tuple(grad.shape), key[0], key[1]))
 
 
 def _diag_norm_flush():
-    """Print one line per category, once, on every rank. Gated on MCORE_DIAG_NORM."""
+    """Print the accumulated categories and the top individual contributors, once per rank."""
     import os
 
     if not os.environ.get("MCORE_DIAG_NORM") or not _DIAG_NORM["buckets"]:
         return
     _DIAG_NORM["calls"] += 1
-    if _DIAG_NORM["calls"] > 1:
-        _DIAG_NORM["buckets"] = {}
+    # Accumulate across every call; emit only once, after the call count stops growing within
+    # an iteration. Emitting on call 1 is what truncated the earlier measurement.
+    if _DIAG_NORM["calls"] < _DIAG_NORM.get("emit_on", 2):
         return
+    if _DIAG_NORM.get("emitted"):
+        return
+    _DIAG_NORM["emitted"] = True
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     for key in sorted(_DIAG_NORM["buckets"]):
         n, numel, sq = _DIAG_NORM["buckets"][key]
@@ -184,7 +198,8 @@ def _diag_norm_flush():
             f"sumsq={sq:.6e}",
             flush=True,
         )
-    _DIAG_NORM["buckets"] = {}
+    for sq, shape, cls, shard in sorted(_DIAG_NORM["top"], reverse=True)[:12]:
+        print(f"[NORMTOP r{rank}] sumsq={sq:.6e} shape={shape} {cls}/{shard}", flush=True)
 
 
 class MegatronOptimizer(ABC):
