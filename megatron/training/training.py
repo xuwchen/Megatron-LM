@@ -3078,6 +3078,7 @@ def train_step(
     # 1/DP slice of it is meaningful. Probe here instead, where the value is defined.
     _gtp_diag_embedding_grad(model, args.curr_iteration, where="pre_step")
     _diag_param_checksum(model, args.curr_iteration)
+    _diag_per_param_checksum(model, args.curr_iteration)
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
@@ -3976,6 +3977,54 @@ def checkpoint_and_decide_exit(
     return False
 
 
+
+
+
+def _diag_per_param_checksum(model, iteration):
+    """DIAGNOSTIC: per-tensor weight checksum, to tell a wrong weight from a wrong GEMM.
+
+    The per-module forward trace puts the first GTP-vs-3D divergence at vision layer 0's
+    mlp.linear_fc2 (1.742e-03) while everything before it — including qkv, core attention,
+    the row-parallel linear_proj and mlp.linear_fc1 — is bit-identical. fc2's input is
+    therefore identical, so either its weight differs in memory or the GEMM executes
+    differently. Only a per-tensor comparison separates the two.
+
+    Each element is counted once: the same three dedup filters the grad-norm path uses, then a
+    world SUM, then divided by the replicate data-parallel size (the group that EXCLUDES the
+    gtp axis — the default data-parallel group includes it and would divide GTP runs by the
+    wrong factor).
+
+    Gated on MCORE_DIAG_WSUM.
+    """
+    import os
+
+    want = os.environ.get("MCORE_DIAG_WSUM")
+    if not want or str(iteration) not in want.split(","):
+        return
+    from megatron.core import parallel_state as mpu
+    from megatron.core import tensor_parallel
+    from megatron.core.transformer.module import param_is_not_shared
+
+    chunks = model if isinstance(model, list) else [model]
+    names, vals = [], []
+    for chunk in chunks:
+        for name, param in chunk.named_parameters():
+            if not param_is_not_shared(param):
+                continue
+            if not tensor_parallel.param_is_not_tensor_parallel_duplicate(param):
+                continue
+            if not tensor_parallel.param_is_not_gtp_duplicate(param):
+                continue
+            names.append(name)
+            vals.append(param.detach().double().abs().sum())
+    if not vals:
+        return
+    buf = torch.stack(vals)
+    torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+    dp = mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False).size()
+    if torch.distributed.get_rank() == 0:
+        for name, v in zip(names, buf.tolist()):
+            print(f"[WSUM it{iteration}] {name} abssum={v / dp:.12e}", flush=True)
 
 
 def _diag_install_layer_trace(model):
