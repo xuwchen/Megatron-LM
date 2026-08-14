@@ -3977,6 +3977,59 @@ def checkpoint_and_decide_exit(
 
 
 
+
+def _diag_install_layer_trace(model):
+    """DIAGNOSTIC: checksum every module's first-forward output, to localise where the
+    GTP-vs-3D forward difference enters.
+
+    GTP shards weights, not activations, and both arms run TP=2, so every module's output has
+    the same shape and the same sharding in both — the per-module checksums are directly
+    comparable rank by rank. A difference that grows smoothly layer over layer is rounding
+    (the all-gathered weight buffer changes cuBLAS kernel selection); a jump at one module is
+    that module's arithmetic being wrong.
+
+    Captures exactly one forward: the print budget equals the number of registered modules, so
+    later passes (including the recompute forward, which runs during backward) are dropped.
+    Gated on MCORE_DIAG_LAYER; rank 0 only.
+    """
+    import os
+
+    if not os.environ.get("MCORE_DIAG_LAYER"):
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+
+    chunks = model if isinstance(model, list) else [model]
+    budget = {"left": 0, "n": 0}
+
+    def make_hook(name):
+        def hook(_mod, _inp, out):
+            if budget["left"] <= 0:
+                return
+            tensor = out[0] if isinstance(out, tuple) and out else out
+            if not torch.is_tensor(tensor) or tensor.numel() == 0:
+                return
+            budget["left"] -= 1
+            budget["n"] += 1
+            d = tensor.detach().double()
+            print(
+                f"[LAYER {budget['n']:04d}] {name} shape={tuple(tensor.shape)} "
+                f"abssum={d.abs().sum().item():.12e}",
+                flush=True,
+            )
+
+        return hook
+
+    count = 0
+    for chunk in chunks:
+        for name, mod in chunk.named_modules():
+            if name:
+                mod.register_forward_hook(make_hook(name))
+                count += 1
+    budget["left"] = count
+    print(f"[LAYER] installed on {count} modules", flush=True)
+
+
 def _diag_param_checksum(model, iteration):
     """DIAGNOSTIC: is the weight the GEMM actually sees identical across parallel layouts?
 
@@ -4247,6 +4300,8 @@ def train(
         model_module.train()
 
     model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+
+    _diag_install_layer_trace(model)
 
     # Tracking loss.
     total_loss_dict = {}
