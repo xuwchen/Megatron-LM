@@ -4005,10 +4005,12 @@ def _diag_install_layer_trace(model):
     # The model is torch.compile'd, and dynamo traces forward hooks: an f-string with a
     # numeric format code inside the hook aborts compilation
     # ("Unknown format code 'd' for object of type 'str'"). Keep the probe out of the graph.
-    import torch._dynamo
+    # NOTE: `import torch._dynamo` here would bind `torch` as a local and shadow the global,
+    # breaking the torch.distributed calls above. Import the symbol instead.
+    from torch._dynamo import disable as _dynamo_disable
 
     def make_hook(name):
-        @torch._dynamo.disable
+        @_dynamo_disable
         def hook(_mod, _inp, out):
             if budget["left"] <= 0:
                 return
