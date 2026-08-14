@@ -4000,23 +4000,36 @@ def _diag_param_checksum(model, iteration):
         return
     from megatron.core import parallel_state as mpu
 
+    from megatron.core import tensor_parallel
+    from megatron.core.transformer.module import param_is_not_shared
+
+    # Dividing a world-sum by the data-parallel size does NOT give a topology-invariant
+    # checksum: under GTP the dense params are a MIX of gtp-sharded (held once) and replicated
+    # (held by every peer), so no single divisor is right for both. Use the same three dedup
+    # filters the grad-norm path uses — they exist precisely to make each element count once,
+    # and their totals were shown to reconcile with the reduction and the logged norm.
     chunks = model if isinstance(model, list) else [model]
     local = torch.zeros(3, dtype=torch.float64, device="cuda")
     for chunk in chunks:
         for name, param in chunk.named_parameters():
             if not getattr(param, "allreduce", True):
-                continue  # expert params: sharded over a different axis, excluded here
+                continue  # expert params live on a different axis; compared separately
+            if not param_is_not_shared(param):
+                continue
+            if not tensor_parallel.param_is_not_tensor_parallel_duplicate(param):
+                continue
+            if not tensor_parallel.param_is_not_gtp_duplicate(param):
+                continue
             d = param.detach().double()
             local[0] += d.sum()
             local[1] += d.abs().sum()
             local[2] += param.numel()
     torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.SUM)
-    dp = mpu.get_data_parallel_group(with_context_parallel=True).size()
     rank = torch.distributed.get_rank()
     if rank == 0:
         print(
-            f"[PARAMSUM it{iteration}] dp={dp} sum={local[0].item() / dp:.12e} "
-            f"abssum={local[1].item() / dp:.12e} numel={local[2].item() / dp:.0f}",
+            f"[PARAMSUM it{iteration}] sum={local[0].item():.12e} "
+            f"abssum={local[1].item():.12e} numel={local[2].item():.0f}",
             flush=True,
         )
 
