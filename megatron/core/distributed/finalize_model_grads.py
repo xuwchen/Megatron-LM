@@ -452,6 +452,38 @@ _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
 
+
+def _diag_expert_grad_scan(model, tag):
+    """DIAGNOSTIC: sum-of-squares of expert vs dense grads at a point in finalize.
+
+    Gated on MCORE_DIAG_NORM; rank 0 only.
+    """
+    import os
+
+    if not os.environ.get("MCORE_DIAG_NORM"):
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    acc = {}
+    for model_chunk in model:
+        for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
+            if not param.requires_grad:
+                continue
+            grad = getattr(param, _get_main_grad_attr(param), None)
+            if grad is None:
+                continue
+            key = (
+                "expert" if not getattr(param, 'allreduce', True) else "dense",
+                "gtp_shard" if getattr(param, 'is_gtp_weight_remat', False) else "replicated",
+            )
+            slot = acc.setdefault(key, [0, 0.0])
+            slot[0] += 1
+            slot[1] += _unshard_if_dtensor(grad).detach().double().pow(2).sum().item()
+    for key in sorted(acc):
+        n, sq = acc[key]
+        print(f"[GRADSCAN r0] {tag:16s} {'/'.join(key):20s} n={n:<5d} sumsq={sq:.6e}", flush=True)
+
+
 def _diag_gtp_axis_probe(kind, grads, group, per_token, tag):
     """DIAGNOSTIC: report the gtp-axis reduction each parameter class receives.
 
@@ -629,11 +661,17 @@ def finalize_model_grads(
 
         wait_for_gtp_grad_reduction_on_current_stream()
 
+    # DIAGNOSTIC: expert grads already carry k = GTP/EGTP times their correct magnitude by the
+    # time the gtp-axis step runs, so the cause is upstream of it. Bracket the DP grad sync to
+    # tell "backward produced it inflated" from "the DP reduction inflated it".
+    _diag_expert_grad_scan(model, "before_dp_sync")
+
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
     for model_chunk in model:
         model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
+    _diag_expert_grad_scan(model, "after_dp_sync")
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
 
