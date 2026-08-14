@@ -133,6 +133,60 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
 
 
+_DIAG_NORM = {"buckets": {}, "calls": 0}
+
+
+def _diag_norm_bucket_key(param, kept):
+    """Classify a parameter for the norm-accounting probe.
+
+    The grad norm scales with GTP/EGTP across four layouts (22.078 / 23.289 / 23.220 / 27.042
+    for k = 1 / 2 / 2 / 4), so some category of parameter enters the sum k times. Deducing which
+    one from the rank-group algebra failed: the mechanism that fit GTP4 predicted k=1 for GTP2,
+    where measurement says 2. So record what each rank actually contributes and diff the
+    categories across layouts instead.
+    """
+    return (
+        "expert" if not getattr(param, "allreduce", True) else "dense",
+        "gtp_shard" if getattr(param, "is_gtp_weight_remat", False) else "replicated",
+        "kept" if kept else "dropped",
+    )
+
+
+def _diag_norm_record(param, grad, grad_not_none, is_not_shared, is_not_tp_dup, is_not_gtp_dup):
+    """Accumulate per-rank sum-of-squares per category. Gated on MCORE_DIAG_NORM."""
+    import os
+
+    if not os.environ.get("MCORE_DIAG_NORM") or not grad_not_none:
+        return
+    kept = is_not_shared and is_not_tp_dup and is_not_gtp_dup
+    key = _diag_norm_bucket_key(param, kept)
+    slot = _DIAG_NORM["buckets"].setdefault(key, [0, 0, 0.0])
+    slot[0] += 1
+    slot[1] += grad.numel()
+    slot[2] += grad.detach().double().pow(2).sum().item()
+
+
+def _diag_norm_flush():
+    """Print one line per category, once, on every rank. Gated on MCORE_DIAG_NORM."""
+    import os
+
+    if not os.environ.get("MCORE_DIAG_NORM") or not _DIAG_NORM["buckets"]:
+        return
+    _DIAG_NORM["calls"] += 1
+    if _DIAG_NORM["calls"] > 1:
+        _DIAG_NORM["buckets"] = {}
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    for key in sorted(_DIAG_NORM["buckets"]):
+        n, numel, sq = _DIAG_NORM["buckets"][key]
+        print(
+            f"[NORMDIAG r{rank}] {'/'.join(key):28s} params={n:<5d} numel={numel:<12d} "
+            f"sumsq={sq:.6e}",
+            flush=True,
+        )
+    _DIAG_NORM["buckets"] = {}
+
+
 class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
@@ -222,8 +276,12 @@ class MegatronOptimizer(ABC):
                 expert_tp_group=getattr(self, 'expert_tp_group', None),
             )
             is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(param)
+            _diag_norm_record(
+                param, grad, grad_not_none, is_not_shared, is_not_tp_duplicate, is_not_gtp_duplicate
+            )
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
+        _diag_norm_flush()
         return grads_for_norm
 
     def get_grads_for_grad_norm(self, grad_norm_group: Optional[str] = None) -> List[torch.Tensor]:
