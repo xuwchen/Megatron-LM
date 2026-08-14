@@ -52,6 +52,26 @@ from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
 
+
+def _diag_reduce_probe(tag, total_norm, group, n_grads):
+    """DIAGNOSTIC: dump the grad-norm reduction's input, group and output. Gated on MCORE_DIAG_NORM."""
+    import os
+
+    if not os.environ.get("MCORE_DIAG_NORM"):
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    try:
+        ranks = torch.distributed.get_process_group_ranks(group) if group is not None else None
+    except Exception:
+        ranks = None
+    val = total_norm.item() if torch.is_tensor(total_norm) else float(total_norm)
+    print(
+        f"[NORMRED r{rank}] {tag:4s} sumsq={val:.6e} n_grads={n_grads} "
+        f"group_size={(len(ranks) if ranks else -1)} group_ranks={ranks}",
+        flush=True,
+    )
+
+
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
@@ -133,9 +153,15 @@ def get_grad_norm_fp32(
             torch.distributed.all_reduce(
                 total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
             )
+        # DIAGNOSTIC: the per-rank contributions that survive filtering are nearly identical
+        # between 3D and GTP4 (471.4 vs 473.3), yet the reduced norms differ by 22%. So the
+        # inflation enters here, not in the selection. Record the local value, the group that
+        # consumes it, and the result. Gated on MCORE_DIAG_NORM.
+        _diag_reduce_probe("pre", total_norm, grad_stats_parallel_group, len(grads_for_norm))
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
+        _diag_reduce_probe("post", total_norm, grad_stats_parallel_group, len(grads_for_norm))
         if multi_tensor_scale_tensor_impl is not None:
             total_norm = total_norm.pow(1.0 / norm_type)
         else:
