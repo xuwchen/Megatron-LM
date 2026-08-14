@@ -4005,18 +4005,23 @@ def _diag_per_param_checksum(model, iteration):
     from megatron.core import tensor_parallel
     from megatron.core.transformer.module import param_is_not_shared
 
+    # The dedup filters keep DIFFERENT subsets on different ranks (a replicated param survives
+    # only on tp_rank 0), so a filtered list has a rank-dependent length. All-reducing that
+    # hangs NCCL — it timed out after 600s with NumelIn=582 on rank 0. Keep every parameter in
+    # the vector so its length and order match across ranks, and zero the filtered-out entries;
+    # the sum is unchanged because those entries are exactly the duplicates.
     chunks = model if isinstance(model, list) else [model]
     names, vals = [], []
+    zero = torch.zeros((), dtype=torch.float64, device="cuda")
     for chunk in chunks:
         for name, param in chunk.named_parameters():
-            if not param_is_not_shared(param):
-                continue
-            if not tensor_parallel.param_is_not_tensor_parallel_duplicate(param):
-                continue
-            if not tensor_parallel.param_is_not_gtp_duplicate(param):
-                continue
+            keep = (
+                param_is_not_shared(param)
+                and tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
+                and tensor_parallel.param_is_not_gtp_duplicate(param)
+            )
             names.append(name)
-            vals.append(param.detach().double().abs().sum())
+            vals.append(param.detach().double().abs().sum() if keep else zero)
     if not vals:
         return
     buf = torch.stack(vals)
