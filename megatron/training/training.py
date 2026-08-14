@@ -4002,7 +4002,13 @@ def _diag_install_layer_trace(model):
     chunks = model if isinstance(model, list) else [model]
     budget = {"left": 0, "n": 0}
 
+    # The model is torch.compile'd, and dynamo traces forward hooks: an f-string with a
+    # numeric format code inside the hook aborts compilation
+    # ("Unknown format code 'd' for object of type 'str'"). Keep the probe out of the graph.
+    import torch._dynamo
+
     def make_hook(name):
+        @torch._dynamo.disable
         def hook(_mod, _inp, out):
             if budget["left"] <= 0:
                 return
