@@ -3077,6 +3077,7 @@ def train_step(
     # where the distributed optimizer has already consumed the buffer and only this rank's
     # 1/DP slice of it is meaningful. Probe here instead, where the value is defined.
     _gtp_diag_embedding_grad(model, args.curr_iteration, where="pre_step")
+    _diag_param_checksum(model, args.curr_iteration)
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
@@ -3973,6 +3974,51 @@ def checkpoint_and_decide_exit(
         return True
 
     return False
+
+
+
+def _diag_param_checksum(model, iteration):
+    """DIAGNOSTIC: is the weight the GEMM actually sees identical across parallel layouts?
+
+    From the same checkpoint, GTP's first forward differs from 3D's by 1.18e-3 in loss. The
+    stored tensors are known bit-identical (2033 model tensors compared, differing=0), and
+    alignment padding is ruled out (pad=0 changes nothing), so either the weights differ in
+    memory after the all-gather or the GEMM simply executes differently. Checkpoint equality
+    cannot settle that; this measures the live tensors.
+
+    Topology-invariant construction: sum each rank's local shard in float64, SUM-reduce over the
+    world, then divide by the dense data-parallel size. Under 3D every element is held by DP
+    ranks; under GTP the element is split across TP x GTP ranks with DP=1. Either way the
+    quotient is the sum over the full tensor.
+
+    Gated on MCORE_DIAG_PARAMSUM.
+    """
+    import os
+
+    want = os.environ.get("MCORE_DIAG_PARAMSUM")
+    if not want or str(iteration) not in want.split(","):
+        return
+    from megatron.core import parallel_state as mpu
+
+    chunks = model if isinstance(model, list) else [model]
+    local = torch.zeros(3, dtype=torch.float64, device="cuda")
+    for chunk in chunks:
+        for name, param in chunk.named_parameters():
+            if not getattr(param, "allreduce", True):
+                continue  # expert params: sharded over a different axis, excluded here
+            d = param.detach().double()
+            local[0] += d.sum()
+            local[1] += d.abs().sum()
+            local[2] += param.numel()
+    torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.SUM)
+    dp = mpu.get_data_parallel_group(with_context_parallel=True).size()
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        print(
+            f"[PARAMSUM it{iteration}] dp={dp} sum={local[0].item() / dp:.12e} "
+            f"abssum={local[1].item() / dp:.12e} numel={local[2].item() / dp:.0f}",
+            flush=True,
+        )
 
 
 def _gtp_diag_embedding_grad(model, iteration, where="post_step"):
