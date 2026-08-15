@@ -4435,7 +4435,19 @@ def train(
     for model_module in model:
         model_module.train()
 
-    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    # Qwen3.5-VL's Qwen35VLModel does not define pg_collection; with bf16 the attribute is
+    # reached by descending the Float16Module wrapper into the language model, and without it
+    # that wrapper is absent so the descent ends early and this raises. Fall back to the MPU
+    # process groups, which is what the language module was constructed from anyway.
+    # get_attr_wrapped_model raises rather than returning None when the attribute is absent
+    # all the way down (allow_none only controls whether a present-but-None value keeps the
+    # descent going), so this has to be a try/except.
+    try:
+        model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    except RuntimeError:
+        from megatron.core.process_groups_config import ProcessGroupCollection
+
+        model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     _diag_install_layer_trace(model)
 
