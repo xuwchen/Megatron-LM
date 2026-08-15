@@ -3079,6 +3079,7 @@ def train_step(
     _gtp_diag_embedding_grad(model, args.curr_iteration, where="pre_step")
     _diag_param_checksum(model, args.curr_iteration)
     _diag_per_param_checksum(model, args.curr_iteration)
+    _diag_kernel_names(args.curr_iteration)
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
@@ -4030,6 +4031,55 @@ def _diag_per_param_checksum(model, iteration):
     if torch.distributed.get_rank() == 0:
         for name, v in zip(names, buf.tolist()):
             print(f"[WSUM it{iteration}] {name} abssum={v / dp:.12e}", flush=True)
+
+
+
+_DIAG_KERN = {"prof": None}
+
+
+def _diag_kernel_names(iteration):
+    """DIAGNOSTIC: record which CUDA kernels actually run, instead of inferring them.
+
+    Every structural explanation for the GTP-vs-3D forward gap has been measured false:
+    identical weights (L1 and L2), buffer provenance (cloning changes nothing), alignment
+    padding (pad=0 is bit-identical to pad=16), tensor shape/stride/contiguity, GEMM
+    contraction-dimension factorisation (a power-of-two FFN width is slightly worse), GTP
+    degree, EP/EGTP, recompute, and the row-parallel collective (TP=1 has none, gap persists).
+    So stop deducing which kernel runs and read it off the profiler.
+
+    Arms are compared by the multiset of kernel names, not by timings.
+
+    Gated on MCORE_DIAG_KERNEL=<iteration>.
+    """
+    import os
+
+    want = os.environ.get("MCORE_DIAG_KERNEL")
+    if not want:
+        return
+    want = int(want)
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+
+    if iteration == want and _DIAG_KERN["prof"] is None:
+        prof = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA], record_shapes=True
+        )
+        prof.__enter__()
+        _DIAG_KERN["prof"] = prof
+        return
+
+    if _DIAG_KERN["prof"] is not None and iteration == want + 1:
+        prof = _DIAG_KERN["prof"]
+        prof.__exit__(None, None, None)
+        _DIAG_KERN["prof"] = "done"
+        rows = {}
+        for e in prof.key_averages(group_by_input_shape=True):
+            if e.device_time_total <= 0:
+                continue
+            rows[(e.key, str(e.input_shapes))] = rows.get((e.key, str(e.input_shapes)), 0) + e.count
+        for (name, shapes), n in sorted(rows.items()):
+            if any(k in name.lower() for k in ("gemm", "sm90", "cutlass", "nvjet", "ampere", "turing")):
+                print(f"[KERNEL] n={n:<4d} {name}  shapes={shapes[:90]}", flush=True)
 
 
 def _diag_install_layer_trace(model):
