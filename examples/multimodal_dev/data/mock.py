@@ -121,6 +121,20 @@ class MockQwen35VLDataset(Dataset):
         if not 0 <= idx < self.num_samples:
             raise IndexError(f"index {idx} out of range for {self.num_samples} samples")
 
+        # DIAGNOSTIC (MCORE_DIAG_SAMPLES): which sample indices this rank actually consumes.
+        # GTP takes ranks out of the DP axis, so a GTP arm and a 3D arm run at different DP
+        # sizes (measured: 4 vs 1) and their rank 0 holds different samples. That makes any
+        # cross-arm per-rank activation comparison meaningless, and it is also the first thing
+        # to rule out before attributing a loss difference to arithmetic: if the two arms do
+        # not consume the same SET of indices, they are not solving the same problem.
+        import os as _os
+
+        if _os.environ.get("MCORE_DIAG_SAMPLES"):
+            import torch.distributed as _dist
+
+            _r = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+            print(f"[SAMPLE] rank={_r} split={self.split} idx={idx}", flush=True)
+
         # Derive the sample from its index. Ranks share the CPU seed unless
         # data_parallel_random_init is set, so ambient-RNG draws collapse a global batch's
         # distinct samples to the per-rank microbatch count — a number that changes with the
