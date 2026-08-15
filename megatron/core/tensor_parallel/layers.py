@@ -521,6 +521,47 @@ def linear_with_frozen_weight(
     return LinearWithFrozenWeight.apply(*args)
 
 
+
+_DIAG_GEMM = {"n": 0}
+
+
+def _diag_gemm_probe(inp, weight, out):
+    """DIAGNOSTIC: ground truth at the one line where the GTP-vs-3D forward diverges.
+
+    Everything around this call has been eliminated: the weights are bit-identical across
+    arms, the gathered buffer's provenance is irrelevant (cloning it changes nothing),
+    alignment padding is irrelevant (pad=0 is bit-identical to pad=16), and the call itself is
+    this same line in both paths. Yet vision layer 0's mlp.linear_fc2 output differs by
+    1.742e-03 while mlp.linear_fc1 — also gathered — is bit-identical.
+
+    So record what the GEMM actually receives and returns: two moments of each tensor (L1 is
+    blind to sign flips and permutations, L2 is not), plus the weight's shape, stride and
+    pointer, which distinguish a narrowed view of a larger buffer from a standalone tensor.
+
+    Gated on MCORE_DIAG_GEMM; rank 0, first N calls only.
+    """
+    import os
+
+    limit = os.environ.get("MCORE_DIAG_GEMM")
+    if not limit:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    if _DIAG_GEMM["n"] >= int(limit):
+        return
+    _DIAG_GEMM["n"] += 1
+    i, w, o = inp.detach().double(), weight.detach().double(), out.detach().double()
+    print(
+        f"[GEMM {_DIAG_GEMM['n']:03d}] "
+        f"in|1|={i.abs().sum().item():.12e} in|2|={i.pow(2).sum().item():.12e} "
+        f"w|1|={w.abs().sum().item():.12e} w|2|={w.pow(2).sum().item():.12e} "
+        f"wshape={tuple(weight.shape)} wstride={tuple(weight.stride())} "
+        f"wptr={weight.data_ptr():#x} wcontig={weight.is_contiguous()} "
+        f"out|1|={o.abs().sum().item():.12e}",
+        flush=True,
+    )
+
+
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
@@ -573,6 +614,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             total_input = input
 
         output = torch.matmul(total_input, weight.t())
+        _diag_gemm_probe(total_input, weight, output)
         if bias is not None:
             output = output + bias
         return output
