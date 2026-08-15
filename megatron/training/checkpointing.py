@@ -2357,6 +2357,34 @@ def load_checkpoint(
     print_rank_0(f' checkpoint version {checkpoint_version}')
     fix_query_key_value_ordering(model, checkpoint_version)
 
+    def _diag_ckpt_probe(tag):
+        """DIAGNOSTIC (MCORE_DIAG_LOADSRC): checksum a few params around the optimizer load.
+
+        GTP and 3D end up with DIFFERENT model weights from the same checkpoint: 3D's are
+        bf16-representable (161/162, i.e. from the ckpt's bf16 model-weight copy) while GTP's
+        are not (0/162, i.e. from the fp32 optimizer master). This probe says WHERE they part
+        company — if a param's checksum changes across `optimizer.load_state_dict`, that arm
+        is having master weights written into its model parameter storage.
+        """
+        import os as _os
+
+        if not _os.environ.get("MCORE_DIAG_LOADSRC"):
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        for chunk in (model if isinstance(model, list) else [model]):
+            for name, p in chunk.named_parameters():
+                if name.endswith(("patch_embed.proj.weight", "final_layernorm.weight")):
+                    d = p.detach()
+                    exact = torch.equal(d.to(torch.bfloat16).to(d.dtype), d)
+                    print(
+                        f"[LOADSRC {tag}] {name} abssum={d.double().abs().sum().item():.12e} "
+                        f"bf16_exact={exact}",
+                        flush=True,
+                    )
+
+    _diag_ckpt_probe("after_model_load")
+
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
         try:
@@ -2377,6 +2405,7 @@ def load_checkpoint(
                 and not optimizer.is_stub_optimizer
             ):
                 optimizer.load_state_dict(state_dict['optimizer'])
+                _diag_ckpt_probe("after_optim_load")
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
