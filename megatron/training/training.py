@@ -4023,6 +4023,32 @@ def _diag_per_param_checksum(model, iteration):
             )
             names.append(name)
             vals.append(param.detach().double().abs().sum() if keep else zero)
+    # Which of the checkpoint's two copies did this parameter come from? The alignment
+    # checkpoint stores model weights in bf16 (249 entries) AND optimizer master weights in
+    # fp32 (747), so a value that survives a bf16 round-trip unchanged was reconstructed from
+    # the bf16 copy, while one that does not came from the fp32 master. The two arms load
+    # values differing by roughly bf16 epsilon, so this tells us which arm reads which.
+    if os.environ.get("MCORE_DIAG_BF16SRC") and torch.distributed.get_rank() == 0:
+        n_bf16, n_fp32 = 0, 0
+        for chunk in chunks:
+            for name, param in chunk.named_parameters():
+                if "expert" in name:
+                    continue
+                d = param.detach()
+                exact = torch.equal(d.to(torch.bfloat16).to(d.dtype), d)
+                n_bf16 += exact
+                n_fp32 += not exact
+                if name.endswith(("patch_embed.proj.weight", "final_layernorm.weight")):
+                    print(
+                        f"[BF16SRC it{iteration}] {name} bf16_exact={exact} dtype={d.dtype}",
+                        flush=True,
+                    )
+        print(
+            f"[BF16SRC it{iteration}] non-expert params: bf16-representable={n_bf16} "
+            f"not={n_fp32}",
+            flush=True,
+        )
+
     if not vals:
         return
     buf = torch.stack(vals)
