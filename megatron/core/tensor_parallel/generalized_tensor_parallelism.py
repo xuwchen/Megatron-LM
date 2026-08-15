@@ -1734,6 +1734,23 @@ class GTPShardedParam(torch.nn.Parameter):
             self.prefetch_initialized = True
             chain["last_weight"] = self
 
+        # DIAGNOSTIC: hand the consumer a freshly allocated copy instead of the cache buffer.
+        # The gathered weight is bit-identical to the 3D parameter (verified per tensor), yet
+        # vision layer 0's mlp.linear_fc2 output differs by 1.742e-03 while mlp.linear_fc1 —
+        # also gathered — is bit-identical. If provenance of the buffer (cache slot, possibly
+        # padded allocation, NCCL-written) is what changes cuBLAS's kernel choice, cloning into
+        # a plain tensor should remove the difference. If it does not, the cause is elsewhere
+        # and "different buffer -> different kernel" is wrong.
+        import os
+
+        if os.environ.get("MCORE_DIAG_AG_CLONE"):
+            if isinstance(result, (list, tuple)):
+                result = type(result)(
+                    r.clone() if torch.is_tensor(r) else r for r in result
+                )
+            elif torch.is_tensor(result):
+                result = result.clone()
+
         return result
 
     def batched_all_gather_and_prefetch(self, **kwargs):
