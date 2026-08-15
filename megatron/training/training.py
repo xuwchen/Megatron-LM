@@ -3097,7 +3097,7 @@ def train_step(
         _save_state_dict(attr_name="data", label="params")
 
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
-    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    pg_collection = _pg_collection_or_mpu(model[0])
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     for _required in ("mp", "pp", "dp_cp"):
@@ -4166,6 +4166,24 @@ def _diag_install_layer_trace(model):
     print(f"[LAYER] installed on {count} modules", flush=True)
 
 
+
+def _pg_collection_or_mpu(model_chunk):
+    """Get the model's pg_collection, falling back to the MPU process groups.
+
+    Qwen35VLModel does not define pg_collection. With bf16 the attribute is reached by
+    descending the Float16Module wrapper into the language model; with bf16 off that wrapper is
+    absent, the descent ends early and get_attr_wrapped_model raises (it raises rather than
+    returning None — allow_none only governs whether a present-but-None value keeps the descent
+    going). The language module was built from the MPU groups anyway, so fall back to those.
+    """
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    try:
+        return get_attr_wrapped_model(model_chunk, "pg_collection")
+    except RuntimeError:
+        return ProcessGroupCollection.use_mpu_process_groups()
+
+
 def _diag_param_checksum(model, iteration):
     """DIAGNOSTIC: is the weight the GEMM actually sees identical across parallel layouts?
 
@@ -4439,15 +4457,7 @@ def train(
     # reached by descending the Float16Module wrapper into the language model, and without it
     # that wrapper is absent so the descent ends early and this raises. Fall back to the MPU
     # process groups, which is what the language module was constructed from anyway.
-    # get_attr_wrapped_model raises rather than returning None when the attribute is absent
-    # all the way down (allow_none only controls whether a present-but-None value keeps the
-    # descent going), so this has to be a try/except.
-    try:
-        model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
-    except RuntimeError:
-        from megatron.core.process_groups_config import ProcessGroupCollection
-
-        model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_pg_collection = _pg_collection_or_mpu(model[0])
 
     _diag_install_layer_trace(model)
 
@@ -5181,7 +5191,7 @@ def evaluate(
     )
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
-    eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
+    eval_pgc = _pg_collection_or_mpu(model[0])
     if eval_pgc is None:
         eval_pgc = ProcessGroupCollection.use_mpu_process_groups()
     if args.cuda_graph_impl == "full_iteration":
