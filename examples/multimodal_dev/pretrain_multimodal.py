@@ -76,6 +76,22 @@ def model_provider(
         num_layers_override=getattr(args, "vision_num_layers", None),
         variant=getattr(args, "model_variant", None),
     )
+    # DIAGNOSTIC: the GTP-vs-3D forward divergence starts at vision layer 0's mlp.linear_fc2
+    # and everything after it is contaminated, so we cannot tell whether the language model's
+    # own GTP gathers add anything. Take the vision tower out of GTP and find out. The vision
+    # TransformerConfig sets no parallel fields, so its sharding comes from global state;
+    # pin it here. Gated on MCORE_VISION_NO_GTP.
+    import os as _os
+
+    if _os.environ.get("MCORE_VISION_NO_GTP"):
+        _tp = getattr(language_config, "tensor_model_parallel_size", 1)
+        vision_config.tensor_parallel_num_weight_shards = _tp
+        vision_config.gtp_weight_remat_size = 1
+        print(
+            f"[VISION-NO-GTP] vision weight shards pinned to TP={_tp} (GTP disabled)",
+            flush=True,
+        )
+
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
