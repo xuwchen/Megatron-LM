@@ -4063,9 +4063,33 @@ def _diag_install_layer_trace(model):
     # breaking the torch.distributed calls above. Import the symbol instead.
     from torch._dynamo import disable as _dynamo_disable
 
+    # A named module can be singled out for full detail (input + weight + output, two moments
+    # each). The GEMM-site probe missed the origin: it only sees
+    # LinearWithGradAccumulationAndAsyncCommunication, and the vision tower runs through
+    # TransformerEngine, so its first captured call already had a differing input.
+    import os as _os
+
+    focus = _os.environ.get("MCORE_DIAG_LAYER_FOCUS", "")
+
     def make_hook(name):
         @_dynamo_disable
         def hook(_mod, _inp, out):
+            if focus and focus in name:
+                w = getattr(_mod, "weight", None)
+                i = _inp[0] if isinstance(_inp, tuple) and _inp else _inp
+                o = out[0] if isinstance(out, tuple) and out else out
+                parts = []
+                for tag, x in (("in", i), ("w", w), ("out", o)):
+                    if torch.is_tensor(x):
+                        d = x.detach().double()
+                        parts.append(
+                            f"{tag}|1|={d.abs().sum().item():.12e} "
+                            f"{tag}|2|={d.pow(2).sum().item():.12e} "
+                            f"{tag}shape={tuple(x.shape)}"
+                        )
+                    else:
+                        parts.append(f"{tag}=<{type(x).__name__}>")
+                print(f"[FOCUS] {name} " + " ".join(parts), flush=True)
             if budget["left"] <= 0:
                 return
             tensor = out[0] if isinstance(out, tuple) and out else out
