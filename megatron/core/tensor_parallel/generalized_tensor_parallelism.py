@@ -1435,6 +1435,30 @@ class GTPShardedParam(torch.nn.Parameter):
             handle = None
 
         nvtx_range_pop(f"{nvtx_label}.all_gather_weight")
+
+        # DIAGNOSTIC (MCORE_DIAG_AGBUF): report the memory identity of the tensor the GEMM
+        # actually consumes. Under GTP this is a pooled, reused gather buffer keyed by
+        # (padded shape, dtype, expert_idx) with a parity flip; under 3D there is no gather at
+        # all and the GEMM reads the parameter's own storage. cuBLASLt heuristics key on
+        # operand alignment and leading dimension, so a differing base-address alignment or
+        # stride here is a concrete mechanism for "same values, different output" that is also
+        # precision-independent — which matches the fp32 result. Values are NOT re-checked
+        # here; they were already shown identical. This probe is about addresses.
+        import os as _os
+
+        if _os.environ.get("MCORE_DIAG_AGBUF"):
+            _t = result[0] if isinstance(result, (list, tuple)) and result else result
+            if torch.is_tensor(_t) and (
+                not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            ):
+                _p = _t.data_ptr()
+                print(
+                    f"[AGBUF] {self._debug_name} fwd={fwd} shape={tuple(_t.shape)} "
+                    f"stride={tuple(_t.stride())} contig={_t.is_contiguous()} "
+                    f"ptr%512={_p % 512} ptr%256={_p % 256} ptr%128={_p % 128}",
+                    flush=True,
+                )
+
         return result, handle
 
     def _wait_param_gather(self):

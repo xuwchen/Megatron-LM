@@ -4132,10 +4132,18 @@ def _diag_install_layer_trace(model):
                 for tag, x in (("in", i), ("w", w), ("out", o)):
                     if torch.is_tensor(x):
                         d = x.detach().double()
+                        # Memory identity, not just values. The 3D arm's GEMM reads the
+                        # parameter's own storage; GTP's reads a pooled gather buffer. Same
+                        # values with a different base-address alignment or leading dimension
+                        # is enough for cuBLASLt to pick a different kernel, which would be
+                        # precision-independent — the shape the observed difference has.
+                        _p = x.data_ptr()
                         parts.append(
                             f"{tag}|1|={d.abs().sum().item():.12e} "
                             f"{tag}|2|={d.pow(2).sum().item():.12e} "
-                            f"{tag}shape={tuple(x.shape)}"
+                            f"{tag}shape={tuple(x.shape)} "
+                            f"{tag}stride={tuple(x.stride())} "
+                            f"{tag}ptr%512={_p % 512}"
                         )
                     else:
                         parts.append(f"{tag}=<{type(x).__name__}>")
