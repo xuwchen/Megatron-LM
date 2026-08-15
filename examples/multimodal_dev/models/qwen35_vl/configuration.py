@@ -83,6 +83,25 @@ _VISION_VARIANT_CONFIGS = {
 _VISION_DEFAULT = {**_VISION_LARGE, "out_hidden_size": 3584}
 
 
+
+def _vision_ffn_hidden_size(vcfg):
+    """DIAGNOSTIC override for the vision FFN width.
+
+    The GTP-vs-3D forward divergence starts at vision layer 0's mlp.linear_fc2 while
+    mlp.linear_fc1 is bit-identical, with identical inputs and identical weights in both. The
+    two differ in how their contraction dimension factorises: fc1 contracts over hidden
+    (1152 = 2^7 * 9) and fc2 over the FFN width per TP rank (4304 / 2 = 2152 = 8 * 269, and
+    269 is prime), which constrains the tilings a GEMM can pick. Setting this to a power of
+    two tests whether that divisibility is what makes fc2's GEMM execute differently.
+
+    Gated on MCORE_VISION_FFN; unset keeps the real Qwen3.5-VL width.
+    """
+    import os
+
+    override = os.environ.get("MCORE_VISION_FFN")
+    return int(override) if override else vcfg["ffn_hidden_size"]
+
+
 def get_qwen35_vl_vision_config(
     num_layers_override: Optional[int] = None,
     variant: Optional[str] = None,
@@ -117,7 +136,7 @@ def get_qwen35_vl_vision_config(
         hidden_size=vcfg["hidden_size"],
         num_attention_heads=vcfg["num_attention_heads"],
         kv_channels=vcfg["kv_channels"],
-        ffn_hidden_size=vcfg["ffn_hidden_size"],
+        ffn_hidden_size=_vision_ffn_hidden_size(vcfg),
         hidden_dropout=0.0,
         attention_dropout=0.0,
         layernorm_epsilon=1e-6,
