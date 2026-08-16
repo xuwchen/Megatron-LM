@@ -1475,15 +1475,12 @@ class GTPShardedParam(torch.nn.Parameter):
                         .reshape(_rows, *_t0.shape[1:])
                         .contiguous()
                     )
-                    # Write back INTO the gather buffer rather than returning a fresh tensor.
-                    # Returning a copy fixed only the consumers that read this function's
-                    # return value; the pooled buffer itself (reached through the param's
-                    # _ag_ticket_* cache entry) stayed interleaved, so microbatch 0 came out
-                    # bit-identical to 3D while microbatch 1 did not -- measured on
-                    # layers.0.mlp.shared_experts.linear_fc1, where |out|_1 matched to 13
-                    # digits while the index-weighted checksum differed, i.e. a pure
-                    # permutation. Copying in place leaves every consumer seeing one layout.
-                    _t0.copy_(_fixed)
+                    if isinstance(result, list):
+                        result[0] = _fixed
+                    elif isinstance(result, tuple):
+                        result = (_fixed,) + tuple(result[1:])
+                    else:
+                        result = _fixed
 
         # DIAGNOSTIC (MCORE_DIAG_AGBUF): report the memory identity of the tensor the GEMM
         # actually consumes. Under GTP this is a pooled, reused gather buffer keyed by
