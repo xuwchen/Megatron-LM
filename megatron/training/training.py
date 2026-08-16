@@ -4196,8 +4196,9 @@ def _diag_install_layer_trace(model):
                     # prelaunch_command: that ran but the directory still did not exist, and
                     # one less link in the chain is one less thing to debug.
                     _os.makedirs(_dump, exist_ok=True)
+                    _rk = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                     _tag = name.replace("/", "_").replace(".", "_")
-                    _path = _osp.join(_dump, f"{_tag}.pt")
+                    _path = _osp.join(_dump, f"r{_rk}_{_tag}.pt")
                     if not _osp.exists(_path):
                         torch.save(
                             {

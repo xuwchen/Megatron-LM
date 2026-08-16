@@ -1482,7 +1482,12 @@ class GTPShardedParam(torch.nn.Parameter):
                     import os.path as _osp
 
                     _os.makedirs(_dump, exist_ok=True)
-                    _path = _osp.join(_dump, "assembled_" + self._debug_name.replace(".", "_") + ".pt")
+                    _rk = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    # Per-rank filename: every rank writes here now, and a shared path
+                    # meant the first writer won and rank 1 — the broken half — was lost.
+                    _path = _osp.join(
+                        _dump, f"assembled_r{_rk}_" + self._debug_name.replace(".", "_") + ".pt"
+                    )
                     if not _osp.exists(_path):
                         torch.save({"name": self._debug_name, "weight": _t.detach().cpu()}, _path)
                         print(f"[DUMP] wrote {_path}", flush=True)
