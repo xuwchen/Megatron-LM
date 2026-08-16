@@ -495,6 +495,16 @@ def configure_gtp_remat_from_recipe(
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
     )
+    # DIAGNOSTIC (MCORE_GTP_NO_WEIGHT_PREFETCH): weight_prefetch has no CLI knob, so a run
+    # cannot currently test whether the prefetch path is what breaks determinism. Under
+    # deterministic_mode with the full validate_deterministic() checklist satisfied, GTP's
+    # iteration-2 loss still varies run to run by 2.6e-04 while 3D's is bit-identical -- and
+    # the variation disappeared when diagnostic probes (which add stream syncs) were enabled.
+    # That points at the asynchronous prefetch consume path rather than at arithmetic.
+    import os as _os_pf
+
+    if _os_pf.environ.get("MCORE_GTP_NO_WEIGHT_PREFETCH"):
+        update_gtp_config(weight_prefetch=False)
     # An explicit value wins over the recipe default. The alignment pad is otherwise
     # unreachable from the training flow: only these three quantized branches set it,
     # and GTPRematConfig's default of 16 then applies to bf16 runs as well. Being able
