@@ -1006,7 +1006,35 @@ class GatedDeltaNet(MegatronModule):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            # DIAGNOSTIC / FIX (MCORE_DIAG_L2 / MCORE_GDN_TORCH_L2): the intermittent
+            # run-to-run deviation reaches the scan already present in q and k while v and beta
+            # are bit-identical, and this is the only step that touches q and k alone. `l2norm`
+            # is fla's Triton kernel; deterministic_mode swaps the gated_delta_rule
+            # implementation but not this one, and torch.use_deterministic_algorithms cannot
+            # see inside a Triton kernel -- so every determinism check in the training script
+            # passes while this step stays free to vary.
+            import os as _os_l2
+
+            _pre_l2 = query_key.contiguous()
+            if _os_l2.environ.get("MCORE_GDN_TORCH_L2") or (
+                self.config.deterministic_mode
+                and _os_l2.environ.get("MCORE_GDN_TORCH_L2_ON_DETERMINISTIC")
+            ):
+                _f = _pre_l2.float()
+                query_key = (
+                    _f * torch.rsqrt(_f.pow(2).sum(-1, keepdim=True).clamp(min=1e-12))
+                ).to(_pre_l2.dtype)
+            else:
+                query_key = l2norm(_pre_l2)
+            if _os_l2.environ.get("MCORE_DIAG_L2"):
+                _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                GatedDeltaNet._diag_l2 = getattr(GatedDeltaNet, "_diag_l2", 0) + 1
+                print(
+                    f"[L2 r{_r} n{GatedDeltaNet._diag_l2:04d}] "
+                    f"in={_pre_l2.detach().abs().sum(dtype=torch.float64).item():.12e} "
+                    f"out={query_key.detach().abs().sum(dtype=torch.float64).item():.12e} |",
+                    flush=True,
+                )
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size_headwise
