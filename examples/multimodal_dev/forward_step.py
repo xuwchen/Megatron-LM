@@ -385,6 +385,27 @@ def loss_func(loss_mask, output_tensor):
     total_loss = torch.sum(losses.view(-1) * loss_mask)
     reporting_loss = torch.cat([total_loss.clone().detach().view(1), total_tokens.view(1)])
 
+    # DIAGNOSTIC (MCORE_DIAG_LOSS): the reported lm loss differs between 3D and GTP by
+    # 3.162e-02 while every traced module output agrees — including the full-vocab
+    # output_layer under a permutation-sensitive checksum. What gets reported is
+    # sum(total_loss)/sum(total_tokens) reduced over the DP group, so the gap can enter
+    # through the NUMERATOR (per-token CE) or the DENOMINATOR (tokens each rank claims);
+    # 3D is TP8/EP8 and GTP is TP2/GTP4/EP4, so the two arms do not even have the same DP
+    # group shape. Those two have never been separated. This is O(1) — the earlier layer
+    # trace allocated ~1 GB of fp64 indices over the logits and perturbed the run itself.
+    import os as _os_loss
+
+    if _os_loss.environ.get("MCORE_DIAG_LOSS"):
+        _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(
+            f"[LOSS r{_r}] loss_sum={total_loss.detach().double().item():.12e} "
+            f"total_tokens={int(total_tokens.item())} "
+            f"mask_numel={loss_mask.numel()} "
+            f"mask_sum={loss_mask.sum(dtype=torch.float64).item():.6f} "
+            f"out_numel={losses.numel()}",
+            flush=True,
+        )
+
     return (total_loss, total_tokens, {"lm loss": reporting_loss})
 
 
