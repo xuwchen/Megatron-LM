@@ -4281,6 +4281,27 @@ def _diag_install_layer_trace(model):
             # no dump, which matters because the cluster filesystem is not reachable from here.
             _flat = d.reshape(-1)
             _idx = torch.arange(_flat.numel(), device=_flat.device, dtype=torch.float64)
+
+            # MCORE_DIAG_LAYER_ASYNC: record WITHOUT a host sync. The intermittent
+            # nondeterminism under investigation is sync-sensitive -- it vanishes whenever this
+            # trace is enabled, because .item() per module serialises the stream. Writing the
+            # checksums into a preallocated device buffer and reading them once at the end
+            # keeps the timing intact, so the trace can finally observe a deviating run instead
+            # of preventing it.
+            if _os.environ.get("MCORE_DIAG_LAYER_ASYNC"):
+                _buf = budget.get("buf")
+                if _buf is None:
+                    _buf = torch.zeros(budget["cap"], 3, dtype=torch.float64, device=d.device)
+                    budget["buf"] = _buf
+                    budget["names"] = []
+                _slot = budget["n"]
+                if _slot < budget["cap"]:
+                    _buf[_slot, 0] = d.abs().sum(dtype=torch.float64)
+                    _buf[_slot, 1] = (_flat.to(torch.float64) * _idx).sum(dtype=torch.float64)
+                    _buf[_slot, 2] = _flat.to(torch.float64).sum(dtype=torch.float64)
+                    budget["names"].append((_r, budget["n"], name, tuple(tensor.shape)))
+                return
+
             _ramp = (_flat.to(torch.float64) * _idx).sum(dtype=torch.float64).item()
             print(
                 f"[LAYER r{_r} {budget['n']:04d}] {name} shape={tuple(tensor.shape)} "
@@ -4305,7 +4326,27 @@ def _diag_install_layer_trace(model):
                 count += 1
     # One full forward pass per module, with headroom, so truncation cannot decide the answer.
     budget["left"] = count * int(_os.environ.get("MCORE_DIAG_LAYER_PASSES", "1"))
+    budget["cap"] = budget["left"] + 1
+    global _DIAG_LAYER_BUDGET
+    _DIAG_LAYER_BUDGET = budget
     print(f"[LAYER] installed on {count} modules", flush=True)
+
+
+def _diag_flush_layer_trace():
+    """Print the async-recorded layer checksums. One host sync, after training."""
+    budget = _DIAG_LAYER_BUDGET
+    if not budget or budget.get("buf") is None:
+        return
+    rows = budget["buf"][: len(budget["names"])].tolist()
+    for (rk, idx, name, shape), (a, ramp, sign) in zip(budget["names"], rows):
+        print(
+            f"[LAYER r{rk} {idx:04d}] {name} shape={shape} "
+            f"abssum={a:.12e} ramp={ramp:.12e} signsum={sign:.12e}",
+            flush=True,
+        )
+
+
+_DIAG_LAYER_BUDGET = None
 
 
 
@@ -4602,6 +4643,9 @@ def train(
     model_pg_collection = _pg_collection_or_mpu(model[0])
 
     _diag_install_layer_trace(model)
+    import atexit as _atexit_diag
+
+    _atexit_diag.register(_diag_flush_layer_trace)
 
     # Tracking loss.
     total_loss_dict = {}
