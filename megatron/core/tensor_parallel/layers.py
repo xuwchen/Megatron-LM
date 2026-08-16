@@ -372,6 +372,30 @@ class VocabParallelEmbedding(torch.nn.Module):
                     output_parallel, group=self.tp_group
                 )
         elif self.tp_group.size() > 1:
+            # DIAGNOSTIC (MCORE_DIAG_EMB): the intermittent run-to-run deviation was bisected to
+            # this module -- inputs (input_ids) are bit-identical across runs and no optimizer
+            # step has happened, yet the output differs. The only cross-rank step here is this
+            # all-reduce, and the deviation's signature fits it: the two TP ranks in a group stay
+            # bit-identical while groups move independently. Pinning NCCL_ALGO=Ring and
+            # NCCL_PROTO=Simple did NOT stop it (2/3 runs still deviated), so the reduction
+            # itself must be measured rather than assumed. One record per call, which is the
+            # density that has been shown not to suppress the phenomenon.
+            import os as _os_emb
+
+            if _os_emb.environ.get("MCORE_DIAG_EMB"):
+                _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                VocabParallelEmbedding._diag_n = getattr(VocabParallelEmbedding, "_diag_n", 0) + 1
+                _pre = output_parallel.detach().abs().sum(dtype=torch.float64).item()
+                _out = reduce_from_tensor_model_parallel_region(
+                    output_parallel, group=self.tp_group
+                )
+                print(
+                    f"[EMB r{_r} n{VocabParallelEmbedding._diag_n:04d}] "
+                    f"pre_reduce={_pre:.12e} "
+                    f"post_reduce={_out.detach().abs().sum(dtype=torch.float64).item():.12e} |",
+                    flush=True,
+                )
+                return _out
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
         else:
