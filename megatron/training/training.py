@@ -4318,10 +4318,18 @@ def _diag_install_layer_trace(model):
     # the captured module SETS differ (128 vs 112 on one rank, only 58 in common) and
     # "first diverging module" is an artefact of where the budget ran out rather than a fact.
     prefix = _os.environ.get("MCORE_DIAG_LAYER_PREFIX", "")
+    # MCORE_DIAG_LAYER_EXACT: match the module whose name ENDS with the prefix rather than
+    # every descendant. Probe density is the binding constraint here -- a per-module trace
+    # (thousands of records) reliably hides the intermittent deviation, while a probe that
+    # fires once per microbatch (the loss probe) does not. Matching a single top-level module
+    # keeps the density at the safe end while still bracketing a subtree.
+    exact = bool(_os.environ.get("MCORE_DIAG_LAYER_EXACT"))
     count = 0
     for chunk in chunks:
         for name, mod in chunk.named_modules():
-            if name and (not prefix or prefix in name):
+            if name and (
+                name.endswith(prefix) if (exact and prefix) else (not prefix or prefix in name)
+            ):
                 mod.register_forward_hook(make_hook(name))
                 count += 1
     # One full forward pass per module, with headroom, so truncation cannot decide the answer.
