@@ -1452,10 +1452,17 @@ class GTPShardedParam(torch.nn.Parameter):
                 not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             ):
                 _p = _t.data_ptr()
+                # The VALUES matter, not just the address. MCORE_DIAG_WSUM compares the stored
+                # parameter, which under GTP is this rank's SHARD — shards can match while the
+                # assembled tensor does not (padding rows left dirty, shards concatenated in a
+                # different order). This is the operand the GEMM actually consumes, so its
+                # checksum is directly comparable with the 3D arm's plain weight.
+                _d = _t.detach().double()
                 print(
                     f"[AGBUF] {self._debug_name} fwd={fwd} shape={tuple(_t.shape)} "
                     f"stride={tuple(_t.stride())} contig={_t.is_contiguous()} "
-                    f"ptr%512={_p % 512} ptr%256={_p % 256} ptr%128={_p % 128}",
+                    f"ptr%512={_p % 512} ptr%256={_p % 256} ptr%128={_p % 128} "
+                    f"abssum={_d.abs().sum().item():.12e} sqsum={_d.pow(2).sum().item():.12e}",
                     flush=True,
                 )
 
