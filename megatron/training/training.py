@@ -4272,9 +4272,21 @@ def _diag_install_layer_trace(model):
             # fitting without recompute. sum(dtype=) accumulates in fp64 in-kernel instead.
             d = tensor.detach()
             _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            # abssum alone is invariant under any permutation AND under sign flips. Both arms
+            # matched on all 299 executed modules on all 8 ranks while lm loss differed by
+            # 3.162e-02, which is exactly what a layout bug looks like through this instrument
+            # (the fused-SwiGLU defect hid behind |.|_1 agreeing to 13 digits for a full day).
+            # `ramp` weights each element by its flattened index, so it separates a genuine
+            # match from a permutation; `signsum` catches sign flips. Both are cheap and need
+            # no dump, which matters because the cluster filesystem is not reachable from here.
+            _flat = d.reshape(-1)
+            _idx = torch.arange(_flat.numel(), device=_flat.device, dtype=torch.float64)
+            _ramp = (_flat.to(torch.float64) * _idx).sum(dtype=torch.float64).item()
             print(
                 f"[LAYER r{_r} {budget['n']:04d}] {name} shape={tuple(tensor.shape)} "
-                f"abssum={d.abs().sum(dtype=torch.float64).item():.12e}",
+                f"abssum={d.abs().sum(dtype=torch.float64).item():.12e} "
+                f"ramp={_ramp:.12e} "
+                f"signsum={_flat.to(torch.float64).sum(dtype=torch.float64).item():.12e}",
                 flush=True,
             )
 
