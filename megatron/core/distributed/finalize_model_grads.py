@@ -760,8 +760,20 @@ def finalize_model_grads(
                 if _g is None:
                     continue
                 _d = _unshard_if_dtensor(_g).data
+                # abssum alone cannot distinguish "off by a constant factor" from
+                # "structurally different": it is not linear under averaging. Dump the tensor
+                # so the two arms can be compared elementwise and a constant ratio tested.
+                _dump = _os.environ.get("MCORE_DIAG_GDUMP")
+                if _dump and tag == "after_gtp_avg":
+                    import os.path as _osp
+
+                    _os.makedirs(_dump, exist_ok=True)
+                    _f = _osp.join(_dump, _n.replace(".", "_") + ".pt")
+                    if not _osp.exists(_f):
+                        torch.save({"name": _n, "grad": _d.detach().float().cpu()}, _f)
                 print(
-                    f"[GAVG {tag}] {_n} abssum={_d.abs().sum(dtype=torch.float64).item():.12e}",
+                    f"[GAVG {tag}] {_n} abssum={_d.abs().sum(dtype=torch.float64).item():.12e} "
+                    f"sqsum={_d.double().pow(2).sum().item():.12e}",
                     flush=True,
                 )
 
