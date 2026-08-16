@@ -627,6 +627,31 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
             setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
 
 
+
+def _glocal_probe(model, tag):
+    """Checksum a couple of replicated params' LOCAL grads (pre-DDP-reduce), all ranks."""
+    import os as _os
+
+    if not _os.environ.get("MCORE_DIAG_GLOCAL"):
+        return
+    _rk = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    for _chunk in model:
+        for _n, _p in get_attr_wrapped_model(_chunk, 'named_parameters')():
+            if not _p.requires_grad or getattr(_p, 'is_gtp_weight_remat', False):
+                continue
+            if not _n.endswith("final_layernorm.weight"):
+                continue
+            _g = getattr(_p, _get_main_grad_attr(_p), None)
+            if _g is None:
+                continue
+            _d = _unshard_if_dtensor(_g).data
+            print(
+                f"[GLOCAL r{_rk} {tag}] {_n} abssum={_d.abs().sum(dtype=torch.float64).item():.12e}",
+                flush=True,
+            )
+
+
+
 def finalize_model_grads(
     model: List[torch.nn.Module],
     num_tokens: Optional[torch.Tensor] = None,
@@ -711,6 +736,14 @@ def finalize_model_grads(
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    # DIAGNOSTIC (MCORE_DIAG_GLOCAL): the LOCAL grad, before DDP's all-reduce. This is
+    # the last unmeasured link: the gtp AVG was verified exact (== mean, divisor 4), the
+    # scaling factors are 1/4 on both sides, the forward matches to 2e-8 and the data
+    # partition is identical per rank — yet the reduced grads differ 3.34x. Either the
+    # local grads differ or one of those checks is wrong.
+    _glocal_probe(model, 'pre_ddp_sync')
+
     for model_chunk in model:
         model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
     _diag_expert_grad_scan(model, "after_dp_sync")
