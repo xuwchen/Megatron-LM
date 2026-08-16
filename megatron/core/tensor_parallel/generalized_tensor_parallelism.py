@@ -460,6 +460,19 @@ def tag_gtp_params_with_names(model):
         if is_gtp_param(param):
             param._debug_name = name
 
+    # Mark the fused gate|up weights so the gather site can de-interleave them. A GLU MLP's
+    # fc1 emits [gate | up] along dim0; GTP chunks straddle that boundary, so the gathered
+    # concatenation interleaves the two and the activation pairs the wrong halves.
+    for mod_name, mod in model.named_modules():
+        if not mod_name.endswith("linear_fc1"):
+            continue
+        cfg = getattr(mod, "config", None)
+        if cfg is None or not getattr(cfg, "gated_linear_unit", False):
+            continue
+        w = getattr(mod, "weight", None)
+        if w is not None and is_gtp_param(w):
+            w._gtp_gated_fused = True
+
 
 def configure_gtp_remat_from_recipe(
     *,
@@ -1435,6 +1448,39 @@ class GTPShardedParam(torch.nn.Parameter):
             handle = None
 
         nvtx_range_pop(f"{nvtx_label}.all_gather_weight")
+
+        # A gated (SwiGLU) MLP fuses gate and up into one weight whose dim0 is [gate | up].
+        # GTP shards that along dim0, so every chunk straddles the boundary and holds a slice
+        # of BOTH. The all-gather then concatenates chunks, producing
+        #     [g0, u0, g1, u1, ...]   instead of   [g0, g1, ..., u0, u1, ...]
+        # and the activation, which splits dim0 in half, pairs the wrong halves. Measured on
+        # shared_experts.linear_fc1 (GTP=4): 3D block i == GTP block [0,2,4,6,1,3,5,7], the
+        # multisets identical, 785724/1048576 elements out of place. L1 is permutation
+        # invariant, which is why every checksum probe called this "bit-identical".
+        # De-interleave here to restore the logical [all gate | all up] layout.
+        import os as _os_glu
+
+        if _os_glu.environ.get("MCORE_GTP_DEINTERLEAVE_GLU") and getattr(
+            self, "_gtp_gated_fused", False
+        ):
+            _t0 = result[0] if isinstance(result, (list, tuple)) and result else result
+            if torch.is_tensor(_t0):
+                _n = gtp_remat_size if (gtp_remat_size := self.group.size()) else 1
+                _rows = _t0.shape[0]
+                if _n > 1 and _rows % (2 * _n) == 0:
+                    _c = _rows // (2 * _n)
+                    _fixed = (
+                        _t0.view(_n, 2, _c, *_t0.shape[1:])
+                        .transpose(0, 1)
+                        .reshape(_rows, *_t0.shape[1:])
+                        .contiguous()
+                    )
+                    if isinstance(result, list):
+                        result[0] = _fixed
+                    elif isinstance(result, tuple):
+                        result = (_fixed,) + tuple(result[1:])
+                    else:
+                        result = _fixed
 
         # DIAGNOSTIC (MCORE_DIAG_AGBUF): report the memory identity of the tensor the GEMM
         # actually consumes. Under GTP this is a pooled, reused gather buffer keyed by
