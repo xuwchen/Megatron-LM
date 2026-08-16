@@ -293,6 +293,29 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self.routing_map = routing_map
+
+        # DIAGNOSTIC (MCORE_DIAG_DISPATCH): the dispatcher's own inputs, before any
+        # permutation or communication. The router MODULE output is bit-identical between the
+        # GTP and 3D arms, but its abssum is permutation-invariant, so that check cannot see a
+        # reordered routing_map. routing_map is integer/bool — comparing it exactly settles
+        # whether the token->expert assignment really matches.
+        import os as _os_d
+
+        if _os_d.environ.get("MCORE_DIAG_DISPATCH"):
+            import torch.distributed as _dist
+
+            _r = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+            if _r in (0, 1):
+                _rm = routing_map
+                print(
+                    f"[DISPATCH r{_r}] hidden shape={tuple(hidden_states.shape)} "
+                    f"abssum={hidden_states.detach().abs().sum(dtype=torch.float64).item():.12e} | "
+                    f"routing_map shape={tuple(_rm.shape)} dtype={_rm.dtype} "
+                    f"sum={_rm.detach().sum().item()} "
+                    f"hash={int(_rm.detach().to(torch.int64).flatten()[:4096].sum().item())} | "
+                    f"probs abssum={probs.detach().abs().sum(dtype=torch.float64).item():.12e}",
+                    flush=True,
+                )
         return hidden_states, probs
 
     def token_dispatch(self, hidden_states, probs):
