@@ -697,6 +697,29 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
+
+        # DIAGNOSTIC (MCORE_DIAG_DISPATCH): the AllToAll dispatcher's inputs, before any
+        # permutation or communication. routing_map is a BOOL mask, so comparing it exactly
+        # settles whether the token->expert assignment matches — the router module's abssum,
+        # which is what "router output identical" rested on, is permutation-invariant and
+        # cannot see a reordering.
+        import os as _os_d
+
+        if _os_d.environ.get("MCORE_DIAG_DISPATCH"):
+            import torch.distributed as _dist
+
+            _r = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+            if _r in (0, 1):
+                _f = routing_map.detach().to(torch.int64).flatten()
+                _idx = torch.nonzero(_f, as_tuple=False).flatten()
+                print(
+                    f"[DISPATCH r{_r}] hidden={tuple(hidden_states.shape)} "
+                    f"h_abssum={hidden_states.detach().abs().sum(dtype=torch.float64).item():.12e} | "
+                    f"map={tuple(routing_map.shape)} true_count={int(_f.sum().item())} "
+                    f"idx_sum={int(_idx.sum().item())} idx_head={_idx[:6].tolist()} | "
+                    f"probs_abssum={probs.detach().abs().sum(dtype=torch.float64).item():.12e}",
+                    flush=True,
+                )
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         if self.config.moe_router_padding_for_quantization:
