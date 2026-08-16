@@ -382,12 +382,21 @@ class VocabParallelEmbedding(torch.nn.Module):
                     VocabParallelEmbedding._diag_n = (
                         getattr(VocabParallelEmbedding, "_diag_n", 0) + 1
                     )
+                    # pre_reduce already differs in a deviating run (320/336 records), so the
+                    # collective is not the source and the difference is in output_parallel
+                    # itself. With input_ids proven bit-identical and no optimizer step yet,
+                    # the only remaining input to this lookup is the WEIGHT -- measure it
+                    # rather than assume it is unchanged.
+                    _w2 = weight.detach()
+                    _wsum = _w2.abs().sum(dtype=torch.float64).item()
                     _pre2 = output_parallel.detach().abs().sum(dtype=torch.float64).item()
                     _out2 = reduce_scatter_to_sequence_parallel_region(
                         output_parallel, group=self.tp_group
                     )
                     print(
                         f"[EMB r{_r2} n{VocabParallelEmbedding._diag_n:04d}] "
+                        f"weight={_wsum:.12e} "
+                        f"in_sum={int(masked_input.sum().item())} "
                         f"pre_reduce={_pre2:.12e} "
                         f"post_reduce={_out2.detach().abs().sum(dtype=torch.float64).item():.12e} |",
                         flush=True,
