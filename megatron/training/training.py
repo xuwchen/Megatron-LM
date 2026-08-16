@@ -4183,6 +4183,10 @@ def _diag_install_layer_trace(model):
                 if _dump:
                     import os.path as _osp
 
+                    # Create the directory here rather than relying on the launcher's
+                    # prelaunch_command: that ran but the directory still did not exist, and
+                    # one less link in the chain is one less thing to debug.
+                    _os.makedirs(_dump, exist_ok=True)
                     _tag = name.replace("/", "_").replace(".", "_")
                     _path = _osp.join(_dump, f"{_tag}.pt")
                     if not _osp.exists(_path):
