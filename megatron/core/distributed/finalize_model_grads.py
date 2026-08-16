@@ -767,11 +767,14 @@ def finalize_model_grads(
                 # "structurally different": it is not linear under averaging. Dump the tensor
                 # so the two arms can be compared elementwise and a constant ratio tested.
                 _dump = _os.environ.get("MCORE_DIAG_GDUMP")
-                if _dump and tag == "after_gtp_avg":
+                # Dump BOTH sides: the mean of the pre-AVG peers can then be computed offline
+                # and compared with the post-AVG value. abssum is non-linear under averaging,
+                # so only the tensors themselves can settle whether the AVG is correct.
+                if _dump:
                     import os.path as _osp
 
                     _os.makedirs(_dump, exist_ok=True)
-                    _f = _osp.join(_dump, _n.replace(".", "_") + ".pt")
+                    _f = _osp.join(_dump, f"{tag}_r{_rk}_" + _n.replace(".", "_") + ".pt")
                     if not _osp.exists(_f):
                         torch.save({"name": _n, "grad": _d.detach().float().cpu()}, _f)
                 print(
