@@ -315,6 +315,24 @@ def loss_func(
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
 
+    # DIAGNOSTIC (MCORE_DIAG_LOSS): the reported lm loss differs between 3D and GTP by
+    # 3.162e-02 while every traced module output — including the full-vocab output_layer,
+    # checked with a permutation-sensitive checksum — agrees. What is reported is
+    # sum(loss)/sum(num_tokens) reduced over the DP group, so a mismatch can equally come
+    # from the NUMERATOR (per-token CE) or the DENOMINATOR (how many tokens each rank
+    # claims). Those two have never been separated; this prints both, per rank, unreduced.
+    import os as _os_loss
+
+    if _os_loss.environ.get("MCORE_DIAG_LOSS"):
+        _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _lm = loss_mask.view(-1).float()
+        print(
+            f"[LOSS r{_r}] loss_sum={loss.detach().double().item():.12e} "
+            f"num_tokens={int(num_tokens.item())} "
+            f"mask_numel={_lm.numel()} mask_sum={_lm.sum(dtype=torch.float64).item():.6f}",
+            flush=True,
+        )
+
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
