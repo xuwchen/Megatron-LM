@@ -4230,13 +4230,19 @@ def _diag_install_layer_trace(model):
 
         return hook
 
+    # MCORE_DIAG_LAYER_PREFIX restricts the trace to a subtree. Without it the budget is
+    # spent across the whole model and each rank/arm gets truncated at a different point, so
+    # the captured module SETS differ (128 vs 112 on one rank, only 58 in common) and
+    # "first diverging module" is an artefact of where the budget ran out rather than a fact.
+    prefix = _os.environ.get("MCORE_DIAG_LAYER_PREFIX", "")
     count = 0
     for chunk in chunks:
         for name, mod in chunk.named_modules():
-            if name:
+            if name and (not prefix or prefix in name):
                 mod.register_forward_hook(make_hook(name))
                 count += 1
-    budget["left"] = count
+    # One full forward pass per module, with headroom, so truncation cannot decide the answer.
+    budget["left"] = count * int(_os.environ.get("MCORE_DIAG_LAYER_PASSES", "1"))
     print(f"[LAYER] installed on {count} modules", flush=True)
 
 
