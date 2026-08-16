@@ -438,11 +438,16 @@ def forward_step(data_iterator, model):
             if torch.is_tensor(_pv)
             else float("nan")
         )
+        # Sequence number, because forward_step runs once per microbatch and the log lines of
+        # 8 ranks arrive concatenated. Without it, pairing a DATA record with a LOSS record
+        # across two runs is guesswork -- the first attempt produced "input differs but loss
+        # is identical", which is not a physical result, only a mis-pairing.
+        forward_step._diag_seq = getattr(forward_step, "_diag_seq", 0) + 1
         print(
-            f"[DATA r{_r}] ids_shape={tuple(_ids.shape)} "
+            f"[DATA r{_r} n{forward_step._diag_seq:04d}] ids_shape={tuple(_ids.shape)} "
             f"ids_sum={int(_ids.sum().item())} "
             f"ids_head={_ids.reshape(-1)[:6].tolist()} "
-            f"pixel_abssum={_pv_sum:.9e}",
+            f"pixel_abssum={_pv_sum:.9e} |",
             flush=True,
         )
 
