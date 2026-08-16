@@ -4174,6 +4174,28 @@ def _diag_install_layer_trace(model):
                     else:
                         parts.append(f"{tag}=<{type(x).__name__}>")
                 print(f"[FOCUS] {name} " + " ".join(parts), flush=True)
+                # MCORE_DIAG_DUMP=<dir>: save the exact tensors this GEMM consumed so the
+                # single call can be replayed in one process on one GPU. Checksums (L1+L2)
+                # already match across arms, so a replay that also matches proves the operands
+                # are equivalent and the difference lives in process state (cuBLASLt workspace,
+                # heuristic cache, preceding kernels) rather than in the data.
+                _dump = _os.environ.get("MCORE_DIAG_DUMP")
+                if _dump:
+                    import os.path as _osp
+
+                    _tag = name.replace("/", "_").replace(".", "_")
+                    _path = _osp.join(_dump, f"{_tag}.pt")
+                    if not _osp.exists(_path):
+                        torch.save(
+                            {
+                                "name": name,
+                                "input": i.detach().cpu() if torch.is_tensor(i) else None,
+                                "weight": w.detach().cpu() if torch.is_tensor(w) else None,
+                                "output": o.detach().cpu() if torch.is_tensor(o) else None,
+                            },
+                            _path,
+                        )
+                        print(f"[DUMP] wrote {_path}", flush=True)
             if budget["left"] <= 0:
                 return
             tensor = out[0] if isinstance(out, tuple) and out else out
