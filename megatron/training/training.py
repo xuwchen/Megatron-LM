@@ -4328,7 +4328,9 @@ def _diag_install_layer_trace(model):
     for chunk in chunks:
         for name, mod in chunk.named_modules():
             if name and (
-                name.endswith(prefix) if (exact and prefix) else (not prefix or prefix in name)
+                any(name.endswith(x) for x in prefix.split(","))
+                if (exact and prefix)
+                else (not prefix or prefix in name)
             ):
                 mod.register_forward_hook(make_hook(name))
                 count += 1
