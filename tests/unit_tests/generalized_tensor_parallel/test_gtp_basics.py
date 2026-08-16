@@ -765,6 +765,69 @@ class TestGTPMicrobatches:
         _run_distributed(_worker_microbatches, 4)
 
 
+def _worker_gated_fused_microbatches(rank, world_size, port):
+    """A fused GLU weight must reach the GEMM as [all gate | all up] on EVERY microbatch.
+
+    Regression guard. A GLU MLP fuses gate and up into one weight whose dim0 is [gate | up].
+    GTP shards that along dim0, so every chunk straddles the boundary and the all-gather
+    concatenation comes back as [g0, u0, g1, u1, ...] instead of [g0, g1, ..., u0, u1, ...].
+    The activation then splits dim0 in half and pairs the wrong halves.
+
+    Why the existing microbatch test does not cover this: it uses a plain (non-gated) linear,
+    and the defect is invisible to any checksum -- |.|_1 is permutation-invariant, and it
+    matched to 13 significant digits while 785724 of 1048576 elements were out of place.
+
+    Why TWO microbatches: a weight is obtained either by _all_gather_weight_on_demand or by
+    _get_prefetched_weight, and the prefetch chain is built during the first forward. So
+    microbatch 0 takes one path and microbatch 1 the other. A fix applied to only one of them
+    passes microbatch 0 and fails microbatch 1 -- which is exactly how this shipped, costing a
+    3.162e-02 loss gap that looked like a converged model drifting.
+    """
+    torch.manual_seed(0)
+    batch, in_f, out_f = 8, 64, 128
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    # Two layers so the prefetch chain has links to build; one alone never takes that path.
+    layers = [_make_gtp_linear(in_f, out_f, gtp_remat_group, dtype) for _ in range(2)]
+    for layer in layers:
+        layer.weight._gtp_gated_fused = True
+
+    # Reference: gather the shards and undo the interleave explicitly, independent of the
+    # code under test.
+    def reference_weight(layer):
+        shard = layer.weight.data.contiguous()
+        parts = [torch.empty_like(shard) for _ in range(world_size)]
+        dist.all_gather(parts, shard, group=gtp_remat_group)
+        rows = out_f
+        chunk = rows // (2 * world_size)
+        stacked = torch.cat(parts, dim=0).view(world_size, 2, chunk, in_f)
+        return stacked.transpose(0, 1).reshape(rows, in_f)
+
+    refs = [reference_weight(layer) for layer in layers]
+
+    inp = torch.randn(batch, in_f, dtype=dtype, device="cuda")
+    dist.broadcast(inp, src=0)
+
+    for mb, is_first in enumerate((True, False)):
+        x = inp
+        for layer, ref in zip(layers, refs):
+            got = layer(x, is_first_microbatch=is_first)
+            want = torch.nn.functional.linear(x, ref)
+            assert torch.equal(got, want), (
+                f"microbatch {mb}: fused gate|up reached the GEMM interleaved "
+                f"(max_diff={(got.float()-want.float()).abs().max():.6f}). "
+                f"Note |out|_1 agrees under a permutation -- compare elementwise."
+            )
+            x = got.detach()
+
+
+class TestGTPGatedFusedLayout:
+    def test_gated_fused_layout_every_microbatch(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_gated_fused_microbatches, 4)
+
+
 # ---------------------------------------------------------------------------
 # MXFP8 + GTP_remat: Linear forward/backward, quantized shard setup
 # ---------------------------------------------------------------------------
