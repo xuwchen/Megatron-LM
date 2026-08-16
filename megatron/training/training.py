@@ -4157,7 +4157,7 @@ def _diag_install_layer_trace(model):
                 parts = []
                 for tag, x in (("in", i), ("w", w), ("out", o)):
                     if torch.is_tensor(x):
-                        d = x.detach().double()
+                        d = x.detach()
                         # Memory identity, not just values. The 3D arm's GEMM reads the
                         # parameter's own storage; GTP's reads a pooled gather buffer. Same
                         # values with a different base-address alignment or leading dimension
@@ -4165,8 +4165,8 @@ def _diag_install_layer_trace(model):
                         # precision-independent — the shape the observed difference has.
                         _p = x.data_ptr()
                         parts.append(
-                            f"{tag}|1|={d.abs().sum().item():.12e} "
-                            f"{tag}|2|={d.pow(2).sum().item():.12e} "
+                            f"{tag}|1|={d.abs().sum(dtype=torch.float64).item():.12e} "
+                            f"{tag}|2|={d.pow(2).sum(dtype=torch.float64).item():.12e} "
                             f"{tag}shape={tuple(x.shape)} "
                             f"{tag}stride={tuple(x.stride())} "
                             f"{tag}ptr%512={_p % 512}"
@@ -4181,10 +4181,14 @@ def _diag_install_layer_trace(model):
                 return
             budget["left"] -= 1
             budget["n"] += 1
-            d = tensor.detach().double()
+            # Accumulate in fp64 WITHOUT materialising an fp64 copy of the activation.
+            # `tensor.detach().double()` allocated a full second tensor and OOM'd at 3.79 GiB
+            # on the biggest activations — which I first misread as the training config not
+            # fitting without recompute. sum(dtype=) accumulates in fp64 in-kernel instead.
+            d = tensor.detach()
             print(
                 f"[LAYER {budget['n']:04d}] {name} shape={tuple(tensor.shape)} "
-                f"abssum={d.abs().sum().item():.12e}",
+                f"abssum={d.abs().sum(dtype=torch.float64).item():.12e}",
                 flush=True,
             )
 

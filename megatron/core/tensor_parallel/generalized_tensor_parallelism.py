@@ -1457,12 +1457,13 @@ class GTPShardedParam(torch.nn.Parameter):
                 # assembled tensor does not (padding rows left dirty, shards concatenated in a
                 # different order). This is the operand the GEMM actually consumes, so its
                 # checksum is directly comparable with the 3D arm's plain weight.
-                _d = _t.detach().double()
+                _d = _t.detach()
                 print(
                     f"[AGBUF] {self._debug_name} fwd={fwd} shape={tuple(_t.shape)} "
                     f"stride={tuple(_t.stride())} contig={_t.is_contiguous()} "
                     f"ptr%512={_p % 512} ptr%256={_p % 256} ptr%128={_p % 128} "
-                    f"abssum={_d.abs().sum().item():.12e} sqsum={_d.pow(2).sum().item():.12e}",
+                    f"abssum={_d.abs().sum(dtype=torch.float64).item():.12e} "
+                    f"sqsum={_d.pow(2).sum(dtype=torch.float64).item():.12e}",
                     flush=True,
                 )
 
