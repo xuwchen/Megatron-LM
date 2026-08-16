@@ -1448,8 +1448,14 @@ class GTPShardedParam(torch.nn.Parameter):
 
         if _os.environ.get("MCORE_DIAG_AGBUF"):
             _t = result[0] if isinstance(result, (list, tuple)) and result else result
+            # All ranks, not just 0: the first divergence is on rank 1's COLUMN-parallel fc1
+            # (rel 1.110e-02 with a bit-identical input), while rank 0 is clean. A rank-0-only
+            # probe is blind to exactly the half that is wrong.
+            _allranks = _os.environ.get("MCORE_DIAG_ALLRANKS")
             if torch.is_tensor(_t) and (
-                not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+                not torch.distributed.is_initialized()
+                or _allranks
+                or torch.distributed.get_rank() == 0
             ):
                 _p = _t.data_ptr()
                 # The VALUES matter, not just the address. MCORE_DIAG_WSUM compares the stored
@@ -1459,7 +1465,8 @@ class GTPShardedParam(torch.nn.Parameter):
                 # checksum is directly comparable with the 3D arm's plain weight.
                 _d = _t.detach()
                 print(
-                    f"[AGBUF] {self._debug_name} fwd={fwd} shape={tuple(_t.shape)} "
+                    f"[AGBUF r{torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}]"
+                    f" {self._debug_name} fwd={fwd} shape={tuple(_t.shape)} "
                     f"stride={tuple(_t.stride())} contig={_t.is_contiguous()} "
                     f"ptr%512={_p % 512} ptr%256={_p % 256} ptr%128={_p % 128} "
                     f"abssum={_d.abs().sum(dtype=torch.float64).item():.12e} "
@@ -1471,7 +1478,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 # the (1152, 2152) tensor the GEMM consumes — replaying that shard compares the
                 # wrong thing. Only this site has the real operand.
                 _dump = _os.environ.get("MCORE_DIAG_DUMP")
-                if _dump and "linear_fc2" in self._debug_name and fwd:
+                if _dump and ("linear_fc2" in self._debug_name or "linear_fc1" in self._debug_name) and fwd:
                     import os.path as _osp
 
                     _os.makedirs(_dump, exist_ok=True)
