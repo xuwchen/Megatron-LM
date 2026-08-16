@@ -4126,7 +4126,16 @@ def _diag_install_layer_trace(model):
 
     if not os.environ.get("MCORE_DIAG_LAYER"):
         return
-    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+    # MCORE_DIAG_ALLRANKS: keep the hook on every rank. linear_fc2 is row-parallel, so the
+    # module output is a TP all-reduce of per-rank partial products. Rank 0's operands and its
+    # GEMM were proven bit-identical between the arms (elementwise, and by single-process
+    # replay), yet the module outputs differ — so the difference enters through the OTHER TP
+    # rank's contribution or through the reduction. A rank-0-only probe cannot see either.
+    if (
+        not os.environ.get("MCORE_DIAG_ALLRANKS")
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_rank() != 0
+    ):
         return
 
     chunks = model if isinstance(model, list) else [model]
@@ -4173,7 +4182,7 @@ def _diag_install_layer_trace(model):
                         )
                     else:
                         parts.append(f"{tag}=<{type(x).__name__}>")
-                print(f"[FOCUS] {name} " + " ".join(parts), flush=True)
+                print(f"[FOCUS r{torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}] {name} " + " ".join(parts), flush=True)
                 # MCORE_DIAG_DUMP=<dir>: save the exact tensors this GEMM consumed so the
                 # single call can be replayed in one process on one GPU. Checksums (L1+L2)
                 # already match across arms, so a replay that also matches proves the operands
