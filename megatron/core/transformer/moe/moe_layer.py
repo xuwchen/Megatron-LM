@@ -197,6 +197,23 @@ class BaseMoELayer(MegatronModule, ABC):
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
         assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
+
+        # DIAGNOSTIC (MCORE_DIAG_EXPMAP): which experts live on this rank. With TP=2 x GTP=4
+        # already consuming all 8 ranks, the ep axis has to share ranks with the gtp axis, so
+        # the expert->rank mapping may differ from the 3D arm. That would reorder the top-k
+        # accumulation and produce exactly the ulp-level difference measured at the dispatch
+        # (rel 2.75e-08 on the expert input, router output bit-identical).
+        import os as _os_em
+
+        if _os_em.environ.get("MCORE_DIAG_EXPMAP"):
+            import torch.distributed as _dist
+
+            _r = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+            print(
+                f"[EXPMAP r{_r}] ep_rank={ep_rank} num_local={self.num_local_experts} "
+                f"local_experts={self.local_expert_indices}",
+                flush=True,
+            )
         self.router: RouterInterface = None
         self.experts = None
         self.shared_experts = None
