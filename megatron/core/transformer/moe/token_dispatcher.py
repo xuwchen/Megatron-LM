@@ -819,6 +819,21 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             use_nccl_stream=self.use_nccl_stream,
         )
 
+        # DIAGNOSTIC (MCORE_DIAG_DISPATCH): straight after the all-to-all. permute() output
+        # is bit-identical across the arms, so anything differing here came out of the
+        # collective itself — which is pure data movement and should not change values.
+        import os as _os_a
+
+        if _os_a.environ.get("MCORE_DIAG_DISPATCH"):
+            import torch.distributed as _dist
+
+            _r = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+            if _r in (0, 1) and torch.is_tensor(global_input_tokens):
+                print(
+                    f"[A2A r{_r}] tokens={tuple(global_input_tokens.shape)} "
+                    f"abssum={global_input_tokens.detach().abs().sum(dtype=torch.float64).item():.12e}",
+                    flush=True,
+                )
         return global_input_tokens, global_probs
 
     def dispatch_postprocess(self, global_input_tokens, global_probs):
