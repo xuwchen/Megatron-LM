@@ -421,6 +421,31 @@ def forward_step(data_iterator, model):
     if batch is None:
         return None, None
 
+    # DIAGNOSTIC (MCORE_DIAG_DATA): separate a data-path nondeterminism from a compute one.
+    # Four repeats of the SAME arm on one node: three were bitwise identical and one produced
+    # different per-rank losses on three of the four DP groups, with values that appear nowhere
+    # in the other runs -- so not a permutation of the same samples. A whole-run, multi-group
+    # deviation looks far more like the input pipeline than like a kernel race, but the loss
+    # probe cannot tell those apart. This checksums what the model was actually fed.
+    import os as _os_data
+
+    if _os_data.environ.get("MCORE_DIAG_DATA"):
+        _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _ids = batch["input_ids"]
+        _pv = batch.get("pixel_values", None)
+        _pv_sum = (
+            _pv.detach().float().abs().sum(dtype=torch.float64).item()
+            if torch.is_tensor(_pv)
+            else float("nan")
+        )
+        print(
+            f"[DATA r{_r}] ids_shape={tuple(_ids.shape)} "
+            f"ids_sum={int(_ids.sum().item())} "
+            f"ids_head={_ids.reshape(-1)[:6].tolist()} "
+            f"pixel_abssum={_pv_sum:.9e}",
+            flush=True,
+        )
+
     pixel_values = batch.get("pixel_values", None)
     if (
         pixel_values is not None
