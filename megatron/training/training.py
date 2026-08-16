@@ -3079,6 +3079,7 @@ def train_step(
     _gtp_diag_embedding_grad(model, args.curr_iteration, where="pre_step")
     _diag_param_checksum(model, args.curr_iteration)
     _diag_per_param_checksum(model, args.curr_iteration)
+    _diag_per_param_grad(model, args.curr_iteration)
     _diag_kernel_names(args.curr_iteration)
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
@@ -4061,6 +4062,47 @@ def _diag_per_param_checksum(model, iteration):
 
 
 _DIAG_KERN = {"prof": None}
+
+
+
+def _diag_per_param_grad(model, iteration):
+    """DIAGNOSTIC: per-parameter GRADIENT checksum, taken BEFORE optimizer.step().
+
+    With both layout defects neutralised the forward is aligned to ~2e-8 (first differing
+    module is the routed-expert GEMM, i.e. grouped-GEMM accumulation order), yet the
+    20-iteration loss gap is 3.2e-2 — six orders larger. That rules the forward out and puts
+    the remaining cause in backward / gradient reduction / the optimizer. This is the forward
+    probe's counterpart on the gradient side.
+
+    main_grad only carries gradient semantics between the end of backward and the step, which
+    is where this is called from. Gated on MCORE_DIAG_GSUM=<iteration list>.
+    """
+    import os
+
+    want = os.environ.get("MCORE_DIAG_GSUM")
+    if not want or str(iteration) not in want.split(","):
+        return
+    from megatron.core.utils import get_attr_wrapped_model
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    allranks = os.environ.get("MCORE_DIAG_ALLRANKS")
+    if rank != 0 and not allranks:
+        return
+    for chunk in (model if isinstance(model, list) else [model]):
+        for name, param in get_attr_wrapped_model(chunk, "named_parameters")():
+            if not param.requires_grad:
+                continue
+            g = getattr(param, "main_grad", None)
+            if g is None:
+                g = param.grad
+            if g is None:
+                continue
+            d = g.detach()
+            print(
+                f"[GSUM r{rank} it{iteration}] {name} shape={tuple(d.shape)} "
+                f"abssum={d.abs().sum(dtype=torch.float64).item():.12e}",
+                flush=True,
+            )
 
 
 def _diag_kernel_names(iteration):
