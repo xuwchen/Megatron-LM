@@ -624,6 +624,26 @@ class GatedDeltaNet(MegatronModule):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
+        # DIAGNOSTIC (MCORE_DIAG_GDN2): in_proj's output is bit-identical in a deviating run
+        # while out_norm's is not, and TWO steps sit in between -- the causal conv / pre-rule
+        # preparation, and the chunked scan itself. Saying "the scan" without splitting them
+        # would be a guess. One record per call, the density already shown not to suppress the
+        # phenomenon.
+        import os as _os_gdn2
+
+        _diag_gdn2 = _os_gdn2.environ.get("MCORE_DIAG_GDN2")
+        if _diag_gdn2:
+            _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            GatedDeltaNet._diag_n = getattr(GatedDeltaNet, "_diag_n", 0) + 1
+            print(
+                f"[GDN2 r{_r} n{GatedDeltaNet._diag_n:04d}] "
+                f"q={query.detach().abs().sum(dtype=torch.float64).item():.12e} "
+                f"k={key.detach().abs().sum(dtype=torch.float64).item():.12e} "
+                f"v={value.detach().abs().sum(dtype=torch.float64).item():.12e} "
+                f"beta={beta.detach().abs().sum(dtype=torch.float64).item():.12e} |",
+                flush=True,
+            )
+
         core_attn_out, _ = self.gated_delta_rule(
             query,
             key,
@@ -637,6 +657,13 @@ class GatedDeltaNet(MegatronModule):
             cp_context=chunkwise_cp_context,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
+        if _diag_gdn2:
+            print(
+                f"[GDN2OUT r{torch.distributed.get_rank()} n{GatedDeltaNet._diag_n:04d}] "
+                f"scan_out={core_attn_out.detach().abs().sum(dtype=torch.float64).item():.12e} |",
+                flush=True,
+            )
+
 
         # RMSNorm
         nvtx_range_push(suffix="gated_norm")
