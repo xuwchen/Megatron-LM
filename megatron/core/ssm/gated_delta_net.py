@@ -256,6 +256,23 @@ class GatedDeltaNet(MegatronModule):
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
 
+        # DIAGNOSTIC: an intermittent, timing-sensitive run-to-run deviation (~1 run in 4,
+        # ~1e-4) was bisected to exactly this block -- in_proj's output is bit-identical while
+        # out_norm's is not, and the scan between them is the only step in between. The run
+        # requests deterministic_mode, which is supposed to select the torch implementation
+        # here, so the question is whether THIS config object actually carries the flag: the
+        # VLM builds its language model from a separate TransformerConfig, and a flag that did
+        # not propagate would silently leave the Triton kernel in place while every
+        # determinism check in the training script still reports success.
+        import os as _os_gdn
+
+        if _os_gdn.environ.get("MCORE_DIAG_GDN") and torch.distributed.get_rank() == 0:
+            print(
+                f"[GDN] deterministic_mode={self.config.deterministic_mode} "
+                f"impl={getattr(self.gated_delta_rule, '__name__', self.gated_delta_rule)}",
+                flush=True,
+            )
+
         # Output layernorm before projection
         self.out_norm = build_module(
             submodules.out_norm,
