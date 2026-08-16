@@ -738,12 +738,41 @@ def finalize_model_grads(
     _rescale_expert_grads_for_gtp_remat(
         model, gtp_remat_group, egtp_remat_group, config.calculate_per_token_loss
     )
+    # DIAGNOSTIC (MCORE_DIAG_GAVG): bracket the gtp-axis AVG for REPLICATED params. The
+    # forward is aligned to 2e-8 with both layout defects fixed, yet these grads differ by
+    # O(1) between the arms after finalization. Sampling either side separates "backward
+    # produced different grads" from "the gtp-axis normalization is wrong" — the same matched
+    # pair that located the expert-grad defect in one step.
+    def _gavg_probe(tag):
+        import os as _os
+
+        if not _os.environ.get("MCORE_DIAG_GAVG"):
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        for _chunk in model:
+            for _n, _p in get_attr_wrapped_model(_chunk, 'named_parameters')():
+                if not _p.requires_grad or getattr(_p, 'is_gtp_weight_remat', False):
+                    continue
+                if not _n.endswith(("final_layernorm.weight", "layers.0.self_attention.out_norm.weight")):
+                    continue
+                _g = getattr(_p, _get_main_grad_attr(_p), None)
+                if _g is None:
+                    continue
+                _d = _unshard_if_dtensor(_g).data
+                print(
+                    f"[GAVG {tag}] {_n} abssum={_d.abs().sum(dtype=torch.float64).item():.12e}",
+                    flush=True,
+                )
+
+    _gavg_probe("before_gtp_avg")
     _allreduce_replicated_grads_over_gtp_remat_group(
         model,
         gtp_remat_group,
         egtp_remat_group,
         calculate_per_token_loss=config.calculate_per_token_loss,
     )
+    _gavg_probe("after_gtp_avg")
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()
 
