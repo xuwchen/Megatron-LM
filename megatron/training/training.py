@@ -4221,8 +4221,9 @@ def _diag_install_layer_trace(model):
             # on the biggest activations — which I first misread as the training config not
             # fitting without recompute. sum(dtype=) accumulates in fp64 in-kernel instead.
             d = tensor.detach()
+            _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             print(
-                f"[LAYER {budget['n']:04d}] {name} shape={tuple(tensor.shape)} "
+                f"[LAYER r{_r} {budget['n']:04d}] {name} shape={tuple(tensor.shape)} "
                 f"abssum={d.abs().sum(dtype=torch.float64).item():.12e}",
                 flush=True,
             )
