@@ -752,6 +752,27 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
         )
+        # DIAGNOSTIC (MCORE_DIAG_DISPATCH): right after permute(), before the alltoall. The
+        # dispatcher's three inputs are bit-identical across the arms (hidden abssum,
+        # routing_map true-count/index-sum, probs), and abssum is permutation-invariant — so a
+        # difference HERE means values changed, not order, which nothing on this path should
+        # do. This splits "permute" from "alltoall" as the origin of the 2.75e-08 seen at the
+        # expert GEMM input.
+        import os as _os_p
+
+        if _os_p.environ.get("MCORE_DIAG_DISPATCH"):
+            import torch.distributed as _dist
+
+            _r = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+            if _r in (0, 1):
+                print(
+                    f"[PERMUTE r{_r}] tokens={tuple(permutated_local_input_tokens.shape)} "
+                    f"abssum="
+                    f"{permutated_local_input_tokens.detach().abs().sum(dtype=torch.float64).item():.12e} "
+                    f"| probs abssum="
+                    f"{permuted_probs.detach().abs().sum(dtype=torch.float64).item():.12e}",
+                    flush=True,
+                )
         return permutated_local_input_tokens, permuted_probs
 
     def token_dispatch(self, permutated_local_input_tokens, permuted_probs):
