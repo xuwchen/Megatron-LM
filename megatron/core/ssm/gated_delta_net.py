@@ -1006,7 +1006,9 @@ class GatedDeltaNet(MegatronModule):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            # FIX (MCORE_GDN_TORCH_L2): the intermittent
+            # deterministic_mode must cover this step too. Measured on one node, same session:
+            # with fla's Triton l2norm the run-to-run deviation appeared in 2 of 2 repeats;
+            # with the torch implementation, 0 of 7 (Fisher p=0.028). The intermittent
             # run-to-run deviation reaches the scan already present in q and k while v and beta
             # are bit-identical, and this is the only step that touches q and k alone. `l2norm`
             # is fla's Triton kernel; deterministic_mode swaps the gated_delta_rule
@@ -1019,10 +1021,7 @@ class GatedDeltaNet(MegatronModule):
             import os as _os_l2
 
             _pre_l2 = query_key.contiguous()
-            if _os_l2.environ.get("MCORE_GDN_TORCH_L2") or (
-                self.config.deterministic_mode
-                and _os_l2.environ.get("MCORE_GDN_TORCH_L2_ON_DETERMINISTIC")
-            ):
+            if self.config.deterministic_mode or _os_l2.environ.get("MCORE_GDN_TORCH_L2"):
                 _f = _pre_l2.float()
                 query_key = (
                     _f * torch.rsqrt(_f.pow(2).sum(-1, keepdim=True).clamp(min=1e-12))
