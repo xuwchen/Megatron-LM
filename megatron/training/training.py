@@ -4161,10 +4161,17 @@ def _diag_install_layer_trace(model):
         def hook(_mod, _inp, out):
             if focus and focus in name:
                 w = getattr(_mod, "weight", None)
+                # Bias too. With skip_bias_add the layer RETURNS the bias separately and it is
+                # applied inside the fused activation, so "fc1 output identical" says nothing
+                # about the bias. GTP has a bias-specific path (_restore_gtp_replicated_bias):
+                # it shards only weights, but TE sizes weight AND bias from the pre-sharded
+                # out_features, so the bias has to be resized back. That is exactly a route to
+                # "weights fine, activation input wrong".
+                _b = getattr(_mod, "bias", None)
                 i = _inp[0] if isinstance(_inp, tuple) and _inp else _inp
                 o = out[0] if isinstance(out, tuple) and out else out
                 parts = []
-                for tag, x in (("in", i), ("w", w), ("out", o)):
+                for tag, x in (("in", i), ("w", w), ("b", _b), ("out", o)):
                     if torch.is_tensor(x):
                         d = x.detach()
                         # Memory identity, not just values. The 3D arm's GEMM reads the
