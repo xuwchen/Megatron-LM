@@ -368,6 +368,31 @@ class VocabParallelEmbedding(torch.nn.Module):
                     output_parallel, self.tp_group, self.config
                 )
             else:
+                # The probe below sits on the all-reduce branch, but with sequence parallelism
+                # on this model takes the reduce-scatter branch instead -- the probe produced
+                # zero records. Same measurement, correct branch.
+                import os as _os_emb2
+
+                if _os_emb2.environ.get("MCORE_DIAG_EMB"):
+                    _r2 = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else 0
+                    )
+                    VocabParallelEmbedding._diag_n = (
+                        getattr(VocabParallelEmbedding, "_diag_n", 0) + 1
+                    )
+                    _pre2 = output_parallel.detach().abs().sum(dtype=torch.float64).item()
+                    _out2 = reduce_scatter_to_sequence_parallel_region(
+                        output_parallel, group=self.tp_group
+                    )
+                    print(
+                        f"[EMB r{_r2} n{VocabParallelEmbedding._diag_n:04d}] "
+                        f"pre_reduce={_pre2:.12e} "
+                        f"post_reduce={_out2.detach().abs().sum(dtype=torch.float64).item():.12e} |",
+                        flush=True,
+                    )
+                    return _out2
                 output = reduce_scatter_to_sequence_parallel_region(
                     output_parallel, group=self.tp_group
                 )
