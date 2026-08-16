@@ -1466,6 +1466,19 @@ class GTPShardedParam(torch.nn.Parameter):
                     f"sqsum={_d.pow(2).sum(dtype=torch.float64).item():.12e}",
                     flush=True,
                 )
+                # Dump the ASSEMBLED operand. The module-level probe can only see
+                # `module.weight`, which under GTP is this rank's shard (288, 2152) rather than
+                # the (1152, 2152) tensor the GEMM consumes — replaying that shard compares the
+                # wrong thing. Only this site has the real operand.
+                _dump = _os.environ.get("MCORE_DIAG_DUMP")
+                if _dump and "linear_fc2" in self._debug_name and fwd:
+                    import os.path as _osp
+
+                    _os.makedirs(_dump, exist_ok=True)
+                    _path = _osp.join(_dump, "assembled_" + self._debug_name.replace(".", "_") + ".pt")
+                    if not _osp.exists(_path):
+                        torch.save({"name": self._debug_name, "weight": _t.detach().cpu()}, _path)
+                        print(f"[DUMP] wrote {_path}", flush=True)
 
         return result, handle
 
