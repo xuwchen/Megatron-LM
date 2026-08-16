@@ -743,6 +743,29 @@ def finalize_model_grads(
     # partition is identical per rank — yet the reduced grads differ 3.34x. Either the
     # local grads differ or one of those checks is wrong.
     _glocal_probe(model, 'pre_ddp_sync')
+    # Also record the group sizes the two steps actually use. The scaling factor is computed
+    # from dp_cp (GTP-excluded, size 1 here) while the reduction may run over a group that
+    # INCLUDES the gtp axis (size 4) — that mismatch is exactly the missing 1/gtp the module
+    # docstring warns about, and the measured chain (local 1.21 -> 1.94 sum vs 3D's 0.493
+    # mean) fits it. Print the sizes instead of inferring them from the config.
+    import os as _os_gs
+
+    if _os_gs.environ.get("MCORE_DIAG_GLOCAL") and (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    ):
+        for _c in model:
+            _b = getattr(_c, "buffers", None)
+            if not _b:
+                continue
+            for _i, _buf in enumerate(_b):
+                _g = getattr(_buf, "data_parallel_group", None) or getattr(_buf, "dp_cp_group", None)
+                print(
+                    f"[GSIZES] buffer{_i} scaling_factor="
+                    f"{getattr(_buf, 'gradient_scaling_factor', None)} "
+                    f"reduce_group_size={torch.distributed.get_world_size(_g) if _g is not None else 'n/a'}",
+                    flush=True,
+                )
+            break
 
     for model_chunk in model:
         model_chunk.finish_grad_sync(force_all_reduce=force_all_reduce)
