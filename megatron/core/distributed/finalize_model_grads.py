@@ -748,7 +748,10 @@ def finalize_model_grads(
 
         if not _os.environ.get("MCORE_DIAG_GAVG"):
             return
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        # All ranks: the point is to check the AVG against the mean of its own inputs, which
+        # needs every gtp peer's pre-AVG value, not just rank 0's.
+        _rk = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if _rk != 0 and not _os.environ.get("MCORE_DIAG_ALLRANKS"):
             return
         for _chunk in model:
             for _n, _p in get_attr_wrapped_model(_chunk, 'named_parameters')():
@@ -772,7 +775,7 @@ def finalize_model_grads(
                     if not _osp.exists(_f):
                         torch.save({"name": _n, "grad": _d.detach().float().cpu()}, _f)
                 print(
-                    f"[GAVG {tag}] {_n} abssum={_d.abs().sum(dtype=torch.float64).item():.12e} "
+                    f"[GAVG r{_rk} {tag}] {_n} abssum={_d.abs().sum(dtype=torch.float64).item():.12e} "
                     f"sqsum={_d.double().pow(2).sum().item():.12e}",
                     flush=True,
                 )
