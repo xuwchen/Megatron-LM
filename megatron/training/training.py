@@ -4435,6 +4435,53 @@ def _diag_param_checksum(model, iteration):
         )
 
 
+def _diag_grad_checksum(model, iteration):
+    """DIAGNOSTIC (MCORE_DIAG_GRADSUM): topology-invariant checksum of main_grad.
+
+    The chain is closed up to the optimizer step -- forward bit-identical, weights identical to
+    1.8e-13 before it and 2.8e-09 after -- but the gradients in between were only ever compared
+    through the logged grad norm, which prints 7 digits. A ~1e-9 gradient difference is
+    invisible there and would explain the whole thing. Per-rank grad sums are NOT comparable
+    across these arms (with the distributed optimizer 3D holds a quarter of each gradient and
+    GTP holds all of it), so reuse the three dedup filters the parameter checksum uses, which
+    exist precisely to make each element count once.
+    """
+    import os
+
+    want = os.environ.get("MCORE_DIAG_GRADSUM")
+    if not want or str(iteration) not in want.split(","):
+        return
+    from megatron.core import tensor_parallel
+    from megatron.core.transformer.module import param_is_not_shared
+
+    chunks = model if isinstance(model, list) else [model]
+    local = torch.zeros(3, dtype=torch.float64, device="cuda")
+    for chunk in chunks:
+        for _name, param in chunk.named_parameters():
+            g = getattr(param, "main_grad", None)
+            if g is None:
+                continue
+            if not getattr(param, "allreduce", True):
+                continue
+            if not param_is_not_shared(param):
+                continue
+            if not tensor_parallel.param_is_not_tensor_parallel_duplicate(param):
+                continue
+            if not tensor_parallel.param_is_not_gtp_duplicate(param):
+                continue
+            d = g.detach().double()
+            local[0] += d.sum()
+            local[1] += d.abs().sum()
+            local[2] += g.numel()
+    torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.SUM)
+    if torch.distributed.get_rank() == 0:
+        print(
+            f"[GRADSUM it{iteration}] sum={local[0].item():.12e} "
+            f"abssum={local[1].item():.12e} numel={local[2].item():.0f}",
+            flush=True,
+        )
+
+
 def _gtp_diag_embedding_grad(model, iteration, where="post_step"):
     """DIAGNOSTIC: is the embedding's autograd grad a real gradient or an uninitialised dummy?
 
