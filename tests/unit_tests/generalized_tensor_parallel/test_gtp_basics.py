@@ -809,17 +809,18 @@ def _worker_gated_fused_microbatches(rank, world_size, port):
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda")
     dist.broadcast(inp, src=0)
 
+    # Both layers consume the SAME input rather than being chained: the second layer exists
+    # only so the GTP prefetch chain has links to build, and chaining them fed a 128-wide
+    # activation into a 64-wide layer ("GEMM not possible").
     for mb, is_first in enumerate((True, False)):
-        x = inp
         for layer, ref in zip(layers, refs):
-            got = layer(x, is_first_microbatch=is_first)
-            want = torch.nn.functional.linear(x, ref)
+            got = layer(inp, is_first_microbatch=is_first)
+            want = torch.nn.functional.linear(inp, ref)
             assert torch.equal(got, want), (
                 f"microbatch {mb}: fused gate|up reached the GEMM interleaved "
                 f"(max_diff={(got.float()-want.float()).abs().max():.6f}). "
                 f"Note |out|_1 agrees under a permutation -- compare elementwise."
             )
-            x = got.detach()
 
 
 class TestGTPGatedFusedLayout:
