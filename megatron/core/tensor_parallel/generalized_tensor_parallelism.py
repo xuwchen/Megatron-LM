@@ -1671,6 +1671,7 @@ class GTPShardedParam(torch.nn.Parameter):
         for w in self._weights:
             result.append(cache.get(w._ag_ticket_recompute))
         result = [self._strip_padding(r) for r in result]
+        result = self._deinterleave_gated_fused(result)
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
