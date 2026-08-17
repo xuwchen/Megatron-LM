@@ -523,6 +523,11 @@ class TestLatentProjectionChainClassification:
             def named_parameters(_self):
                 return iter(zip((self.FC1, self.FC2), params))
 
+            def named_modules(_self):
+                # tag_gtp_params_with_names walks modules for gated fc1 weights; this
+                # fixture has bare params only.
+                return iter(())
+
         gtp_module.classify_gtp_remat_chains(
             _Model(), cuda_graph_modules=cuda_graph_modules, cuda_graph_impl=cuda_graph_impl
         )
