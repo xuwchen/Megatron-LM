@@ -3078,6 +3078,7 @@ def train_step(
     # 1/DP slice of it is meaningful. Probe here instead, where the value is defined.
     _gtp_diag_embedding_grad(model, args.curr_iteration, where="pre_step")
     _diag_param_checksum(model, args.curr_iteration)
+    _diag_grad_checksum(model, args.curr_iteration)
     _diag_per_param_checksum(model, args.curr_iteration)
     _diag_per_param_grad(model, args.curr_iteration)
     _diag_kernel_names(args.curr_iteration)
