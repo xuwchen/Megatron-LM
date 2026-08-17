@@ -34,6 +34,12 @@ def test_sync_batched_rs_returns_original_inputs_to_wgrad_pool(monkeypatch):
             self.main_grad = torch.zeros_like(reduced)
 
     class _FakeSyncWgradOwner:
+        # Borrow the real gated-fused inverse: wgrad_reduce_scatter calls it via self, and the
+        # untagged weights below make it a no-op before it touches any GTP state.
+        _reinterleave_gated_fused_wgrads = (
+            gtp_module.GTPShardedParam._reinterleave_gated_fused_wgrads
+        )
+
         def __init__(self):
             self._weights = [_FakeWeight(reduced) for reduced in reduced_outputs]
             self.chain_id = gtp_module.GTPChain.UNGRAPHED.value

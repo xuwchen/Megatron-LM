@@ -460,6 +460,33 @@ def tag_gtp_params_with_names(model):
         if is_gtp_param(param):
             param._debug_name = name
 
+    # Mark the fused gate|up weights so the gather site can de-interleave them. A GLU MLP's
+    # fc1 emits [gate | up] along dim0; GTP chunks straddle that boundary, so the gathered
+    # concatenation interleaves the two and the activation pairs the wrong halves.
+    for mod_name, mod in model.named_modules():
+        if not mod_name.endswith("linear_fc1"):
+            continue
+        cfg = getattr(mod, "config", None)
+        if cfg is None or not getattr(cfg, "gated_linear_unit", False):
+            continue
+        w = getattr(mod, "weight", None)
+        if w is not None and is_gtp_param(w):
+            w._gtp_gated_fused = True
+            continue
+        # Grouped (routed-expert) gated fc1 under EGTP has the same interleave and no
+        # de-interleave wiring yet. Refuse rather than train on scrambled experts.
+        grouped = [
+            gw
+            for gw in (getattr(mod, f"weight{i}", None) for i in range(64))
+            if gw is not None and is_gtp_param(gw)
+        ]
+        if grouped:
+            raise NotImplementedError(
+                f"{mod_name}: gated_linear_unit with EGTP-sharded grouped weights is not "
+                "supported: the fused gate|up de-interleave is only wired for non-grouped "
+                "weights. Disable EGTP for gated experts or extend the tagging here."
+            )
+
 
 def configure_gtp_remat_from_recipe(
     *,
@@ -1451,6 +1478,88 @@ class GTPShardedParam(torch.nn.Parameter):
                 self._prefetch_handle = None
                 self.ag_event.record()
 
+    def _deinterleave_gated_fused(self, tensors):
+        """Restore [all gate | all up] on a fused GLU weight gathered across the gtp axis.
+
+        A GLU MLP fuses gate and up into one weight whose dim0 is [gate | up]. GTP shards that
+        along dim0, so every chunk straddles the boundary and the all-gather concatenation comes
+        back as [g0, u0, g1, u1, ...] instead of [g0, g1, ..., u0, u1, ...]; the activation then
+        splits dim0 in half and pairs the wrong halves. Measured on shared_experts.linear_fc1
+        with GTP=4: 3D block i == GTP block [0,2,4,6,1,3,5,7], multisets identical, 785724 of
+        1048576 elements out of place. |.|_1 is permutation-invariant, which is why every
+        checksum probe called this bit-identical.
+
+        This lives at the CONSUME sites rather than at the gather, because there are three of
+        them: _all_gather_weight_on_demand, _get_prefetched_weight and
+        _get_recompute_prefetched_weight. Fixing only the gather's
+        return value left the prefetch path untouched -- and the prefetch chain is built during
+        the first forward, so microbatch 0 took the on-demand path and matched 3D bit-for-bit
+        while microbatch 1 took the prefetched path and diverged by 4.8e-3, which is the whole
+        of the reported 3.162e-02 loss gap. Writing back into the gather buffer instead is NOT
+        an option: that buffer is pooled by (shape, dtype) and shared with other weights, and
+        doing so produced NaN in an unrelated attention module.
+        """
+        n = self.group.size()
+        if n <= 1:
+            return tensors
+        out = []
+        for t, w in zip(tensors, self._weights):
+            if not getattr(w, "_gtp_gated_fused", False):
+                out.append(t)
+                continue
+            self._check_gated_fused_transformable(t, w, n)
+            rows = t.shape[0]
+            c = rows // (2 * n)
+            tail = t.shape[1:]
+            out.append(t.view(n, 2, c, *tail).transpose(0, 1).reshape(rows, *tail).contiguous())
+        return out
+
+    @staticmethod
+    def _check_gated_fused_transformable(t, w, n):
+        """Refuse the layouts the gate|up (de-)interleave cannot express, loudly.
+
+        Silently skipping any of these would hand the GEMM an interleaved weight — the exact
+        silent-wrongness this transform exists to prevent (checksums cannot see it).
+        """
+        if isinstance(t, QuantizedTensor):
+            raise NotImplementedError(
+                f"{getattr(w, '_debug_name', 'gated fc1')}: fused gate|up de-interleave is not "
+                "implemented for quantized gathers (quantize-then-gather); run this weight in "
+                "BF16 or extend _deinterleave_gated_fused to the quantized layout."
+            )
+        if getattr(w, "pad_length", 0):
+            raise NotImplementedError(
+                f"{getattr(w, '_debug_name', 'gated fc1')}: fused gate|up de-interleave does "
+                f"not support GTP alignment padding (pad_length={w.pad_length}); size the FFN "
+                "so no pad is needed or set pad_for_alignment=0."
+            )
+        if t.shape[0] % (2 * n) != 0:
+            raise RuntimeError(
+                f"{getattr(w, '_debug_name', 'gated fc1')}: gathered dim0={t.shape[0]} is not "
+                f"divisible by 2*gtp={2 * n}; cannot split gate|up per shard."
+            )
+
+    def _reinterleave_gated_fused_wgrads(self, wgrads):
+        """Map fused-GLU wgrads back from [all gate | all up] to the storage layout, in place.
+
+        Inverse of _deinterleave_gated_fused (view(2, n, c) instead of view(n, 2, c)). Writes
+        THROUGH the incoming buffers — they may be pool-owned or CUDA-graph ring slots, so
+        their storage must be preserved — at the cost of one temporary per gated wgrad.
+        """
+        if not any(getattr(w, "_gtp_gated_fused", False) for w in self._weights):
+            return
+        n = self.group.size()
+        if n <= 1:
+            return
+        for t, w in zip(wgrads, self._weights):
+            if not (torch.is_tensor(t) and getattr(w, "_gtp_gated_fused", False)):
+                continue
+            self._check_gated_fused_transformable(t, w, n)
+            rows = t.shape[0]
+            c = rows // (2 * n)
+            tail = t.shape[1:]
+            t.copy_(t.view(2, n, c, *tail).transpose(0, 1).reshape(rows, *tail))
+
     def _all_gather_weight_on_demand(self, fwd, recompute=False, recompute_prev=None):
         # Only pass the recompute kwargs when they apply, so the fwd/bwd path keeps calling
         # _all_gather_weight with its original signature.
@@ -1462,6 +1571,7 @@ class GTPShardedParam(torch.nn.Parameter):
             result, _ = self._all_gather_weight(async_op=False, fwd=fwd)
         result = result if self.is_routed_expert else [result]
         result = [self._strip_padding(r) for r in result]
+        result = self._deinterleave_gated_fused(result)
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
@@ -1512,6 +1622,7 @@ class GTPShardedParam(torch.nn.Parameter):
             result.append(cache.get(ticket))
 
         result = [self._strip_padding(r) for r in result]
+        result = self._deinterleave_gated_fused(result)
 
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
@@ -1553,6 +1664,7 @@ class GTPShardedParam(torch.nn.Parameter):
         for w in self._weights:
             result.append(cache.get(w._ag_ticket_recompute))
         result = [self._strip_padding(r) for r in result]
+        result = self._deinterleave_gated_fused(result)
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
@@ -2052,6 +2164,14 @@ class GTPShardedParam(torch.nn.Parameter):
         # later get() hands back a too-small buffer.
         wgrad_inputs = list(wgrad) if batched else [wgrad]
         weights = self._weights
+
+        # Fused gate|up weights were CONSUMED de-interleaved ([all gate | all up], see
+        # _deinterleave_gated_fused), so autograd hands their wgrad back in that layout — while
+        # the reduce-scatter below deals out contiguous dim0 chunks onto shards stored as
+        # [gate_i | up_i]. Undo the permutation first or every GLU shard accumulates the
+        # gradient rows of a DIFFERENT shard. Invisible to lr=0 A/Bs, loss curves at lr=0 and
+        # every grad-norm probe (all permutation-invariant); it only corrupts the update.
+        self._reinterleave_gated_fused_wgrads(wgrad_inputs)
 
         # MTP feeds embedding and output_layer into more than one GEMM per forward, so they get
         # more than one backward. The previous reduce-scatter may still be running: starting
