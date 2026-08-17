@@ -460,6 +460,20 @@ def tag_gtp_params_with_names(model):
         if is_gtp_param(param):
             param._debug_name = name
 
+    # Mark the fused gate|up weights so the gather site can de-interleave them. A GLU MLP's
+    # fc1 emits [gate | up] along dim0; GTP chunks straddle that boundary, so the gathered
+    # concatenation interleaves the two and the activation pairs the wrong halves.
+    for mod_name, mod in model.named_modules():
+        if not mod_name.endswith("linear_fc1"):
+            continue
+        cfg = getattr(mod, "config", None)
+        if cfg is None or not getattr(cfg, "gated_linear_unit", False):
+            continue
+        w = getattr(mod, "weight", None)
+        if w is not None and is_gtp_param(w):
+            w._gtp_gated_fused = True
+
+
 
 def configure_gtp_remat_from_recipe(
     *,
@@ -1451,6 +1465,42 @@ class GTPShardedParam(torch.nn.Parameter):
                 self._prefetch_handle = None
                 self.ag_event.record()
 
+    def _deinterleave_gated_fused(self, tensors):
+        """Restore [all gate | all up] on a fused GLU weight gathered across the gtp axis.
+
+        A GLU MLP fuses gate and up into one weight whose dim0 is [gate | up]. GTP shards that
+        along dim0, so every chunk straddles the boundary and the all-gather concatenation comes
+        back as [g0, u0, g1, u1, ...] instead of [g0, g1, ..., u0, u1, ...]; the activation then
+        splits dim0 in half and pairs the wrong halves. Measured on shared_experts.linear_fc1
+        with GTP=4: 3D block i == GTP block [0,2,4,6,1,3,5,7], multisets identical, 785724 of
+        1048576 elements out of place. |.|_1 is permutation-invariant, which is why every
+        checksum probe called this bit-identical.
+
+        This lives at the CONSUME sites rather than at the gather, because there are two of
+        them: _all_gather_weight_on_demand and _get_prefetched_weight. Fixing only the gather's
+        return value left the prefetch path untouched -- and the prefetch chain is built during
+        the first forward, so microbatch 0 took the on-demand path and matched 3D bit-for-bit
+        while microbatch 1 took the prefetched path and diverged by 4.8e-3, which is the whole
+        of the reported 3.162e-02 loss gap. Writing back into the gather buffer instead is NOT
+        an option: that buffer is pooled by (shape, dtype) and shared with other weights, and
+        doing so produced NaN in an unrelated attention module.
+        """
+        out = []
+        for t, w in zip(tensors, self._weights):
+            if not (torch.is_tensor(t) and getattr(w, "_gtp_gated_fused", False)):
+                out.append(t)
+                continue
+            n = self.group.size()
+            rows = t.shape[0]
+            if n <= 1 or rows % (2 * n) != 0:
+                out.append(t)
+                continue
+            c = rows // (2 * n)
+            out.append(
+                t.view(n, 2, c, *t.shape[1:]).transpose(0, 1).reshape(rows, *t.shape[1:]).contiguous()
+            )
+        return out
+
     def _all_gather_weight_on_demand(self, fwd, recompute=False, recompute_prev=None):
         # Only pass the recompute kwargs when they apply, so the fwd/bwd path keeps calling
         # _all_gather_weight with its original signature.
@@ -1462,6 +1512,7 @@ class GTPShardedParam(torch.nn.Parameter):
             result, _ = self._all_gather_weight(async_op=False, fwd=fwd)
         result = result if self.is_routed_expert else [result]
         result = [self._strip_padding(r) for r in result]
+        result = self._deinterleave_gated_fused(result)
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
@@ -1512,6 +1563,7 @@ class GTPShardedParam(torch.nn.Parameter):
             result.append(cache.get(ticket))
 
         result = [self._strip_padding(r) for r in result]
+        result = self._deinterleave_gated_fused(result)
 
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
@@ -1553,6 +1605,7 @@ class GTPShardedParam(torch.nn.Parameter):
         for w in self._weights:
             result.append(cache.get(w._ag_ticket_recompute))
         result = [self._strip_padding(r) for r in result]
+        result = self._deinterleave_gated_fused(result)
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
