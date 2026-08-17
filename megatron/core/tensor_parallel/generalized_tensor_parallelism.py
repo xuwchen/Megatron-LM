@@ -2195,6 +2195,28 @@ class GTPShardedParam(torch.nn.Parameter):
         # shard-sized outputs into a pool whose buffers are expected to be full-sized, and a
         # later get() hands back a too-small buffer.
         wgrad_inputs = list(wgrad) if batched else [wgrad]
+
+        # DIAGNOSTIC (MCORE_DIAG_WGRAD): the residual first-step gradient difference is
+        # 2.18e-06 with fp32 accumulation on this axis, and every reduction-precision and
+        # summation-tree explanation has been measured and ruled out. What remains is that GTP
+        # computes wgrad against the ALL-GATHERED full weight and reduce-scatters it, while 3D
+        # computes it directly on the local shard -- different GEMM reduction lengths, hence a
+        # different cuBLAS split and accumulation order. Checksum the wgrad BEFORE the
+        # collective: if it already differs from 3D's local wgrad by ~2e-06, the GEMM owns the
+        # residual and no configuration can remove it.
+        import os as _os_wg
+
+        if _os_wg.environ.get("MCORE_DIAG_WGRAD"):
+            _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            GTPShardedParam._diag_wg = getattr(GTPShardedParam, "_diag_wg", 0) + 1
+            _n = GTPShardedParam._diag_wg
+            if _n <= 40:
+                _t = wgrad_inputs[0]
+                print(
+                    f"[WGRAD r{_r} n{_n:04d}] shape={tuple(_t.shape)} "
+                    f"abssum={_t.detach().abs().sum(dtype=torch.float64).item():.12e} |",
+                    flush=True,
+                )
         weights = self._weights
 
         # MTP feeds embedding and output_layer into more than one GEMM per forward, so they get
