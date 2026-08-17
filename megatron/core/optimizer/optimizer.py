@@ -409,18 +409,6 @@ class MegatronOptimizer(ABC):
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
 
-        # DIAGNOSTIC (MCORE_DIAG_GNORM): the gradient is the last unmeasured link between a
-        # bit-identical forward and a 2.8e-09 weight difference after the first step. A raw
-        # main_grad checksum is NOT comparable across these arms -- with the distributed
-        # optimizer each rank's buffer holds only its own reduce-scatter shard, so summing it
-        # and dividing by the DP factor is a caliber error (it produced a nonsensical 40%
-        # "difference"). This norm, by contrast, is reduced over grad_stats_parallel_group and
-        # is topology-invariant by construction; the training log just prints it to 7 digits,
-        # which hides exactly the ~1e-9 scale in question.
-        import os as _os_gn
-
-        if _os_gn.environ.get("MCORE_DIAG_GNORM") and torch.distributed.get_rank() == 0:
-            print(f"[GNORM] {float(grad_norm):.15e}", flush=True)
 
         if clip_grad > 0.0 and params:
             # Only reduce group grad norms when clipping can use them.
@@ -1428,6 +1416,23 @@ class FP32Optimizer(MegatronOptimizer):
         grad_norm = None
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
+
+        # DIAGNOSTIC (MCORE_DIAG_GNORM): the gradient is the last unmeasured link between a
+        # bit-identical forward and a 2.8e-09 weight difference after the first step. The
+        # training log prints this to 7 digits, which hides the ~1e-9 scale in question. Probe
+        # HERE rather than inside clip_grad_norm: with a ChainedOptimizer the norm is assembled
+        # from per-optimizer norms and that method is never entered (the earlier probe there
+        # produced zero records). A raw main_grad checksum is not an option -- under the
+        # distributed optimizer each rank holds only its reduce-scatter shard, and summing it
+        # gave a nonsensical 40% "difference".
+        import os as _os_gn
+
+        if (
+            grad_norm is not None
+            and _os_gn.environ.get("MCORE_DIAG_GNORM")
+            and torch.distributed.get_rank() == 0
+        ):
+            print(f"[GNORM] {float(grad_norm):.15e}", flush=True)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
