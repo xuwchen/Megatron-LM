@@ -3551,6 +3551,16 @@ def training_log(
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
+            # DIAGNOSTIC (MCORE_DIAG_GNORM): print the same value at full precision. Two
+            # earlier attempts to probe inside the optimizer recorded nothing -- the norm is
+            # assembled by a ChainedOptimizer and neither MixedPrecisionOptimizer.clip_grad_norm
+            # nor that step path is entered. This line demonstrably executes (it is where the
+            # logged "grad norm: 43.774" comes from), and 3 decimals is exactly what hides the
+            # ~1e-9 difference that would explain the post-step weight gap.
+            import os as _os_gn
+
+            if _os_gn.environ.get("MCORE_DIAG_GNORM"):
+                print(f"[GNORM] {float(grad_norm):.15e}", flush=True)
         if num_zeros_in_grad is not None:
             log_string += f' num zeros: {num_zeros_in_grad} |'
         if params_norm is not None:
