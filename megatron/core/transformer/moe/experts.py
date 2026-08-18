@@ -962,6 +962,7 @@ class TEGroupedMLP(MegatronModule):
                             # writes, and slice this rank's contiguous rows back out on load.
                             # This also pins "a shard is a contiguous row slice of [gate|up]",
                             # so the runtime all-gather is already in logical order.
+                            from megatron.core import parallel_state as _ps
                             from megatron.core.tensor_parallel.gtp_ckpt import (
                                 _gtp_gather_rows_for_save,
                                 _gtp_slice_rows_on_load,
@@ -981,7 +982,12 @@ class TEGroupedMLP(MegatronModule):
                                 expert_w,
                                 target_rows,
                                 self.tp_group,
-                                metadata['dp_cp_group'],
+                                # The EXPERT data-parallel group, not the dense dp_cp one: its
+                                # rank varies across EP ranks, so using it here left every
+                                # expert outside ep_rank 0 without a main replica and DCP
+                                # rejected the plan for incomplete coverage. Exclude the GTP
+                                # axis -- EGTP peers are already separated by replica_id[1].
+                                _ps.get_expert_data_parallel_group(with_gtp_remat=False),
                                 new_sharded_offsets,
                             )
                             v = apply_swiglu_sharded_factory(
