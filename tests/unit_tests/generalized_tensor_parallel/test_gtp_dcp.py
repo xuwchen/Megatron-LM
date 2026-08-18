@@ -1597,6 +1597,94 @@ def _worker_padded_fused_projection_gather(rank, world_size, port):
         update_gtp_config(pad_for_alignment=orig)
 
 
+def _worker_non_gtp_checkpoint_into_padded_gtp(rank, world_size, ckpt_base):
+    """A checkpoint written WITHOUT GTP must load correctly into a padded GTP model.
+
+    This is the cross-topology case the checkpoint matrix uses (3D save -> GTP load) and the
+    one the pre-fix layout got wrong: the saver declared a PADDED global (per-TP padded rows x
+    tp_size) while a non-GTP file holds the LOGICAL global, and allow_shape_mismatch let the two
+    line up at index 0 -- so every TP rank past 0 read from `tp_rank * pad_length` rows too far.
+    Values are distinct per row, so a shift shows up as a value mismatch rather than a crash.
+
+    world=4 -> tp2 x gtp2. Logical per-TP rows 10, alignment 3*2=6 -> pad 2, padded 12, shards
+    of 6: gtp rank 0 keeps 6 rows, gtp rank 1 keeps 4.
+    """
+    from megatron.core.dist_checkpointing import load, save
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    orig = GTP_CONFIG.pad_for_alignment
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=2, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'dp_cp', 'dp_cp_gtp_remat']
+        )
+        gtp_group = ps.get_gtp_weight_remat_group()
+        per_tp, hidden = 10, 4
+        tp_rank = ps.get_tensor_model_parallel_rank()
+        gtp_rank = ps.get_gtp_weight_remat_rank()
+
+        # Row r of the global tensor carries the value r, so any shift is visible.
+        full = torch.arange(per_tp * 2, dtype=torch.bfloat16, device="cuda").reshape(-1, 1)
+        full = full.expand(per_tp * 2, hidden).contiguous()
+        my_rows = full[tp_rank * per_tp : (tp_rank + 1) * per_tp].clone()
+
+        with TempNamedDir(ckpt_base / 'non_gtp_to_gtp', sync=True) as ckpt_dir:
+            # --- save WITHOUT GTP: plain TP-sharded, logical global (20, 4) ---
+            update_gtp_config(pad_for_alignment=0)
+            plain = {
+                "w": make_tp_sharded_tensor_for_checkpoint(
+                    tensor=torch.nn.Parameter(my_rows.clone()),
+                    key="w",
+                    tp_axis=0,
+                    prepend_offsets=(),
+                    tp_group=pg.tp,
+                    # GTP-inclusive replicate group: the two GTP peers hold identical rows,
+                    # so with the GTP-excluding group they collide on one replica_id and the
+                    # save deadlocks (see test_save_load_roundtrip_needs_gtp_inclusive_group).
+                    dp_cp_group=pg.dp_cp_gtp_remat,
+                )
+            }
+            assert plain["w"].global_shape[0] == per_tp * 2, plain["w"].global_shape
+            save(plain, ckpt_dir)
+
+            # --- load INTO a padded GTP model ---
+            update_gtp_config(pad_for_alignment=3)
+            weight = _make_gtp_shard(per_tp, hidden, gtp_group)
+            assert (weight.shape[0], weight.pad_length) == (6, 2), (weight.shape, weight.pad_length)
+            with torch.no_grad():
+                weight.zero_()
+            target = {
+                "w": make_tp_sharded_tensor_for_checkpoint(
+                    tensor=weight,
+                    key="w",
+                    tp_axis=0,
+                    prepend_offsets=(),
+                    tp_group=pg.tp,
+                    dp_cp_group=pg.dp_cp_gtp_remat,
+                )
+            }
+            loaded = load(target, ckpt_dir)
+
+        got = loaded["w"]
+        got = got.data if hasattr(got, "data") else got
+        start = gtp_rank * 6
+        keep = min(6, max(0, per_tp - start))
+        want = my_rows[start : start + keep]
+        assert torch.equal(got[:keep].cpu(), want.cpu()), (
+            f"rank={rank} tp={tp_rank} gtp={gtp_rank}: non-GTP checkpoint loaded into the padded "
+            f"GTP model gave the wrong rows -- the layout is shifted.\n"
+            f"  want rows {want[:, 0].tolist()}\n"
+            f"  got  rows {got[:keep, 0].cpu().tolist()}"
+        )
+    finally:
+        update_gtp_config(pad_for_alignment=orig)
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 # ---------------------------------------------------------------------------
 # Test class wrappers (4-GPU)
 # ---------------------------------------------------------------------------
@@ -1661,6 +1749,10 @@ class TestGtpDcpHelper:
     def test_padded_optimizer_state_mapping(self):
         _require_world_size(4)
         _worker_padded_optimizer_state_mapping(dist.get_rank(), 4, None)
+
+    def test_non_gtp_checkpoint_into_padded_gtp(self, tmp_path_dist_ckpt):
+        _require_world_size(4)
+        _worker_non_gtp_checkpoint_into_padded_gtp(dist.get_rank(), 4, tmp_path_dist_ckpt)
 
     def test_padded_save_load_roundtrip(self, tmp_path_dist_ckpt):
         _require_world_size(4)
