@@ -650,9 +650,15 @@ class GatedDeltaNet(MegatronModule):
             # consumers run and are restored by replaying ONLY the projection/prep block
             # in backward — the gated-delta-rule kernel below is never recomputed.
             _qkv_ckpt_manager = CheckpointManager()
+            _uses_gtp = (
+                HAVE_GTP and is_gtp_param is not None and is_gtp_param(self.in_proj.weight)
+            )
             query, key, value, gate, beta, g = tensor_parallel.CheckpointWithoutOutput(
                 fp8=bool(self.config.fp8 or getattr(self.config, "fp4", None)),
                 ckpt_manager=_qkv_ckpt_manager,
+                # BF16 GTP still needs TE's recompute marker so the replay all-gather uses
+                # the dedicated recompute chain instead of corrupting backward gather state.
+                te_activation_recompute=_uses_gtp,
             ).checkpoint(_qkv_proj_and_prepare, hidden_states)
         else:
             query, key, value, gate, beta, g = _qkv_proj_and_prepare(hidden_states)
