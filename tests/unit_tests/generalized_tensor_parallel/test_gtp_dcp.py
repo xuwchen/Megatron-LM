@@ -1450,7 +1450,9 @@ def _worker_padded_save_load_roundtrip(rank, world_size, ckpt_base):
         if keep == weight.shape[0]:
             assert saved["w"].data is weight, "untrimmed shard must preserve object identity"
         else:
-            assert getattr(saved["w"].data, "_gtp_pad_src", None) is weight, (
+            # The backlink lives on the ShardedTensor, not on its data: the torch strategy
+            # reassigns data via detach() before loading, which drops tensor attributes.
+            assert getattr(saved["w"], "gtp_pad_src", None) is weight, (
                 "trimmed shard must backlink to the full padded shard for the optimizer id map"
             )
 
@@ -1482,7 +1484,7 @@ def _worker_padded_optimizer_state_mapping(rank, world_size, port):
     Trimming the alignment-pad tail makes ShardedTensor.data a different object from the
     optimizer's param on the shard that actually loses rows. The optimizer matches the two by
     object identity (get_param_id_to_sharded_param_map) and, in the Muon backfill, by shape.
-    Without the _gtp_pad_src backlink the param stops matching, which does NOT raise -- the
+    Without the gtp_pad_src backlink the param stops matching, which does NOT raise -- the
     state is silently left out of the checkpoint -- and where it does raise, it raises in
     make_sharded_optimizer_tensor's local_shape assert. Pin both halves here.
 

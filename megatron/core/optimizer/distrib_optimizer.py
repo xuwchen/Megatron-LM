@@ -117,7 +117,7 @@ def _resolve_gtp_sharded_metadata(model_param, model_sharded_state_dict):
 
     # Case 1: a backlink from the entry's data to the live param. Two kinds exist and both
     # mean "this entry stands for that param": ``_gtp_dequant_src`` on the native-FP8
-    # dequantized copy, and ``_gtp_pad_src`` on a shard whose alignment-pad tail was trimmed
+    # dequantized copy, and ``gtp_pad_src`` (on the ShardedTensor) for a shard whose pad tail
     # for the checkpoint. Missing the latter sends the trailing GTP shard down the Case 3
     # rebuild, which keys it by ``_debug_name`` -- a DIFFERENT checkpoint FQN -- so the real
     # tensor silently loses those rows and DCP rejects the plan for incomplete coverage.
