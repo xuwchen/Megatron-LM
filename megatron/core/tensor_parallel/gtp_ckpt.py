@@ -22,7 +22,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
-def untrimmed_gtp_shard(data: torch.Tensor) -> torch.Tensor:
+def untrimmed_gtp_shard(sh_ten) -> torch.Tensor:
     """Return the full padded GTP shard behind a checkpoint entry's data.
 
     ``make_tp_sharded_tensor_for_checkpoint`` keeps alignment padding out of the checkpoint by
@@ -32,8 +32,8 @@ def untrimmed_gtp_shard(data: torch.Tensor) -> torch.Tensor:
     rows tall instead of the TP-local projection (and the ranks disagree on the collective, so
     the job hangs rather than failing). Callers strip the pad again after gathering.
     """
-    src = getattr(data, "_gtp_pad_src", None)
-    return data if src is None else src
+    src = getattr(sh_ten, "gtp_pad_src", None)
+    return sh_ten.data if src is None else src
 
 
 def _gtp_gather_rows_for_save(
@@ -62,7 +62,7 @@ def _gtp_gather_rows_for_save(
     """
     gtp_remat_group = weight.group
     gtp_rank = torch.distributed.get_rank(gtp_remat_group)
-    local = untrimmed_gtp_shard(sh_ten.data).contiguous()
+    local = untrimmed_gtp_shard(sh_ten).contiguous()
     gathered = torch.empty(
         (local.shape[0] * torch.distributed.get_world_size(gtp_remat_group),) + local.shape[1:],
         dtype=local.dtype,

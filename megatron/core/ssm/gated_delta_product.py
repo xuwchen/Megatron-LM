@@ -1002,7 +1002,7 @@ class GatedDeltaProductMixer(MegatronModule):
             from megatron.core.tensor_parallel.gtp_ckpt import untrimmed_gtp_shard
 
             local = untrimmed_gtp_shard(
-                sharded_state_dict[f"{prefix}in_proj.weight"].data
+                sharded_state_dict[f"{prefix}in_proj.weight"]
             ).contiguous()
             gathered = torch.empty(
                 (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],

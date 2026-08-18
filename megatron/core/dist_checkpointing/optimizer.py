@@ -67,7 +67,7 @@ def get_param_id_to_sharded_param_map(
         # A GTP shard whose alignment-pad tail was trimmed for the checkpoint is a narrowed
         # view, i.e. a different object from the optimizer's param; it carries a backlink to
         # the full padded shard (see utils._make_gtp_logical_sharded_tensor).
-        pad_src = getattr(ten.data, '_gtp_pad_src', None)
+        pad_src = getattr(ten, 'gtp_pad_src', None)
         match_id = id(pad_src) if pad_src is not None else id(ten.data)
         if match_id in param_to_id_map:
             id_to_sharded_param_map[param_to_id_map[match_id]] = ten
@@ -103,13 +103,17 @@ def make_sharded_optimizer_tensor(
         return replace(model_param, key=f'{prefix}.{model_param.key}', data=optim_param)
 
     # The model entry may have dropped GTP alignment-pad rows; the optimizer state still spans
-    # the full padded shard. Those rows carry no real parameter, so trim rather than save them.
+    # the full padded shard. Those rows carry no real parameter, so trim rather than save them,
+    # and carry the backlink onto the optimizer entry so the load side can hand the full state
+    # tensor back (``replace`` builds a new object and would otherwise drop it).
+    optim_pad_src = None
     if (
-        getattr(model_param.data, '_gtp_pad_src', None) is not None
+        getattr(model_param, 'gtp_pad_src', None) is not None
         and optim_param.dim() == len(model_param.local_shape)
         and optim_param.shape[0] > model_param.local_shape[0]
         and tuple(optim_param.shape[1:]) == tuple(model_param.local_shape[1:])
     ):
+        optim_pad_src = optim_param
         optim_param = optim_param[: model_param.local_shape[0]]
 
     assert tuple(optim_param.shape) == model_param.local_shape, (
@@ -119,6 +123,8 @@ def make_sharded_optimizer_tensor(
     sh_ten = replace(
         model_param, key=f'{prefix}.{model_param.key}', data=optim_param, dtype=optim_param.dtype
     )
+    if optim_pad_src is not None:
+        sh_ten.gtp_pad_src = optim_pad_src
     sh_ten.validate_metadata_integrity()
     return sh_ten
 

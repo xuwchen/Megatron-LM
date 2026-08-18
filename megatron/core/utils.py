@@ -1017,11 +1017,6 @@ def _make_gtp_logical_sharded_tensor(
         local = tensor
     else:
         local = tensor[:keep]
-        # Identity is unavoidably broken here, so leave a backlink to the full padded shard,
-        # mirroring _gtp_dequant_src. get_param_id_to_sharded_param_map and
-        # _backfill_gtp_sharded_param_map both resolve through it, and the optimizer-state
-        # consumers use it to trim their state to the same logical rows.
-        local._gtp_pad_src = tensor
     if tp_axis == 0:
         global_dim0 = logical_rows * tp_size
         offset_dim0 = tp_rank * logical_rows + start
@@ -1046,6 +1041,12 @@ def _make_gtp_logical_sharded_tensor(
     sharded.global_offset = tuple(global_offset)
     # Uneven shards: the regular-grid divisibility rule no longer applies.
     sharded.axis_fragmentations = None
+    # Trimming breaks object identity with the live param, which several consumers rely on.
+    # The backlink lives on the ShardedTensor, NOT on its data: ``data`` is reassigned
+    # (``sh_ten.data = sh_ten.data.detach()`` in the torch strategy) and detach/clone/to all
+    # produce a fresh tensor that silently drops attributes.
+    if keep != shard_rows:
+        sharded.gtp_pad_src = tensor
     sharded.validate_metadata_integrity()
     return sharded
 

@@ -331,7 +331,7 @@ def mcore_to_pyt_state_dict(
     return pyt_state_dict
 
 
-def _gtp_restore_padded(data: torch.Tensor) -> torch.Tensor:
+def _gtp_restore_padded(sh_ten) -> torch.Tensor:
     """Give back the full padded GTP shard once its logical rows have been loaded.
 
     A GTP shard whose alignment-pad tail is excluded from the checkpoint is described to DCP as
@@ -341,8 +341,8 @@ def _gtp_restore_padded(data: torch.Tensor) -> torch.Tensor:
     and reports a size mismatch. The pad rows keep whatever the model initialized them with,
     which is what a fresh GTP shard holds anyway.
     """
-    src = getattr(data, "_gtp_pad_src", None)
-    return data if src is None else src
+    src = getattr(sh_ten, "gtp_pad_src", None)
+    return sh_ten.data if src is None else src
 
 
 def _unwrap_pyt_sharded_tensor(
@@ -354,10 +354,10 @@ def _unwrap_pyt_sharded_tensor(
     then the tensor has additional singleton dimensions which should be squeezed.
     """
     if isinstance(sh_ten, CheckpointableShardedTensor):
-        return [_gtp_restore_padded(sh_ten._sh_ten.data)]
+        return [_gtp_restore_padded(sh_ten._sh_ten)]
     if isinstance(sh_ten, LocalShardsContainer):
         return [
-            _gtp_restore_padded(local_shard._sh_ten.data)
+            _gtp_restore_padded(local_shard._sh_ten)
             for local_shard in sh_ten._local_shards
         ]
     if not isinstance(sh_ten, TorchShardedTensor):
