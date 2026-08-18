@@ -2636,6 +2636,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # Handle torch Adam "step" state separately.
                             continue
                         v_flat = v.flatten()
+                        # GTP alignment-pad rows are excluded from the checkpoint (they are
+                        # the trailing rows of the shard and hold no parameter), while the
+                        # flat param ranges below are expressed over the PADDED shard.
+                        # Restore them as zeros -- the same value a freshly built shard has --
+                        # so the ranges line up. Mirrors the trim on the save side.
+                        _want_numel = model_param.numel()
+                        if v_flat.numel() < _want_numel:
+                            v_flat = torch.cat(
+                                [v_flat, v_flat.new_zeros(_want_numel - v_flat.numel())]
+                            )
                         v_flat = v_flat[
                             param_range_map["param"].start : param_range_map["param"].end
                         ]
