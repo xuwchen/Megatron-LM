@@ -25,6 +25,7 @@ See ``docs/api-guide/core/generalized_tensor_parallel.md`` for design and usage.
 from __future__ import annotations
 
 import logging
+import os
 import math
 import re
 from collections import defaultdict
@@ -45,6 +46,11 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
 from megatron.core.utils import ensure_params_ready, log_single_rank
 
 logger = logging.getLogger(__name__)
+
+# Perf-attribution probe ONLY (temporary, never merge): bypass the fused-GLU
+# de-interleave pair so an A/B run can price it. Numerics are WRONG when set.
+_GLU_PROBE_NOOP = os.environ.get("GTP_PROBE_GLU_NOOP", "0") == "1"
+
 
 _GTP_TE_MIN_VERSION = Version("2.19.0.dev0")
 
@@ -1499,6 +1505,8 @@ class GTPShardedParam(torch.nn.Parameter):
         an option: that buffer is pooled by (shape, dtype) and shared with other weights, and
         doing so produced NaN in an unrelated attention module.
         """
+        if _GLU_PROBE_NOOP:
+            return tensors  # perf-attribution probe: numerics invalid, timing valid
         n = self.group.size()
         if n <= 1:
             return tensors
@@ -1546,6 +1554,8 @@ class GTPShardedParam(torch.nn.Parameter):
         THROUGH the incoming buffers — they may be pool-owned or CUDA-graph ring slots, so
         their storage must be preserved — at the cost of one temporary per gated wgrad.
         """
+        if _GLU_PROBE_NOOP:
+            return  # perf-attribution probe: numerics invalid, timing valid
         if not any(getattr(w, "_gtp_gated_fused", False) for w in self._weights):
             return
         n = self.group.size()
