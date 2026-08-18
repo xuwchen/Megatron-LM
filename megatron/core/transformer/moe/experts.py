@@ -972,7 +972,12 @@ class TEGroupedMLP(MegatronModule):
                             )
                             v = _gtp_gather_rows_for_save(
                                 sub_sd[k],
-                                k,
+                                # The CHECKPOINT key, not the dict key: TEGroupedLinear keys
+                                # every local expert as `...linear_fc1.weight` and carries the
+                                # expert index as a sharded offset, while the dict key keeps the
+                                # `weight{i}` suffix. Passing the dict key invents per-expert
+                                # checkpoint keys that no non-EGTP run ever writes.
+                                sub_sd[k].key,
                                 expert_w,
                                 target_rows,
                                 self.tp_group,
