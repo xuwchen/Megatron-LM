@@ -30,6 +30,8 @@ try:
 except ImportError:
     HAVE_DEEP_EP_V2 = False
 
+import os
+
 import torch
 
 _buffer = None
@@ -620,6 +622,13 @@ class HybridEPDispatch(torch.autograd.Function):
 
         if _hybrid_ep_buffer is None:
             num_tokens, hidden_dim = x.shape[-2:]
+            # Pre-size for routing imbalance: the lazy init above sizes the buffer to the
+            # FIRST call's local token count, but the post-dispatch receive side fluctuates
+            # with the routing distribution, and any overflow triggers HybridEPBuffer's
+            # runtime reallocation (tens of ms per occurrence). Capacity is allocation-only
+            # (integer bookkeeping unchanged), so oversizing is numerically transparent.
+            headroom = float(os.environ.get("HYBRIDEP_TOKEN_HEADROOM", "1.0"))
+            num_tokens = int(num_tokens * headroom)
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,
