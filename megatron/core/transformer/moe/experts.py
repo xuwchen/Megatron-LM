@@ -982,7 +982,14 @@ class TEGroupedMLP(MegatronModule):
                             v = apply_swiglu_sharded_factory(
                                 v, new_sharded_offsets, singleton_local_shards
                             )
-                            sub_sd[k] = _gtp_slice_rows_on_load(v, expert_w)
+                            v = _gtp_slice_rows_on_load(v, expert_w)
+                            # The factory exposes the GATHERED tensor, so it never matches this
+                            # per-shard param by identity and its key is rewritten by the prefix
+                            # replacement below -- name matching is fragile. Leave a backlink so
+                            # the optimizer resolves it by identity instead (same lesson as
+                            # gtp_pad_src / _gtp_dequant_src).
+                            v.gtp_source_param = expert_w
+                            sub_sd[k] = v
                         else:
                             sub_sd[k] = apply_swiglu_sharded_factory(
                                 sub_sd[k], new_sharded_offsets, singleton_local_shards

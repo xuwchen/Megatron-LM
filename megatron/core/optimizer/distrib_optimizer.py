@@ -139,6 +139,13 @@ def _resolve_gtp_sharded_metadata(model_param, model_sharded_state_dict):
     # Return the model's own factory; the caller gathers the state tensors across the GTP
     # group to the shape the factory expects. Match by name, since the factory's data is
     # the gathered tensor and therefore never identical to this shard.
+    # Case 2a: the factory carries a backlink to the per-shard param it was built from. This is
+    # exact, unlike the name match below -- a grouped-expert factory's key is rewritten by the
+    # prefix replacement in experts.py, so it does not equal the param's stripped _debug_name.
+    for entry in nested_values(model_sharded_state_dict):
+        if getattr(entry, 'gtp_source_param', None) is model_param:
+            return entry
+
     name = _strip_module_prefix(getattr(model_param, '_debug_name', '') or '')
     if name:
         for entry in nested_values(model_sharded_state_dict):

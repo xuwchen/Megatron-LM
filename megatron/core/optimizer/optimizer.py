@@ -873,6 +873,13 @@ def _backfill_gtp_sharded_param_map(
         # Case 1: reuse the model's own entry (native-FP8 dequantized copy broke the id match).
         entry = src_id_to_entry.get(id(p))
         if entry is None:
+            # Gathered+split factories carry a backlink to their source shard (experts.py /
+            # mlp.py); resolve by identity before falling back to name/shape heuristics.
+            for cand in nested_values(model_sharded_state_dict or {}):
+                if getattr(cand, 'gtp_source_param', None) is p:
+                    entry = cand
+                    break
+        if entry is None:
             name = _strip_module_prefix(getattr(p, '_debug_name', '') or '')
             candidate = key_to_entry.get(name)
             # Reuse only a plain ShardedTensor with this shard's local shape; a factory
