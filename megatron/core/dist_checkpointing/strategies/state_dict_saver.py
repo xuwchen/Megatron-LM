@@ -140,7 +140,54 @@ def save_state_dict_async_plan(
         if not loaded_all_plans or not global_md_verify_reuse:
             all_local_plans = dist_wrapper.gather_object(local_plan)
             if dist_wrapper.is_coordinator:
-                _, global_metadata = planner.create_global_plan(all_local_plans)
+                try:
+                    _, global_metadata = planner.create_global_plan(all_local_plans)
+                except Exception:
+                    # DCP reports "Failed to validate global plan" without naming the tensor.
+                    # Reconstruct the per-FQN chunk layout and report the offenders.
+                    _boxes = {}
+                    _gsize = {}
+                    for _plan in all_local_plans:
+                        for _wi in getattr(_plan, "items", []):
+                            _td = getattr(_wi, "tensor_data", None)
+                            if _td is None or getattr(_td, "chunk", None) is None:
+                                continue
+                            _fqn = _wi.index.fqn
+                            _boxes.setdefault(_fqn, []).append(
+                                (tuple(_td.chunk.offsets), tuple(_td.chunk.sizes))
+                            )
+                            _gsize[_fqn] = tuple(_td.size)
+                    for _fqn, _bs in sorted(_boxes.items()):
+                        _problems = []
+                        for _i in range(len(_bs)):
+                            _o0, _s0 = _bs[_i]
+                            if len(_o0) != len(_s0):
+                                _problems.append(f"rank mismatch offsets{_o0} sizes{_s0}")
+                                break
+                            if any(_x == 0 for _x in _s0):
+                                _problems.append(f"empty chunk at {_o0} sizes{_s0}")
+                            for _j in range(_i + 1, len(_bs)):
+                                _o1, _s1 = _bs[_j]
+                                if len(_o1) != len(_s1):
+                                    continue
+                                if all(
+                                    _o0[_d] < _o1[_d] + _s1[_d] and _o1[_d] < _o0[_d] + _s0[_d]
+                                    for _d in range(len(_o0))
+                                ):
+                                    _problems.append(f"overlap {_o0}+{_s0} vs {_o1}+{_s1}")
+                        _vol = sum(
+                            __import__("math").prod(_s) for _, _s in _bs if len(_s) == len(_gsize[_fqn])
+                        )
+                        _want = __import__("math").prod(_gsize[_fqn])
+                        if _vol != _want:
+                            _problems.append(f"volume {_vol} != global {_want} {_gsize[_fqn]}")
+                        if _problems:
+                            print(
+                                f"[PLANDIAG] {_fqn} global={_gsize[_fqn]} nchunks={len(_bs)} "
+                                f"problems={_problems[:4]} chunks={sorted(_bs)[:6]}",
+                                flush=True,
+                            )
+                    raise
                 global_metadata.all_local_plans = all_local_plans
         else:
             logger.debug(f"rank: {rank}, Passed cached global metadata")
