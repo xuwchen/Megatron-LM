@@ -617,7 +617,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc", "gdn", "gdn_norm_out".
+             "shared_experts", "mhc", "gdn", "gdn_qkv", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -632,9 +632,11 @@ class TransformerConfig(ModelParallelConfig):
     "gdn": recompute the entire GDN-family layer, including GatedDeltaNet and KDA
             (input projections, conv1d, gated delta rule, gated norm, CP all-to-all, and
             out_proj). Requires a GDN-family experimental attention variant or a hybrid model.
+    "gdn_qkv": discard-output checkpoint of the GDN projection/prep block only (the gated
+            delta rule kernel is not replayed) — cheaper recompute, smaller memory saving.
     "gdn_norm_out": recompute gated output normalization and layout restoration for
             Gated DeltaNet-family layers, including GatedDeltaNet and KDA.
-    "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use
+    "moe_act", "layernorm", "mla_up_proj", "mhc", "gdn_qkv", and "gdn_norm_out" use
     output-discarding checkpointing,
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
@@ -2305,6 +2307,7 @@ class TransformerConfig(ModelParallelConfig):
                     "shared_experts",
                     "mhc",
                     "gdn",
+                    "gdn_qkv",
                     "gdn_norm_out",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
