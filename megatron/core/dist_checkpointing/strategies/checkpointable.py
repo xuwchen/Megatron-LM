@@ -24,6 +24,19 @@ def _dcp_chunk_size(sh_ten: ShardedTensor) -> torch.Size:
     return torch.Size((1,) * sh_ten.prepend_axis_num + tuple(sh_ten.local_shape))
 
 
+def _dcp_shard_view(sh_ten: ShardedTensor) -> torch.Tensor:
+    """The shard's data viewed over the same axes as its chunk description.
+
+    Must stay consistent with :func:`_dcp_chunk_size`: DCP narrows the returned tensor with the
+    chunk's offsets/sizes, so handing back the bare ``data`` (which lacks the prepended axes)
+    raises ``IndexError: Dimension out of range``. Unsqueezing is free and needs no contiguity.
+    """
+    data = sh_ten.data
+    if not sh_ten.prepend_axis_num:
+        return data
+    return data[(None,) * sh_ten.prepend_axis_num]
+
+
 class CheckpointableShardedTensor(torch.Tensor):
     """ShardedTensor extension compatible with PyTorch DCP checkpointing library.
 
@@ -89,7 +102,7 @@ class CheckpointableShardedTensor(torch.Tensor):
         Returns:
             Tensor: the underlying data tensor
         """
-        return self._sh_ten.data
+        return _dcp_shard_view(self._sh_ten)
 
     @classmethod
     def from_sh_ten(cls, sh_ten: ShardedTensor) -> 'CheckpointableShardedTensor':
