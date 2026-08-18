@@ -852,7 +852,10 @@ def _backfill_gtp_sharded_param_map(
     key_to_entry = {}
     if model_sharded_state_dict is not None:
         for entry in nested_values(model_sharded_state_dict):
-            src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+            data = getattr(entry, 'data', None)
+            # _gtp_pad_src: same idea as _gtp_dequant_src, for a shard whose alignment-pad
+            # tail was trimmed to keep the checkpoint in logical layout.
+            src = getattr(data, '_gtp_dequant_src', None) or getattr(data, '_gtp_pad_src', None)
             if src is not None:
                 src_id_to_entry[id(src)] = entry
             key = getattr(entry, 'key', None)

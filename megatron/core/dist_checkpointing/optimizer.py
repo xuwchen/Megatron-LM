@@ -64,8 +64,13 @@ def get_param_id_to_sharded_param_map(
     # have been converted to local tensors during initialization.
     # See the make_(tp)_sharded_tensor_for_checkpoint functions.
     for ten in nested_values(model_sharded_state_dict):
-        if id(ten.data) in param_to_id_map:
-            id_to_sharded_param_map[param_to_id_map[id(ten.data)]] = ten
+        # A GTP shard whose alignment-pad tail was trimmed for the checkpoint is a narrowed
+        # view, i.e. a different object from the optimizer's param; it carries a backlink to
+        # the full padded shard (see utils._make_gtp_logical_sharded_tensor).
+        pad_src = getattr(ten.data, '_gtp_pad_src', None)
+        match_id = id(pad_src) if pad_src is not None else id(ten.data)
+        if match_id in param_to_id_map:
+            id_to_sharded_param_map[param_to_id_map[match_id]] = ten
         else:
             logger.debug(f'{ten} is not tracked by the optimizer')
 
@@ -96,6 +101,16 @@ def make_sharded_optimizer_tensor(
     optim_param = to_local_if_dtensor(optim_param)
     if isinstance(model_param, ShardedTensorFactory):
         return replace(model_param, key=f'{prefix}.{model_param.key}', data=optim_param)
+
+    # The model entry may have dropped GTP alignment-pad rows; the optimizer state still spans
+    # the full padded shard. Those rows carry no real parameter, so trim rather than save them.
+    if (
+        getattr(model_param.data, '_gtp_pad_src', None) is not None
+        and optim_param.dim() == len(model_param.local_shape)
+        and optim_param.shape[0] > model_param.local_shape[0]
+        and tuple(optim_param.shape[1:]) == tuple(model_param.local_shape[1:])
+    ):
+        optim_param = optim_param[: model_param.local_shape[0]]
 
     assert tuple(optim_param.shape) == model_param.local_shape, (
         f'Optimizer shape ({tuple(optim_param.shape)} does not match model shape '

@@ -10,6 +10,8 @@ from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+import math
+
 import torch
 import torch.nn.functional
 
@@ -2036,7 +2038,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             if gathered.shape[0] != want_rows:
                                 gathered = gathered[:want_rows]
                             state_ten = gathered.contiguous().to(host_device)
-                        state_ten = state_ten.reshape(sharded_metadata.data.shape)
+                        want_shape = tuple(sharded_metadata.data.shape)
+                        if (
+                            getattr(sharded_metadata.data, '_gtp_pad_src', None) is not None
+                            and state_ten.numel() > math.prod(want_shape)
+                        ):
+                            # GTP trimmed the alignment-pad rows out of the model entry; the
+                            # flat state still spans the padded shard. Drop the same tail.
+                            state_ten = state_ten.reshape((-1,) + want_shape[1:])[: want_shape[0]]
+                        state_ten = state_ten.reshape(want_shape)
                         replace_kwargs = dict(
                             key=f'{prefix}.{state_key}.{sharded_metadata.key}',
                             data=state_ten,
