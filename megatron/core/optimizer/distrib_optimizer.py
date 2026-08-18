@@ -115,9 +115,15 @@ def _resolve_gtp_sharded_metadata(model_param, model_sharded_state_dict):
     if not is_gtp_param(model_param):
         return None
 
-    # Case 1: the dequantized copy's backlink.
+    # Case 1: a backlink from the entry's data to the live param. Two kinds exist and both
+    # mean "this entry stands for that param": ``_gtp_dequant_src`` on the native-FP8
+    # dequantized copy, and ``_gtp_pad_src`` on a shard whose alignment-pad tail was trimmed
+    # for the checkpoint. Missing the latter sends the trailing GTP shard down the Case 3
+    # rebuild, which keys it by ``_debug_name`` -- a DIFFERENT checkpoint FQN -- so the real
+    # tensor silently loses those rows and DCP rejects the plan for incomplete coverage.
     for entry in nested_values(model_sharded_state_dict):
-        src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+        data = getattr(entry, 'data', None)
+        src = getattr(data, '_gtp_dequant_src', None) or getattr(data, '_gtp_pad_src', None)
         if src is model_param:
             return entry
 
