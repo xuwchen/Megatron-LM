@@ -54,6 +54,15 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     sharded_state_dict_default,
 )
+try:
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP, is_gtp_param
+except ImportError:  # pragma: no cover - TE-less environments have no GTP
+    HAVE_GTP = False
+
+    def is_gtp_param(_param):
+        return False
+
+
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import is_te_min_version
 
@@ -935,7 +944,46 @@ class TEGroupedMLP(MegatronModule):
                             (ep_axis, local_expert_indices_offset + i, num_global_experts),
                         )
                     for k in (f'{name}.weight{i}', f'{name}.bias{i}'):
-                        if k in sub_sd:
+                        if k not in sub_sd:
+                            continue
+                        expert_w = getattr(module, f'weight{i}', None)
+                        if (
+                            k.endswith(f'weight{i}')
+                            and HAVE_GTP
+                            and expert_w is not None
+                            and is_gtp_param(expert_w)
+                            and getattr(expert_w, 'gtp_remat_size', 1) > 1
+                        ):
+                            # EGTP shards dim0 of this expert's fused [gate|up] weight, and the
+                            # gate/up boundary does not line up with the shard boundaries. Use
+                            # the same logical-layout wiring the non-grouped fc1 uses (see
+                            # transformer/mlp.py): gather the shards back to the ETP-local
+                            # tensor (pad stripped), run the SAME swiglu split a non-EGTP run
+                            # writes, and slice this rank's contiguous rows back out on load.
+                            # This also pins "a shard is a contiguous row slice of [gate|up]",
+                            # so the runtime all-gather is already in logical order.
+                            from megatron.core.tensor_parallel.gtp_ckpt import (
+                                _gtp_gather_rows_for_save,
+                                _gtp_slice_rows_on_load,
+                            )
+
+                            target_rows = (
+                                expert_w.shape[0] * expert_w.group.size() - expert_w.pad_length
+                            )
+                            v = _gtp_gather_rows_for_save(
+                                sub_sd[k],
+                                k,
+                                expert_w,
+                                target_rows,
+                                self.tp_group,
+                                metadata['dp_cp_group'],
+                                new_sharded_offsets,
+                            )
+                            v = apply_swiglu_sharded_factory(
+                                v, new_sharded_offsets, singleton_local_shards
+                            )
+                            sub_sd[k] = _gtp_slice_rows_on_load(v, expert_w)
+                        else:
                             sub_sd[k] = apply_swiglu_sharded_factory(
                                 sub_sd[k], new_sharded_offsets, singleton_local_shards
                             )
