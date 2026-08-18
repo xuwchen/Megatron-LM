@@ -1001,20 +1001,6 @@ class TEGroupedMLP(MegatronModule):
                             # gtp_pad_src / _gtp_dequant_src).
                             v.gtp_source_param = expert_w
                             sub_sd[k] = v
-                            if __import__("os").environ.get("MCORE_DIAG_EGTP") and i == 0:
-                                import torch.distributed as _d
-
-                                _r = _d.get_rank() if _d.is_initialized() else 0
-                                print(
-                                    f"[EGTPDIAG] rank={_r} key={v.key!r} "
-                                    f"replica={getattr(v, 'replica_id', None)} "
-                                    f"data={tuple(v.data.shape)} "
-                                    f"offsets={new_sharded_offsets} "
-                                    f"egtp_rank={torch.distributed.get_rank(expert_w.group)}/"
-                                    f"{expert_w.group.size()} "
-                                    f"ep_rank={self.ep_group.rank()} nloc={self.num_local_experts}",
-                                    flush=True,
-                                )
                         else:
                             sub_sd[k] = apply_swiglu_sharded_factory(
                                 sub_sd[k], new_sharded_offsets, singleton_local_shards
