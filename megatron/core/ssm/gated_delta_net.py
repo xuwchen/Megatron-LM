@@ -37,6 +37,7 @@ from megatron.core.ssm.utils import (
     _split_tensor_factory,
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -281,10 +282,19 @@ class GatedDeltaNet(MegatronModule):
 
         # Whole-module recompute: when "gdn" is in recompute_modules (selective granularity),
         # the entire GatedDeltaNet compute is wrapped in a normal checkpoint and recomputed
-        # in the backward pass.
+        # in the backward pass. "gdn_qkv" instead wraps only the projection/prep block
+        # (in_proj -> CP reshuffle -> pre_gated_delta_rule) in a discard-output checkpoint:
+        # the expensive gated-delta-rule kernel is NOT replayed in backward, trading a
+        # little of "gdn"'s memory saving for most of its recompute cost.
         self.recompute_gdn = False
+        self.recompute_gdn_qkv = False
         if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_gdn = "gdn" in self.config.recompute_modules
+            self.recompute_gdn_qkv = "gdn_qkv" in self.config.recompute_modules
+        assert not (self.recompute_gdn and self.recompute_gdn_qkv), (
+            "recompute_modules must not contain both 'gdn' and 'gdn_qkv': whole-module "
+            "recompute already covers the qkv projection block."
+        )
 
         # Cache for CP context objects consumed by FLA kernels. Rebuilding these per-forward
         # is unsafe under CUDA graph capture because build_cp_context allocates
@@ -513,98 +523,140 @@ class GatedDeltaNet(MegatronModule):
         Returns:
             Tuple of (output, output_bias).
         """
-        # Input projection
-        nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
-        nvtx_range_pop(suffix="in_proj")
+        recompute_qkv = self.recompute_gdn_qkv and self.training
 
-        # Chunkwise CP expects the contiguous-time chunk layout (rank r holds chunks
-        # [2r, 2r+1]) inside conv1d / chunk_gated_delta_rule. Megatron attention CP
-        # feeds us the zigzag attention-load-balanced layout (rank r holds
-        # [r, 2*cp-r-1]), so reshuffle chunks over the CP group with a single
-        # all-to-all — no full-sequence gather required.
-        # TODO: Move CP layout ownership to a model/region-level scheduler so hybrid models can
-        # enter contiguous layout before GDN regions instead of paying module-local conversions.
-        if cp_size_chunkwise > 1:
-            nvtx_range_push(suffix="zigzag_to_contiguous")
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                qkvzba = zigzag_to_contiguous_chunks(
-                    qkvzba, cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
-                )
-            else:
-                qkvzba = zigzag_to_contiguous_chunks(qkvzba, cp_group_chunkwise, seq_dim=0)
-            nvtx_range_pop(suffix="zigzag_to_contiguous")
-
-        qkvzba, thd_cp_a2a_inv = self._a2a_cp_to_hp(
-            qkvzba,
-            cp_size_headwise,
-            cp_group_headwise,
-            cu_seqlens_q,
-            seq_len_post_headwise,
-            packed_seq_params,
-        )
-
-        if self.gdn_pre_gated_delta_rule_fusion:
-            if cp_size_chunkwise > 1 and batch > 1:
-                raise ValueError(
-                    "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-                    "because the FLA gated delta rule backend requires a single batch dimension "
-                    "when cp_context is used. Use packed THD input or micro_batch_size=1."
-                )
-            if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
-                raise ValueError(
-                    "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
-                    "chunk-local causal-conv inputs can change later chunk numerics."
-                )
-            nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
-            seq_idx = (
-                packed_seq_params.seq_idx
-                if packed_seq_params is not None
-                and packed_seq_params.qkv_format == 'thd'
-                and cp_size_chunkwise == 1
-                else None
+        # CheckpointWithoutOutput may only own floating-point outputs that participate in
+        # autograd. Packed THD headwise CP also produces an integer inverse permutation, so
+        # materialize that deterministic metadata outside the checkpoint and reuse it in
+        # both the original forward and the backward replay.
+        precomputed_thd_perm = None
+        if (
+            recompute_qkv
+            and cp_size_headwise > 1
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+        ):
+            precomputed_thd_perm = _build_thd_cp_a2a_perm(
+                cu_seqlens_q, cp_size_headwise, seq_len_post_headwise
             )
-            fused_cu_seqlens_q = (
-                cu_seqlens_q
-                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-                else None
-            )
-            query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
+
+        # Deterministic integer metadata escaping the checkpoint boundary: identical on
+        # replay, so overwriting the box during backward recompute is harmless.
+        _thd_inv_box = [None]
+
+        def _qkv_proj_and_prepare(hidden_states):
+            # Input projection
+            nvtx_range_push(suffix="in_proj")
+            qkvzba, _ = self.in_proj(hidden_states)
+            nvtx_range_pop(suffix="in_proj")
+
+            # Chunkwise CP expects the contiguous-time chunk layout (rank r holds chunks
+            # [2r, 2r+1]) inside conv1d / chunk_gated_delta_rule. Megatron attention CP
+            # feeds us the zigzag attention-load-balanced layout (rank r holds
+            # [r, 2*cp-r-1]), so reshuffle chunks over the CP group with a single
+            # all-to-all — no full-sequence gather required.
+            # TODO: Move CP layout ownership to a model/region-level scheduler so hybrid
+            # models can enter contiguous layout before GDN regions instead of paying
+            # module-local conversions.
+            if cp_size_chunkwise > 1:
+                nvtx_range_push(suffix="zigzag_to_contiguous")
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                    qkvzba = zigzag_to_contiguous_chunks(
+                        qkvzba, cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
+                    )
+                else:
+                    qkvzba = zigzag_to_contiguous_chunks(qkvzba, cp_group_chunkwise, seq_dim=0)
+                nvtx_range_pop(suffix="zigzag_to_contiguous")
+
+            qkvzba, _thd_cp_a2a_inv = self._a2a_cp_to_hp(
                 qkvzba,
-                cu_seqlens_q=fused_cu_seqlens_q,
-                seq_idx=seq_idx,
-                cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
-                cp_size_headwise=cp_size_headwise,
-                cp_group_headwise=cp_group_headwise,
-            )
-            nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
-        else:
-            nvtx_range_push(suffix="pre_gated_delta_rule")
-            if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
-                # TODO: If additional gated delta rule backends are added, handle this
-                # SBHD + chunkwise CP + batch>1 case per backend instead of
-                # unconditionally rejecting it.
-                raise ValueError(
-                    "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-                    "because the FLA gated delta rule backend requires a single batch dimension "
-                    "when cp_context is used. Use packed THD input or micro_batch_size=1."
-                )
-            if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
-                raise ValueError(
-                    "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
-                    "chunk-local causal-conv inputs can change later chunk numerics."
-                )
-            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
-                qkvzba,
-                batch,
-                seq_len_post_headwise,
                 cp_size_headwise,
                 cp_group_headwise,
                 cu_seqlens_q,
-                chunkwise_cp_context,
-                packed_seq_params=packed_seq_params,
+                seq_len_post_headwise,
+                packed_seq_params,
+                precomputed_thd_perm=precomputed_thd_perm,
             )
-            nvtx_range_pop(suffix="pre_gated_delta_rule")
+            _thd_inv_box[0] = _thd_cp_a2a_inv
+
+            if self.gdn_pre_gated_delta_rule_fusion:
+                if cp_size_chunkwise > 1 and batch > 1:
+                    raise ValueError(
+                        "GDN chunkwise CP with SBHD inputs currently requires "
+                        "micro_batch_size == 1 because the FLA gated delta rule backend "
+                        "requires a single batch dimension when cp_context is used. "
+                        "Use packed THD input or micro_batch_size=1."
+                    )
+                if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
+                    raise ValueError(
+                        "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
+                        "chunk-local causal-conv inputs can change later chunk numerics."
+                    )
+                nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
+                seq_idx = (
+                    packed_seq_params.seq_idx
+                    if packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd'
+                    and cp_size_chunkwise == 1
+                    else None
+                )
+                fused_cu_seqlens_q = (
+                    cu_seqlens_q
+                    if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                    else None
+                )
+                query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
+                    qkvzba,
+                    cu_seqlens_q=fused_cu_seqlens_q,
+                    seq_idx=seq_idx,
+                    cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
+                    cp_size_headwise=cp_size_headwise,
+                    cp_group_headwise=cp_group_headwise,
+                )
+                nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
+            else:
+                nvtx_range_push(suffix="pre_gated_delta_rule")
+                if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
+                    # TODO: If additional gated delta rule backends are added, handle this
+                    # SBHD + chunkwise CP + batch>1 case per backend instead of
+                    # unconditionally rejecting it.
+                    raise ValueError(
+                        "GDN chunkwise CP with SBHD inputs currently requires "
+                        "micro_batch_size == 1 because the FLA gated delta rule backend "
+                        "requires a single batch dimension when cp_context is used. "
+                        "Use packed THD input or micro_batch_size=1."
+                    )
+                if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
+                    raise ValueError(
+                        "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
+                        "chunk-local causal-conv inputs can change later chunk numerics."
+                    )
+                query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+                    qkvzba,
+                    batch,
+                    seq_len_post_headwise,
+                    cp_size_headwise,
+                    cp_group_headwise,
+                    cu_seqlens_q,
+                    chunkwise_cp_context,
+                    packed_seq_params=packed_seq_params,
+                )
+                nvtx_range_pop(suffix="pre_gated_delta_rule")
+            return query, key, value, gate, beta, g
+
+        _qkv_ckpt_manager = None
+        if recompute_qkv:
+            # Discard-output checkpoint: the six outputs are freed after their forward
+            # consumers run and are restored by replaying ONLY the projection/prep block
+            # in backward — the gated-delta-rule kernel below is never recomputed.
+            _qkv_ckpt_manager = CheckpointManager()
+            query, key, value, gate, beta, g = tensor_parallel.CheckpointWithoutOutput(
+                fp8=bool(self.config.fp8 or getattr(self.config, "fp4", None)),
+                ckpt_manager=_qkv_ckpt_manager,
+            ).checkpoint(_qkv_proj_and_prepare, hidden_states)
+        else:
+            query, key, value, gate, beta, g = _qkv_proj_and_prepare(hidden_states)
+        thd_cp_a2a_inv = _thd_inv_box[0]
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
@@ -656,6 +708,11 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
+
+        # The output projection has consumed every discardable activation. Register one
+        # hook on its output so the qkv checkpoint replays before its consumers' backward.
+        if _qkv_ckpt_manager is not None:
+            _qkv_ckpt_manager.discard_all_outputs_and_register_unified_recompute(out)
 
         return out, out_bias
 
@@ -864,8 +921,13 @@ class GatedDeltaNet(MegatronModule):
         cu_seqlens_q: Optional[torch.Tensor],
         seq_len: int,
         packed_seq_params: Optional[PackedSeqParams],
+        precomputed_thd_perm: Optional[tuple] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Run GDN context-parallel to hidden-parallel A2A and return its inverse context."""
+        """Run GDN context-parallel to hidden-parallel A2A and return its inverse context.
+
+        ``precomputed_thd_perm`` optionally supplies the (idx, inv) THD permutation pair so a
+        discard-output checkpoint can keep this integer metadata outside its replay boundary.
+        """
         if cp_size > 1:
             # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
             head_perm = _build_head_perm_for_split_sections(
@@ -895,9 +957,12 @@ class GatedDeltaNet(MegatronModule):
                 # Permute at the seq dim so that a single unsectioned a2a
                 # is equivalent to per-sequence a2a.
                 # This also folds the ``_undo_attention_load_balancing`` step.
-                thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
-                    cu_seqlens_q, cp_size, seq_len
-                )
+                if precomputed_thd_perm is not None:
+                    thd_cp_a2a_idx, thd_cp_a2a_inv = precomputed_thd_perm
+                else:
+                    thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
+                        cu_seqlens_q, cp_size, seq_len
+                    )
                 qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
         else:
             qkvzba = tensor_a2a_cp2hp(qkvzba, seq_dim=0, head_dim=-1, cp_group=cp_group)
