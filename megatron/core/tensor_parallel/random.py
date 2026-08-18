@@ -841,10 +841,15 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
             fp8 = FP8GlobalStateManager.is_fp8_enabled()
             ctx.fp8 = fp8
             ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
-            fwd_ctx = activation_recompute_forward(activation_recompute=True, recompute_phase=False)
         else:
             ctx.fp8 = False
             ctx.fp8_recipe = None
+        # TE's activation-recompute marker is independent of FP8: BF16 GTP consumers also
+        # need it so weight gathers issued inside this checkpoint (and its replay) route
+        # through the dedicated recompute chain instead of the fwd/bwd gather state.
+        if checkpoint_without_output_obj.te_activation_recompute:
+            fwd_ctx = activation_recompute_forward(activation_recompute=True, recompute_phase=False)
+        else:
             fwd_ctx = contextlib.nullcontext()
 
         with torch.no_grad(), fwd_ctx:
@@ -1028,7 +1033,14 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False, ckpt_manager=None, output_slot=None, recompute_phase=None):
+    def __init__(
+        self,
+        fp8=False,
+        ckpt_manager=None,
+        output_slot=None,
+        recompute_phase=None,
+        te_activation_recompute=False,
+    ):
         """
         Initialize CheckpointWithoutOutput.
 
@@ -1042,10 +1054,20 @@ class CheckpointWithoutOutput(object):
                          producer and consumed at its captured address.
             recompute_phase: Earliest explicit backward barrier that needs this
                              checkpoint. Defaults to the conservative first phase.
+            te_activation_recompute: Mark forward and replay with TransformerEngine's
+                         activation-recompute phase even in BF16. GTP consumers need this
+                         so weight all-gathers inside the checkpoint route through the
+                         dedicated recompute chain instead of the fwd/bwd gather state.
         """
         from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot, MHCRecomputePhase
 
         self.fp8 = bool(fp8)
+        self.te_activation_recompute = self.fp8 or bool(te_activation_recompute)
+        if self.te_activation_recompute and not HAVE_TE:
+            raise RuntimeError(
+                "CheckpointWithoutOutput requires TransformerEngine when "
+                "te_activation_recompute=True."
+            )
         self.ckpt_manager = ckpt_manager
         if output_slot is not None and not isinstance(output_slot, MHCRecomputeArenaSlot):
             raise TypeError("output_slot must be an MHCRecomputeArenaSlot")
@@ -1121,13 +1143,15 @@ class CheckpointWithoutOutput(object):
         with _fork_rng():
             _set_all_rng_states(*self.rng_states)
 
-            if self.fp8:
+            if self.te_activation_recompute:
                 recompute_ctx = activation_recompute_forward(
                     activation_recompute=True, recompute_phase=True
                 )
-                fp8_ctx = fp8_autocast(enabled=self.ctx.fp8, fp8_recipe=self.ctx.fp8_recipe)
             else:
                 recompute_ctx = contextlib.nullcontext()
+            if self.fp8:
+                fp8_ctx = fp8_autocast(enabled=self.ctx.fp8, fp8_recipe=self.ctx.fp8_recipe)
+            else:
                 fp8_ctx = contextlib.nullcontext()
 
             # Reconstruct full args list from saved ctx
