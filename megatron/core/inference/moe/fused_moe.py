@@ -19,6 +19,7 @@ from megatron.core.inference.moe.permute import (
     permute_tokens,
     unpermute_tokens,
 )
+from megatron.core.inference.quantization.mxfp8_quantize import MXFP8_SCALE_ROW_BLOCK
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
 try:
@@ -170,6 +171,8 @@ def mcore_fused_moe(
             num_local_experts,
             valid_tokens,
             alignment=expert_alignment,
+            row_alignment=MXFP8_SCALE_ROW_BLOCK if use_mxfp8 else 1,
+            return_batch_invariant_inverse_map=batch_invariant_mode,
         )
 
     # --- FC1 -> activation -> FC2 ---
