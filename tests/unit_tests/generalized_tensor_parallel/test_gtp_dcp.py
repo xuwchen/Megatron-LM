@@ -55,6 +55,7 @@ from megatron.core.tensor_parallel.gtp_api import (  # noqa: E402
     dequantize_gtp_native_fp8,
     gtp_native_fp8_load_context,
     gtp_remat_shard_dim0,
+    is_gtp_param,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed  # noqa: E402
 from megatron.core.transformer.spec_utils import ModuleSpec  # noqa: E402
