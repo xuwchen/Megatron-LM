@@ -1004,12 +1004,14 @@ def _make_gtp_logical_sharded_tensor(
     shard_rows = tensor.shape[0]
     logical_rows = shard_rows * gtp_remat_size - pad_length
 
-    start = min(gtp_rank * shard_rows, logical_rows)
-    keep = min(shard_rows, max(0, logical_rows - start))
     # A trailing shard can be entirely padding -- e.g. dim0 1152 with alignment 128*4 pads by
     # 384 into 4 shards of 384, so the last shard covers [1152, 1536). It holds no logical rows,
-    # which is a legal (if wasteful) configuration, not an error: it contributes an empty slice
-    # to the checkpoint. ShardedTensor's own validation anticipates zero-sized shards.
+    # which is a legal (if wasteful) configuration, not an error: `start` clamps to the logical
+    # end and `keep` becomes 0, contributing an empty slice. ShardedTensor's own validation
+    # anticipates zero-sized shards.
+    start = min(gtp_rank * shard_rows, logical_rows)
+    keep = min(shard_rows, max(0, logical_rows - start))
+
     if keep == shard_rows:
         # Nothing to trim: hand back the SAME object. The optimizer maps its params to model
         # entries by object identity (dist_checkpointing/optimizer.py), and a narrowed view --
