@@ -460,13 +460,6 @@ def tag_gtp_params_with_names(model):
         if is_gtp_param(param):
             param._debug_name = name
 
-    # A fused gate|up fc1 under GTP/EGTP stores each shard as a CONTIGUOUS row slice of the
-    # logical [gate | up] weight. That mapping is pinned by the checkpoint wiring:
-    # transformer/mlp.py for the non-grouped case, transformer/moe/experts.py for grouped
-    # (routed-expert) weights. Both gather back to the logical tensor, run the same swiglu
-    # split a non-GTP run writes, and slice this rank's rows out on load -- so the gathered
-    # weight is already in logical order and needs no runtime permutation.
-
 
 def configure_gtp_remat_from_recipe(
     *,

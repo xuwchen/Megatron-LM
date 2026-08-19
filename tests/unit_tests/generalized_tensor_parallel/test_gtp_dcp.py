@@ -1399,9 +1399,14 @@ def _worker_padded_save_load_roundtrip(rank, world_size, ckpt_base):
     """Real DCP save->load with alignment padding actually biting.
 
     The other padded tests assert metadata only, so they cannot see whether the bytes land
-    where the offsets claim. This one writes and reads them back: with the pre-fix mapping
-    TP rank 1 sat pad_length rows too far, so its tail came back as zeros while rank 0 looked
-    perfect -- exactly the shape of the production failure.
+    where the offsets claim. This one writes and reads them back.
+
+    Scope, stated honestly: save and load both go through the same _sd(), so a mapping that
+    is self-consistently WRONG would still round-trip clean here. What this catches is a
+    save path and a load path that disagree, plus any shape/coverage error DCP rejects.
+    The pre-fix cross-topology shift -- TP rank 1 sitting pad_length rows too far -- is
+    caught by _worker_non_gtp_checkpoint_into_padded_gtp, which writes with one layout and
+    reads with another and is therefore the discriminating test of the two.
 
     world=4 -> tp2 x gtp2. Per-TP dim0 10, alignment 3*2=6 -> pad 2, padded 12, shards of 6;
     gtp rank 0 keeps 6 rows, gtp rank 1 keeps 4.

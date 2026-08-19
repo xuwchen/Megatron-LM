@@ -994,6 +994,15 @@ class TEGroupedMLP(MegatronModule):
                                 self.expt_dp_group,
                                 new_sharded_offsets,
                             )
+                            # A fused gate|up fc1 under GTP/EGTP stores each shard as a
+                            # CONTIGUOUS row slice of the logical [gate | up] weight, and this
+                            # gather-then-split-then-slice sequence is what pins that mapping.
+                            # The gather above restores the logical tensor, the factory runs the
+                            # same swiglu split a non-GTP run writes, and the slice below takes
+                            # this rank's rows back out -- so the gathered weight is already in
+                            # logical order and no runtime permutation is needed. The dense
+                            # (non-grouped) counterpart is the same sequence in
+                            # transformer/mlp.py.
                             v = apply_swiglu_sharded_factory(
                                 v, new_sharded_offsets, singleton_local_shards
                             )
