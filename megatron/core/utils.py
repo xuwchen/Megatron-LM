@@ -1048,7 +1048,14 @@ def _make_gtp_logical_sharded_tensor(
     # (``sh_ten.data = sh_ten.data.detach()`` in the torch strategy) and detach/clone/to all
     # produce a fresh tensor that silently drops attributes.
     if keep != shard_rows:
-        sharded.gtp_pad_src = tensor
+        # Point at the LIVE param, which is what the optimizer holds and matches against.
+        # For a native-FP8 GTP weight `tensor` is already the dequantized BF16 copy carrying
+        # `_gtp_dequant_src`; slicing it drops that attribute, so without this hop both
+        # backlinks would break on exactly the trimmed rank and the param's optimizer state
+        # would vanish from the checkpoint with only a debug log.
+        # Explicit None check, not `a or b`: these are tensors.
+        _live = getattr(tensor, "_gtp_dequant_src", None)
+        sharded.gtp_pad_src = tensor if _live is None else _live
     sharded.validate_metadata_integrity()
     return sharded
 

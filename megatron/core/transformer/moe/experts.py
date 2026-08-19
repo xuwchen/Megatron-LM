@@ -54,6 +54,7 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     sharded_state_dict_default,
 )
+
 try:
     from megatron.core.tensor_parallel.gtp_api import HAVE_GTP, is_gtp_param
 except ImportError:  # pragma: no cover - TE-less environments have no GTP
@@ -207,6 +208,10 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+        # Replicate group for expert weights in sharded_state_dict. expt_dp EXCLUDES the
+        # egtp_remat axis (expt_dp_gtp_remat is the inclusive one), which is what writer
+        # election needs: EGTP peers are separated by replica_id[1], not by this rank.
+        self.expt_dp_group = pg_collection.expt_dp
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -962,7 +967,6 @@ class TEGroupedMLP(MegatronModule):
                             # writes, and slice this rank's contiguous rows back out on load.
                             # This also pins "a shard is a contiguous row slice of [gate|up]",
                             # so the runtime all-gather is already in logical order.
-                            from megatron.core import parallel_state as _ps
                             from megatron.core.tensor_parallel.gtp_ckpt import (
                                 _gtp_gather_rows_for_save,
                                 _gtp_slice_rows_on_load,
@@ -987,7 +991,7 @@ class TEGroupedMLP(MegatronModule):
                                 # expert outside ep_rank 0 without a main replica and DCP
                                 # rejected the plan for incomplete coverage. Exclude the GTP
                                 # axis -- EGTP peers are already separated by replica_id[1].
-                                _ps.get_expert_data_parallel_group(with_gtp_remat=False),
+                                self.expt_dp_group,
                                 new_sharded_offsets,
                             )
                             v = apply_swiglu_sharded_factory(

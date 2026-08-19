@@ -462,9 +462,9 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
         f"rank={rank} pad case: local rows {st.local_shape[0]} != {expected_rows} "
         "(alignment pad rows must not reach the checkpoint)"
     )
-    assert not st.allow_shape_mismatch, (
-        f"rank={rank} pad case: the logical layout is exact, so the shape check must stay armed"
-    )
+    assert (
+        not st.allow_shape_mismatch
+    ), f"rank={rank} pad case: the logical layout is exact, so the shape check must stay armed"
 
 
 def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
@@ -509,13 +509,13 @@ def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
         f"rank={rank} saved global_shape ({st.global_shape[0]}) != logical ({dim0_unpadded}); "
         "alignment padding leaked into the checkpoint layout."
     )
-    assert not st.allow_shape_mismatch, (
-        "the logical layout is exact, so the shape check must stay armed"
-    )
+    assert (
+        not st.allow_shape_mismatch
+    ), "the logical layout is exact, so the shape check must stay armed"
     assert st.global_offset[0] == start, f"rank={rank} offset {st.global_offset[0]} != {start}"
-    assert st.local_shape[0] == expected_rows, (
-        f"rank={rank} local rows {st.local_shape[0]} != {expected_rows} (pad rows not dropped)"
-    )
+    assert (
+        st.local_shape[0] == expected_rows
+    ), f"rank={rank} local rows {st.local_shape[0]} != {expected_rows} (pad rows not dropped)"
     assert st.global_offset[0] + st.local_shape[0] <= st.global_shape[0]
 
 
@@ -1351,12 +1351,12 @@ def _worker_padded_shard_logical_offsets(rank, world_size, port):
             f"rank={rank} axis-0 offset {st.global_offset[0]} != {expected_offset} "
             f"(shifted by {st.global_offset[0] - expected_offset})"
         )
-        assert st.local_shape[0] == expected_rows, (
-            f"rank={rank} local rows {st.local_shape[0]} != {expected_rows} (pad rows not dropped)"
-        )
-        assert st.global_offset[0] + st.local_shape[0] <= st.global_shape[0], (
-            f"rank={rank} shard runs past the end of the global tensor"
-        )
+        assert (
+            st.local_shape[0] == expected_rows
+        ), f"rank={rank} local rows {st.local_shape[0]} != {expected_rows} (pad rows not dropped)"
+        assert (
+            st.global_offset[0] + st.local_shape[0] <= st.global_shape[0]
+        ), f"rank={rank} shard runs past the end of the global tensor"
 
         # The shards must tile the logical tensor exactly -- no gap, no overlap.
         span = torch.tensor([st.global_offset[0], st.local_shape[0]], device="cuda")
@@ -1452,9 +1452,9 @@ def _worker_padded_save_load_roundtrip(rank, world_size, ckpt_base):
         else:
             # The backlink lives on the ShardedTensor, not on its data: the torch strategy
             # reassigns data via detach() before loading, which drops tensor attributes.
-            assert getattr(saved["w"], "gtp_pad_src", None) is weight, (
-                "trimmed shard must backlink to the full padded shard for the optimizer id map"
-            )
+            assert (
+                getattr(saved["w"], "gtp_pad_src", None) is weight
+            ), "trimmed shard must backlink to the full padded shard for the optimizer id map"
 
         expected = weight[:keep].clone()
         with TempNamedDir(ckpt_base / 'gtp_padded_roundtrip', sync=True) as ckpt_dir:
@@ -1527,13 +1527,16 @@ def _worker_padded_optimizer_state_mapping(rank, world_size, port):
         assert id_map[0] is sharded["w"], id_map
 
         # 2. Optimizer state spans the full padded shard and must trim to the logical rows.
-        exp_avg = torch.arange(
-            shard_rows * hidden, dtype=torch.float32, device="cuda"
-        ).reshape(shard_rows, hidden)
-        opt_st = make_sharded_optimizer_tensor(sharded["w"], exp_avg, prefix="optimizer.state.exp_avg")
-        assert tuple(opt_st.data.shape) == (keep, hidden), (
-            f"rank={rank} optimizer state {tuple(opt_st.data.shape)} != trimmed {(keep, hidden)}"
+        exp_avg = torch.arange(shard_rows * hidden, dtype=torch.float32, device="cuda").reshape(
+            shard_rows, hidden
         )
+        opt_st = make_sharded_optimizer_tensor(
+            sharded["w"], exp_avg, prefix="optimizer.state.exp_avg"
+        )
+        assert tuple(opt_st.data.shape) == (
+            keep,
+            hidden,
+        ), f"rank={rank} optimizer state {tuple(opt_st.data.shape)} != trimmed {(keep, hidden)}"
         assert torch.equal(opt_st.data, exp_avg[:keep]), "trimmed the wrong rows"
         assert opt_st.global_offset == sharded["w"].global_offset, (
             opt_st.global_offset,
@@ -1581,9 +1584,10 @@ def _worker_padded_fused_projection_gather(rank, world_size, port):
         gathered = _gtp_gather_rows_for_save(
             sh_ten, "in_proj.weight", weight, dim0, tp_group, dp_cp_group, ()
         )
-        assert tuple(gathered.data.shape) == (dim0, hidden), (
-            f"rank={rank} gathered {tuple(gathered.data.shape)} != {(dim0, hidden)}"
-        )
+        assert tuple(gathered.data.shape) == (
+            dim0,
+            hidden,
+        ), f"rank={rank} gathered {tuple(gathered.data.shape)} != {(dim0, hidden)}"
         # _make_gtp_shard fills the logical tensor with arange, so order is checkable.
         expected = torch.arange(
             dim0 * hidden, dtype=gathered.data.dtype, device=gathered.data.device
@@ -1727,9 +1731,9 @@ def _worker_padded_ep_egtp_offsets(rank, world_size, port):
             "-- alignment padding leaked into the checkpoint"
         )
         assert st.global_offset[1] == start, (st.global_offset, start)
-        assert st.local_shape[0] == keep, (
-            f"rank={rank} local rows {st.local_shape[0]} != {keep} (pad rows not dropped)"
-        )
+        assert (
+            st.local_shape[0] == keep
+        ), f"rank={rank} local rows {st.local_shape[0]} != {keep} (pad rows not dropped)"
         assert st.global_offset[0] == global_expert_idx, st.global_offset
         assert not st.allow_shape_mismatch, "the logical layout is exact; keep the check armed"
 

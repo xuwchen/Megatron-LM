@@ -1001,9 +1001,7 @@ class GatedDeltaProductMixer(MegatronModule):
             # local length makes the ranks disagree (the job hangs). Pad is stripped below.
             from megatron.core.tensor_parallel.gtp_ckpt import untrimmed_gtp_shard
 
-            local = untrimmed_gtp_shard(
-                sharded_state_dict[f"{prefix}in_proj.weight"]
-            ).contiguous()
+            local = untrimmed_gtp_shard(sharded_state_dict[f"{prefix}in_proj.weight"]).contiguous()
             gathered = torch.empty(
                 (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
                 dtype=local.dtype,

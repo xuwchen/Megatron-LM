@@ -356,10 +356,7 @@ def _unwrap_pyt_sharded_tensor(
     if isinstance(sh_ten, CheckpointableShardedTensor):
         return [_gtp_restore_padded(sh_ten._sh_ten)]
     if isinstance(sh_ten, LocalShardsContainer):
-        return [
-            _gtp_restore_padded(local_shard._sh_ten)
-            for local_shard in sh_ten._local_shards
-        ]
+        return [_gtp_restore_padded(local_shard._sh_ten) for local_shard in sh_ten._local_shards]
     if not isinstance(sh_ten, TorchShardedTensor):
         return sh_ten
     mcore_sh_ten = sh_ten.mcore_sh_ten

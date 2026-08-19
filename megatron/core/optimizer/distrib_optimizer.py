@@ -5,12 +5,11 @@
 import gc
 import itertools
 import logging
+import math
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-
-import math
 
 import torch
 import torch.nn.functional
@@ -123,9 +122,12 @@ def _resolve_gtp_sharded_metadata(model_param, model_sharded_state_dict):
     # tensor silently loses those rows and DCP rejects the plan for incomplete coverage.
     for entry in nested_values(model_sharded_state_dict):
         data = getattr(entry, 'data', None)
-        src = getattr(data, '_gtp_dequant_src', None) or getattr(
-            entry, 'gtp_pad_src', None
-        )
+        # Explicit None checks, NOT `a or b`: _gtp_dequant_src is a TENSOR, and `or` evaluates
+        # bool() on it, which raises "Boolean value of Tensor with more than one element is
+        # ambiguous" for every native-FP8 entry.
+        src = getattr(data, '_gtp_dequant_src', None)
+        if src is None:
+            src = getattr(entry, 'gtp_pad_src', None)
         if src is model_param:
             return entry
 
@@ -2054,10 +2056,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 gathered = gathered[:want_rows]
                             state_ten = gathered.contiguous().to(host_device)
                         want_shape = tuple(sharded_metadata.data.shape)
-                        if (
-                            getattr(sharded_metadata, 'gtp_pad_src', None) is not None
-                            and state_ten.numel() > math.prod(want_shape)
-                        ):
+                        if getattr(
+                            sharded_metadata, 'gtp_pad_src', None
+                        ) is not None and state_ten.numel() > math.prod(want_shape):
                             # GTP trimmed the alignment-pad rows out of the model entry; the
                             # flat state still spans the padded shard. Drop the same tail.
                             state_ten = state_ten.reshape((-1,) + want_shape[1:])[: want_shape[0]]

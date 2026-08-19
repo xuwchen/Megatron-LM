@@ -855,9 +855,12 @@ def _backfill_gtp_sharded_param_map(
             data = getattr(entry, 'data', None)
             # gtp_pad_src (on the ShardedTensor): same idea as _gtp_dequant_src, for a shard
             # tail was trimmed to keep the checkpoint in logical layout.
-            src = getattr(data, '_gtp_dequant_src', None) or getattr(
-                entry, 'gtp_pad_src', None
-            )
+            # Explicit None checks, NOT `a or b`: _gtp_dequant_src is a TENSOR and `or`
+            # would call bool() on it -> "Boolean value of Tensor with more than one element
+            # is ambiguous" on every native-FP8 entry.
+            src = getattr(data, '_gtp_dequant_src', None)
+            if src is None:
+                src = getattr(entry, 'gtp_pad_src', None)
             if src is not None:
                 src_id_to_entry[id(src)] = entry
             key = getattr(entry, 'key', None)
