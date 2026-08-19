@@ -1685,6 +1685,66 @@ def _worker_non_gtp_checkpoint_into_padded_gtp(rank, world_size, ckpt_base):
         ps.initialize_model_parallel()
 
 
+def _worker_padded_ep_egtp_offsets(rank, world_size, port):
+    """EGTP with the expert weight ACTUALLY padded — the combination nothing else covers.
+
+    Every other EGTP test runs under the file-wide ``_no_pad_alignment`` fixture, and the
+    shipped configs happen to divide evenly (gated moe_ffn 1024 -> 2048 rows per expert, which
+    is a multiple of the 16*EGTP alignment), so the padded branch of the grouped-expert
+    checkpoint wiring has never executed. Padding is exactly what broke the dense path: the
+    offset was computed from the PADDED shard size, shifting every rank past the first.
+
+    EP=2 x EGTP=2 (4 ranks). Per-expert out 10, alignment 3*2=6 -> pad 2, padded 12, shards of
+    6: egtp rank 0 keeps 6 rows, egtp rank 1 keeps 4. The saved global must stay logical (10).
+    """
+    orig = GTP_CONFIG.pad_for_alignment
+    update_gtp_config(pad_for_alignment=3)
+    try:
+        egtp_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+        ep_size, egtp_size, num_gemms = 2, 2, 1
+        ep_rank, egtp_rank = rank // 2, rank % 2
+        per_expert_out, in_features = 10, 4
+        num_global_experts = ep_size * num_gemms
+        global_expert_idx = ep_rank * num_gemms
+
+        weight = _make_gtp_shard(per_expert_out, in_features, egtp_group)
+        assert (weight.shape[0], weight.pad_length) == (6, 2), (weight.shape, weight.pad_length)
+
+        sharded = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+            {"weight": weight},
+            prefix="",
+            tensor_parallel_layers_axis_map={"weight": 0},
+            sharded_offsets=((0, global_expert_idx, num_global_experts),),
+            tp_group=_cached_new_group([rank]),
+            dp_cp_group=_cached_new_group(list(range(world_size))),
+        )
+        st = sharded["weight"]
+
+        start = egtp_rank * 6
+        keep = min(6, max(0, per_expert_out - start))
+        assert st.global_shape[1] == per_expert_out, (
+            f"rank={rank} expert axis-0 global {st.global_shape[1]} != logical {per_expert_out} "
+            "-- alignment padding leaked into the checkpoint"
+        )
+        assert st.global_offset[1] == start, (st.global_offset, start)
+        assert st.local_shape[0] == keep, (
+            f"rank={rank} local rows {st.local_shape[0]} != {keep} (pad rows not dropped)"
+        )
+        assert st.global_offset[0] == global_expert_idx, st.global_offset
+        assert not st.allow_shape_mismatch, "the logical layout is exact; keep the check armed"
+
+        # The two EGTP shards of one expert must tile that expert's rows exactly.
+        span = torch.tensor([global_expert_idx, start, keep], device="cuda")
+        spans = [torch.empty_like(span) for _ in range(world_size)]
+        dist.all_gather(spans, span)
+        covered = torch.zeros(num_global_experts, per_expert_out, dtype=torch.int32)
+        for e, off, rows in (t.cpu().tolist() for t in spans):
+            covered[e, off : off + rows] += 1
+        assert torch.all(covered == 1), f"expert rows not tiled exactly:\n{covered.tolist()}"
+    finally:
+        update_gtp_config(pad_for_alignment=orig)
+
+
 # ---------------------------------------------------------------------------
 # Test class wrappers (4-GPU)
 # ---------------------------------------------------------------------------
@@ -1737,6 +1797,10 @@ class TestGtpDcpHelper:
     def test_dual_offsets_cross_axis(self):
         _require_world_size(4)
         _worker_helper_offsets_tp_neq_gtp_axis(dist.get_rank(), 4, None)
+
+    def test_padded_ep_egtp_offsets(self):
+        _require_world_size(4)
+        _worker_padded_ep_egtp_offsets(dist.get_rank(), 4, None)
 
     def test_ep_egtp_offsets(self):
         _require_world_size(4)
