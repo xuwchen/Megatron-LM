@@ -22,6 +22,35 @@ from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
+def gtp_entry_backlink(entry):
+    """Return the live GTP param a model checkpoint entry stands for, or None.
+
+    ``get_param_id_to_sharded_param_map`` / ``param_to_sharded_metadata`` key model entries by
+    ``id()`` of the tensor the entry carries. Two GTP cases deliberately put a DIFFERENT tensor
+    there, so identity alone cannot match them back to the live parameter:
+
+    - Native FP8: the entry holds a dequantized BF16 COPY of the param, tagged
+      ``_gtp_dequant_src`` on the copy (a tensor attribute).
+    - Alignment padding: the entry holds a shard whose pad tail was trimmed so the checkpoint
+      stays in logical layout, tagged ``gtp_pad_src`` on the ShardedTensor. It must live on the
+      ShardedTensor and not on its data, because the torch strategy does
+      ``sh_ten.data = sh_ten.data.detach()``, which drops tensor attributes.
+
+    An FP8 param that is ALSO padded has both hops in play, so ``gtp_pad_src`` is set to the live
+    param rather than to the dequantized copy -- otherwise the trimmed rank would resolve to a
+    copy that the ``_gtp_dequant_src`` lookup can no longer see, and its optimizer state would
+    silently vanish.
+
+    Callers must not fold these two ``getattr`` results together with ``or``: the values are
+    TENSORS, and ``or`` evaluates ``bool()`` on them, raising "Boolean value of Tensor with more
+    than one element is ambiguous" for every native-FP8 entry.
+    """
+    src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+    if src is None:
+        src = getattr(entry, 'gtp_pad_src', None)
+    return src
+
+
 def untrimmed_gtp_shard(sh_ten) -> torch.Tensor:
     """Return the full padded GTP shard behind a checkpoint entry's data.
 

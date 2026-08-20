@@ -108,27 +108,20 @@ def _resolve_gtp_sharded_metadata(model_param, model_sharded_state_dict):
             is_gtp_param,
             make_sharded_tensors_for_checkpoint_with_gtp_remat,
         )
+        from megatron.core.tensor_parallel.gtp_ckpt import gtp_entry_backlink
     except ImportError:
         return None  # GTP not built in.
 
     if not is_gtp_param(model_param):
         return None
 
-    # Case 1: a backlink from the entry's data to the live param. Two kinds exist and both
-    # mean "this entry stands for that param": ``_gtp_dequant_src`` on the native-FP8
-    # dequantized copy, and ``gtp_pad_src`` (on the ShardedTensor) for a shard whose pad tail
-    # for the checkpoint. Missing the latter sends the trailing GTP shard down the Case 3
-    # rebuild, which keys it by ``_debug_name`` -- a DIFFERENT checkpoint FQN -- so the real
-    # tensor silently loses those rows and DCP rejects the plan for incomplete coverage.
+    # Case 1: the entry carries a backlink saying it stands for this param -- see
+    # gtp_entry_backlink for the two kinds and why they exist. Missing the padding one sends the
+    # trailing GTP shard down the Case 3 rebuild, which keys it by ``_debug_name`` -- a DIFFERENT
+    # checkpoint FQN -- so the real tensor silently loses those rows and DCP rejects the plan for
+    # incomplete coverage.
     for entry in nested_values(model_sharded_state_dict):
-        data = getattr(entry, 'data', None)
-        # Explicit None checks, NOT `a or b`: _gtp_dequant_src is a TENSOR, and `or` evaluates
-        # bool() on it, which raises "Boolean value of Tensor with more than one element is
-        # ambiguous" for every native-FP8 entry.
-        src = getattr(data, '_gtp_dequant_src', None)
-        if src is None:
-            src = getattr(entry, 'gtp_pad_src', None)
-        if src is model_param:
+        if gtp_entry_backlink(entry) is model_param:
             return entry
 
     # Case 2: a factory-backed weight (GDN / Mamba in_proj). The model gathers the GTP

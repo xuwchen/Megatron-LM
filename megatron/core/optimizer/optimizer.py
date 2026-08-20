@@ -832,6 +832,7 @@ def _backfill_gtp_sharded_param_map(
             is_gtp_param,
             make_sharded_tensors_for_checkpoint_with_gtp_remat,
         )
+        from megatron.core.tensor_parallel.gtp_ckpt import gtp_entry_backlink
     except ImportError:
         return  # GTP not built in -- nothing to backfill.
 
@@ -852,15 +853,9 @@ def _backfill_gtp_sharded_param_map(
     key_to_entry = {}
     if model_sharded_state_dict is not None:
         for entry in nested_values(model_sharded_state_dict):
-            data = getattr(entry, 'data', None)
-            # gtp_pad_src (on the ShardedTensor): same idea as _gtp_dequant_src, for a shard
-            # tail was trimmed to keep the checkpoint in logical layout.
-            # Explicit None checks, NOT `a or b`: _gtp_dequant_src is a TENSOR and `or`
-            # would call bool() on it -> "Boolean value of Tensor with more than one element
-            # is ambiguous" on every native-FP8 entry.
-            src = getattr(data, '_gtp_dequant_src', None)
-            if src is None:
-                src = getattr(entry, 'gtp_pad_src', None)
+            # See gtp_entry_backlink: the native-FP8 dequantized copy and the pad-trimmed shard
+            # both break the id() match, and each tags the live param a different way.
+            src = gtp_entry_backlink(entry)
             if src is not None:
                 src_id_to_entry[id(src)] = entry
             key = getattr(entry, 'key', None)
