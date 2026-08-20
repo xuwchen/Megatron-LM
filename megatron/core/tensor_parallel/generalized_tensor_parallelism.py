@@ -498,6 +498,30 @@ def configure_gtp_remat_from_recipe(
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
     )
+    # Two diagnostic escape hatches for the "prefetch breaks bitwise reproducibility"
+    # investigation. Neither has a CLI knob, so without these a run simply cannot test the
+    # question. Under deterministic_mode with the full validate_deterministic() checklist
+    # satisfied, GTP's iteration-2 loss still varies run to run by 2.6e-04 while a non-GTP
+    # arm is bit-identical -- and the variation disappeared once diagnostic probes (which
+    # add stream syncs) were enabled, which points at the asynchronous consume path rather
+    # than at arithmetic.
+    #
+    #   MCORE_GTP_NO_WEIGHT_PREFETCH=1  take the on-demand (synchronous) all-gather at every
+    #                                   consume. This is the control arm: with it, 19/19
+    #                                   iterations were bit-identical on the diag branch.
+    #   MCORE_GTP_CHECK_PARAM_STATES=1  turn the stale-read asserts back on. They fire when a
+    #                                   consume reaches cache.get() without an all-gather
+    #                                   having been issued for this cycle -- i.e. exactly the
+    #                                   "read the previous AG's buffer" failure. Off by default
+    #                                   because GTP buffer reuse under CUDA-graph capture trips
+    #                                   them, so a firing assert is only evidence when capture
+    #                                   is off.
+    import os as _os_diag
+
+    if _os_diag.environ.get("MCORE_GTP_NO_WEIGHT_PREFETCH"):
+        update_gtp_config(weight_prefetch=False)
+    if _os_diag.environ.get("MCORE_GTP_CHECK_PARAM_STATES"):
+        update_gtp_config(check_param_states=True)
     # An explicit value wins over the recipe default. The alignment pad is otherwise
     # unreachable from the training flow: only these three quantized branches set it,
     # and GTPRematConfig's default of 16 then applies to bf16 runs as well. Being able
