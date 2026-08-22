@@ -201,6 +201,38 @@ class GatedDeltaProductMixer(MegatronModule):
         self.num_householder = config.gdp_num_householder
 
         self.config = config
+        # deterministic_mode does not reach this module, and silently running anyway is the
+        # failure mode this guard exists to prevent. GatedDeltaNet swaps its three fla ops for
+        # torch implementations under the flag; GatedDeltaProduct has no torch reference for
+        # chunk_gated_delta_product, so there is nothing to swap to.
+        #
+        # It matters because the training/prefill path IS the autotuned one. fla's
+        # chunk_gated_delta_product carries @triton.autotune in two files
+        # (chunk_deltaproduct_o.py, chunk_deltaproduct_h.py); Triton's autotuner picks a config
+        # by TIMING it at runtime, and the chosen config (num_warps, block sizes) fixes the
+        # reduction order of the tl.sum inside. Timing is perturbed by whatever else the GPU is
+        # doing, so the same run can pick a different config and produce different numerics --
+        # while torch.use_deterministic_algorithms sees nothing, because it cannot look inside
+        # Triton. That is precisely how the GDN q/k L2 norm made training irreproducible for
+        # four days while the whole determinism checklist reported green (see the l2norm swap in
+        # gated_delta_net.py).
+        #
+        # The decode path (fused_recurrent_gated_delta_rule) is clean -- its module has no
+        # autotune and does not import the one sibling that does -- so this refuses only what is
+        # actually unsafe.
+        #
+        # Megatron's own Triton kernels solve this with ssm/ops/determinism.py::autotune_configs,
+        # which picks a config by estimated shared-memory cost instead of measured time. That is
+        # the shape of a real fix here too, but it needs fla to route its configs through it, or
+        # a torch reference for chunk_gated_delta_product. Until one exists, refuse loudly.
+        if getattr(config, "deterministic_mode", False):
+            raise RuntimeError(
+                "GatedDeltaProduct does not support deterministic_mode: its train/prefill path "
+                "calls fla's chunk_gated_delta_product, whose Triton autotuner selects a kernel "
+                "config by runtime timing, so the reduction order -- and the result -- can differ "
+                "between runs. torch.use_deterministic_algorithms cannot detect this. Disable "
+                "deterministic_mode, or use GatedDeltaNet, which has torch fallbacks."
+            )
         self.d_model = d_model
         self.d_conv = d_conv
         self.conv_init = conv_init
