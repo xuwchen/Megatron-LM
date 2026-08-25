@@ -20,6 +20,7 @@ from megatron.core.mdp.encoder import (
     build_encoder_domain,
     build_encoder_pg_collection,
     finalize_encoder_grads,
+    zero_pad_vision_mlp_channels,
 )
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
@@ -211,4 +212,130 @@ def test_disjointness_assertion_catches_leaked_parameter():
     # And a clean chunk passes.
     assert_parameter_disjointness(
         domain.encoder_ddp, [torch.nn.Linear(4, 4).cuda()]
+    )
+
+
+# ---------------------- zero_pad_vision_ffn (Approach B) ----------------------
+
+
+def _build_mlp_config(ffn_hidden_size):
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=1,
+        ffn_hidden_size=ffn_hidden_size,
+        gated_linear_unit=False,
+        add_bias_linear=True,
+        use_cpu_initialization=True,
+        calculate_per_token_loss=True,
+    )
+
+
+class _TinyMLPEncoder(torch.nn.Module):
+    """Wraps a real MLP so zero_pad_vision_mlp_channels' isinstance(module, MLP)
+    walk finds a genuine linear_fc1/linear_fc2 pair, same as the vision
+    encoder's per-layer MLP submodules."""
+
+    def __init__(self, config):
+        super().__init__()
+        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+        from megatron.core.transformer.mlp import MLP
+        from megatron.core.transformer.spec_utils import get_submodules
+
+        self.config = config
+        mlp_submodules = get_submodules(get_gpt_layer_local_submodules().mlp)
+        self.mlp = MLP(config, submodules=mlp_submodules)
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class _TinyMLPAdapter:
+    payload_width = 8
+    spatial_merge_size = 2
+
+    def build_encoder(self, model_config, *, pg_collection):
+        return _TinyMLPEncoder(model_config)
+
+
+def test_zero_pad_vision_ffn_zeros_padding_channels_only():
+    real_ffn, padded_ffn = 6, 8
+    encoder = _TinyMLPEncoder(_build_mlp_config(padded_ffn))
+    torch.nn.init.normal_(encoder.mlp.linear_fc1.weight, std=1.0)
+    torch.nn.init.normal_(encoder.mlp.linear_fc1.bias, std=1.0)
+    torch.nn.init.normal_(encoder.mlp.linear_fc2.weight, std=1.0)
+    real_fc1_before = encoder.mlp.linear_fc1.weight.data[:real_ffn, :].clone()
+
+    zero_pad_vision_mlp_channels(encoder, real_ffn_hidden_size=real_ffn)
+
+    assert torch.equal(encoder.mlp.linear_fc1.weight.data[:real_ffn, :], real_fc1_before)
+    assert torch.equal(
+        encoder.mlp.linear_fc1.weight.data[real_ffn:, :],
+        torch.zeros_like(encoder.mlp.linear_fc1.weight.data[real_ffn:, :]),
+    )
+    assert torch.equal(
+        encoder.mlp.linear_fc1.bias.data[real_ffn:],
+        torch.zeros_like(encoder.mlp.linear_fc1.bias.data[real_ffn:]),
+    )
+    assert torch.equal(
+        encoder.mlp.linear_fc2.weight.data[:, real_ffn:],
+        torch.zeros_like(encoder.mlp.linear_fc2.weight.data[:, real_ffn:]),
+    )
+
+
+def test_zero_pad_vision_ffn_noop_when_already_real_size():
+    """No override in effect (ffn_hidden_size == real_ffn_hidden_size) must
+    raise rather than silently do nothing -- callers only invoke this when
+    they mean to pad."""
+    encoder = _TinyMLPEncoder(_build_mlp_config(6))
+    with pytest.raises(MdpConfigurationError, match="no vision MLP layer"):
+        zero_pad_vision_mlp_channels(encoder, real_ffn_hidden_size=6)
+
+
+def test_zero_pad_vision_ffn_rejects_target_smaller_than_real():
+    encoder = _TinyMLPEncoder(_build_mlp_config(6))
+    with pytest.raises(MdpConfigurationError, match="real_ffn_hidden_size"):
+        zero_pad_vision_mlp_channels(encoder, real_ffn_hidden_size=8)
+
+
+def test_build_encoder_domain_applies_zero_pad_vision_ffn():
+    real_ffn, padded_ffn = 6, 8
+    world = torch.distributed.get_world_size()
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
+    )
+    groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
+    encoder_pgs = build_encoder_pg_collection(
+        rank_map, encoder_cp=1, process_groups=groups
+    )
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True,
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+    )
+    optimizer_config = OptimizerConfig(
+        optimizer="adam", lr=1e-3, use_distributed_optimizer=True, clip_grad=1.0
+    )
+    domain = build_encoder_domain(
+        adapter=_TinyMLPAdapter(),
+        model_config=_build_mlp_config(real_ffn),
+        mdp_config=MdpConfig(
+            enable=True,
+            zero_pad_vision_ffn=True,
+            vision_config_overrides=(("ffn_hidden_size", padded_ffn),),
+        ),
+        ddp_config=ddp_config,
+        optimizer_config=optimizer_config,
+        encoder_pgs=encoder_pgs,
+        wrap_mixed_precision=False,
+    )
+    mlp = domain.encoder_ddp.module.mlp
+    assert mlp.linear_fc1.weight.shape[0] == padded_ffn
+    assert torch.equal(
+        mlp.linear_fc1.weight.data[real_ffn:, :],
+        torch.zeros_like(mlp.linear_fc1.weight.data[real_ffn:, :]),
+    )
+    assert torch.equal(
+        mlp.linear_fc2.weight.data[:, real_ffn:],
+        torch.zeros_like(mlp.linear_fc2.weight.data[:, real_ffn:]),
     )

@@ -42,6 +42,13 @@ VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
         "fp8_amax_compute_algo",
         "fp8_wgrad",
         "fp8_dot_product_attention",
+        # Vision FFN alignment target (e.g. MXFP8's 32-token block size: 4304 ->
+        # 4320). Used two ways: as a raw architecture change (checkpoint-
+        # incompatible, "Approach A"), or paired with --mdp-zero-pad-vision-ffn
+        # so the extra channels are zero-initialized and provably inert
+        # ("Approach B", checkpoint-compatible -- see
+        # zero_pad_vision_mlp_channels in encoder.py).
+        "ffn_hidden_size",
     }
 )
 
@@ -78,6 +85,7 @@ class MdpConfig:
     debug_plan_payload_check: bool = False
     pixel_locality: bool = False
     overlap_window_capture: bool = False
+    zero_pad_vision_ffn: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,6 +152,18 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "None or a positive integer",
             "The chunk cap is measured in patch rows.",
             "None",
+        )
+    if config.zero_pad_vision_ffn and not any(
+        key == "ffn_hidden_size" for key, _ in config.vision_config_overrides
+    ):
+        _reject(
+            "zero_pad_vision_ffn",
+            config.zero_pad_vision_ffn,
+            "an ffn_hidden_size vision_config_overrides entry is present",
+            "zero_pad_vision_ffn pads the vision FFN's real (checkpoint) hidden "
+            "size up to whatever --mdp-vision-config-override ffn_hidden_size=N "
+            "requests; with no such override there is nothing to pad to.",
+            "--mdp-vision-config-override ffn_hidden_size=<alignment target>",
         )
     if not (0 <= config.locality_slack_permille < 1000):
         _reject(

@@ -78,6 +78,78 @@ def build_encoder_pg_collection(
     return pgs
 
 
+def zero_pad_vision_mlp_channels(encoder: torch.nn.Module, *, real_ffn_hidden_size: int) -> None:
+    """Zero-init the FFN alignment-padding channels on every vision MLP layer.
+
+    ``effective_config.ffn_hidden_size`` (the model actually built) may be larger
+    than ``real_ffn_hidden_size`` (the official/checkpoint architecture) when
+    ``--mdp-vision-config-override ffn_hidden_size=N`` requests a hardware
+    alignment target (e.g. MXFP8's 32-token block size: 4304 -> 4320). Every
+    :class:`~megatron.core.transformer.mlp.MLP` in the encoder gets its extra
+    rows/columns -- ``linear_fc1``'s output rows ``[real_ffn_hidden_size:]`` and
+    ``linear_fc2``'s input columns ``[:, real_ffn_hidden_size:]``, plus
+    ``linear_fc1``'s bias if present -- zeroed here, once, at construction time.
+
+    No gradient masking or parameter freezing is needed after this: the vision
+    MLP is ``linear_fc1 -> activation -> linear_fc2`` with no intermediate
+    normalization, so GELU(0)=0 exactly and, by the chain rule, these padding
+    channels receive exactly-zero gradient on every subsequent backward pass --
+    a self-stabilizing invariant (bit-exact verified in
+    ``scripts/test_mxfp8_ffn_padding.py``). This function only has to establish
+    the invariant once; it is never called again during training.
+
+    TP=1 is assumed for the encoder (true for every current MDP topology, see
+    ``build_encoder_pg_collection``), so ``linear_fc1``/``linear_fc2`` weights
+    are the full, unsharded ``[ffn_hidden_size, hidden_size]`` /
+    ``[hidden_size, ffn_hidden_size]`` tensors on every rank -- no TP shard
+    offset accounting is required.
+    """
+    from megatron.core.transformer.mlp import MLP
+
+    padded = 0
+    with torch.no_grad():
+        for module in encoder.modules():
+            if not isinstance(module, MLP):
+                continue
+            fc1_out = module.linear_fc1.weight.shape[0]
+            fc2_in = module.linear_fc2.weight.shape[1]
+            if fc1_out != fc2_in:
+                raise MdpConfigurationError(
+                    f"MDP: vision MLP linear_fc1 output width {fc1_out} != "
+                    f"linear_fc2 input width {fc2_in} violates: the two must "
+                    "agree on ffn_hidden_size for zero_pad_vision_ffn to locate "
+                    "the padding channels consistently."
+                )
+            if fc1_out < real_ffn_hidden_size:
+                raise MdpConfigurationError(
+                    f"MDP: vision MLP ffn_hidden_size {fc1_out} violates: "
+                    f">= real_ffn_hidden_size ({real_ffn_hidden_size}). "
+                    "zero_pad_vision_ffn only pads up, never down; check the "
+                    "--mdp-vision-config-override ffn_hidden_size=N value."
+                )
+            if fc1_out == real_ffn_hidden_size:
+                continue  # no padding requested for this layer; nothing to zero
+            module.linear_fc1.weight.data[real_ffn_hidden_size:, :].zero_()
+            if module.linear_fc1.bias is not None:
+                module.linear_fc1.bias.data[real_ffn_hidden_size:].zero_()
+            module.linear_fc2.weight.data[:, real_ffn_hidden_size:].zero_()
+            padded += 1
+    if padded == 0:
+        raise MdpConfigurationError(
+            "MDP: zero_pad_vision_ffn=True found no vision MLP layer whose "
+            f"ffn_hidden_size exceeds real_ffn_hidden_size ({real_ffn_hidden_size}) "
+            "violates: at least one layer to pad. Check that "
+            "--mdp-vision-config-override ffn_hidden_size=N is actually larger "
+            "than the base vision config's ffn_hidden_size."
+        )
+    logger.info(
+        "MDP: zero-padded %d vision MLP layer(s) from real ffn_hidden_size=%d up "
+        "to the checkpoint-compatible alignment target.",
+        padded,
+        real_ffn_hidden_size,
+    )
+
+
 def build_encoder_domain(
     *,
     adapter: MdpModelAdapter,
@@ -116,6 +188,10 @@ def build_encoder_domain(
         list(mdp_config.vision_config_overrides),
     )
     encoder = adapter.build_encoder(effective_config, pg_collection=encoder_pgs)
+    if mdp_config.zero_pad_vision_ffn:
+        zero_pad_vision_mlp_channels(
+            encoder, real_ffn_hidden_size=model_config.ffn_hidden_size
+        )
     if wrap_mixed_precision and (
         getattr(effective_config, "fp16", False) or getattr(effective_config, "bf16", False)
     ):

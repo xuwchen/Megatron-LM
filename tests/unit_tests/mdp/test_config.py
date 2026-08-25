@@ -83,6 +83,14 @@ def test_disabled_mdp_skips_all_checks():
             ),
             "sorted",
         ),
+        (dict(zero_pad_vision_ffn=True), "zero_pad_vision_ffn"),
+        (
+            dict(
+                zero_pad_vision_ffn=True,
+                vision_config_overrides=(("recompute_granularity", "full"),),
+            ),
+            "zero_pad_vision_ffn",
+        ),
     ],
 )
 def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
@@ -132,6 +140,17 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
 def test_rejection_list(option_kwargs, match):
     with pytest.raises(MdpConfigurationError, match=match):
         validate_mdp_config(MdpConfig(enable=True), _options(**option_kwargs))
+
+
+def test_zero_pad_vision_ffn_accepted_with_ffn_hidden_size_override():
+    validate_mdp_config(
+        MdpConfig(
+            enable=True,
+            zero_pad_vision_ffn=True,
+            vision_config_overrides=(("ffn_hidden_size", 4320),),
+        ),
+        _options(),
+    )
 
 
 def test_unsupported_checkpoint_mode_allowed_without_save_or_load():
@@ -197,6 +216,7 @@ class _FakeTransformerConfig:
     recompute_num_layers: object = None
     recompute_modules: object = None
     hidden_size: int = 64
+    ffn_hidden_size: int = 4304
 
     def __post_init__(self):
         if self.recompute_granularity not in (None, "selective", "full"):
@@ -213,6 +233,13 @@ def test_apply_overrides_uses_dataclasses_replace():
     assert result.recompute_granularity == "full"
     assert result.recompute_num_layers == 1
     assert base.recompute_granularity is None
+
+
+def test_apply_overrides_ffn_hidden_size_for_mxfp8_alignment():
+    base = _FakeTransformerConfig()
+    result = apply_vision_config_overrides(base, (("ffn_hidden_size", 4320),))
+    assert result.ffn_hidden_size == 4320
+    assert base.ffn_hidden_size == 4304
 
 
 def test_apply_overrides_empty_returns_base():

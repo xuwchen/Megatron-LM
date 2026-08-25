@@ -169,6 +169,23 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-zero-pad-vision-ffn",
+        action="store_true",
+        default=False,
+        help=(
+            "Zero-pad the vision FFN's real (checkpoint) ffn_hidden_size up to the "
+            "size requested by --mdp-vision-config-override ffn_hidden_size=N "
+            "(e.g. 4304 -> 4320 for MXFP8's 32-token block alignment), instead of "
+            "changing the architecture outright. The padding channels are "
+            "zero-initialized on both linear_fc1's output rows and linear_fc2's "
+            "input columns; since the vision MLP has no normalization between "
+            "them, GELU(0)=0 and the chain rule keep those channels at exactly "
+            "zero forever, so the padded model stays numerically identical to the "
+            "unpadded one and loadable from official (unpadded) checkpoints. "
+            "Requires an ffn_hidden_size override to be present."
+        ),
+    )
+    group.add_argument(
         "--mdp-debug-plan-payload-check",
         action="store_true",
         default=False,
