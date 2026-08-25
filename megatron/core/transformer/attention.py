@@ -1674,6 +1674,21 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and packed_seq_params.cu_seqlens_q_padded is not None
+            and packed_seq_params.total_tokens is not None
+            and int(packed_seq_params.total_tokens) != core_attn_out.size(0)
+        ):
+            # TE's THD attention kernel reads query/key/value out of the padded buffer
+            # (per-sequence boundaries given by cu_seqlens_q_padded) but returns output
+            # containing only the real, unpadded tokens (cu_seqlens_q). Scatter those real
+            # rows back into their padded-buffer positions so core_attn_out again matches
+            # the padded token dimension that gate, linear_proj's FP8 GEMM alignment, and
+            # the residual stream all expect.
+            core_attn_out = self._repad_thd_core_attn_out(core_attn_out, packed_seq_params)
+
         if head_wise_gate is not None:
             nvtx_range_push(suffix="head_wise_attn_gate")
             gate_states = head_wise_gate.view(*head_wise_gate.shape[:2], -1, 1)
@@ -1702,6 +1717,30 @@ class Attention(MegatronModule, ABC):
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
+
+    @staticmethod
+    def _repad_thd_core_attn_out(x: Tensor, packed_seq_params: PackedSeqParams) -> Tensor:
+        """Scatter ``x``'s real THD tokens back into their padded-buffer positions.
+
+        In THD format with per-sequence padding (``cu_seqlens_q_padded != cu_seqlens_q``),
+        TE's attention kernel reads query/key/value out of the padded buffer (boundaries
+        given by ``cu_seqlens_q_padded``) but returns output containing only the real,
+        unpadded tokens (boundaries given by ``cu_seqlens_q``). Every other tensor in this
+        layer -- ``gate`` (split from the same padded QKV buffer), the FP8 output
+        projection's alignment requirement, and the padded residual stream -- expects the
+        padded token dimension, so re-pad ``x`` back to it here using the same per-sequence
+        offsets TE used to read query/key/value. Padding-slot rows are filled with zeros.
+        """
+        cu_seqlens_q = packed_seq_params.cu_seqlens_q
+        cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
+        total_padded = int(packed_seq_params.total_tokens)
+        real_positions = torch.arange(x.size(0), device=x.device)
+        batch_idx = torch.searchsorted(cu_seqlens_q, real_positions, right=True) - 1
+        offset_in_seq = real_positions - cu_seqlens_q[batch_idx]
+        scatter_idx = cu_seqlens_q_padded[batch_idx] + offset_in_seq
+        padded = x.new_zeros((total_padded,) + tuple(x.shape[1:]))
+        padded.index_copy_(0, scatter_idx, x)
+        return padded
 
     @jit_fuser
     def _apply_output_gate(self, x, gate):
