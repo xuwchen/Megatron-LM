@@ -665,12 +665,26 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
             return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
+    # FP8 GEMMs require the packed (THD) leading dimension to be divisible by 8
+    # (transformer_engine.pytorch.utils.assert_dim_for_fp8_exec) or 16 for the
+    # backward wgrad GEMM (cublaslt_gemm.cu CanonicalizeGemmInput); MXFP8 is
+    # stricter still, requiring 32 (TE's quantizer.cpp create_tensor asserts
+    # flat_first_dim % MXFP8_BLOCK_SIZE == 0, MXFP8_BLOCK_SIZE=32 — observed
+    # empirically via a training-time crash with 16-aligned padding, not
+    # something inferable from the forward-only assert alone).
+    if getattr(args, "fp8", None) is None:
+        _pad_to_multiple = None
+    elif getattr(args, "fp8_recipe", None) == "mxfp8":
+        _pad_to_multiple = 32
+    else:
+        _pad_to_multiple = 16
     batch = pack_or_pad_batch(
         data,
         args.use_packed_sequence,
         args.seq_length,
         device=device,
         with_vision_sidecar=getattr(args, "mdp_enable", False),
+        pad_to_multiple=_pad_to_multiple,
     )
 
     # Fix shapes produced by default_collate.
