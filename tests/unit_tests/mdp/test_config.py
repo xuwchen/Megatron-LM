@@ -33,6 +33,7 @@ def _options(**overrides):
         bf16=True,
         fsdp_enabled=False,
         fp8_enabled=False,
+        encoder_fp8_enabled=False,
         cuda_graph_enabled=False,
         activation_offload_enabled=False,
         overlap_grad_reduce=False,
@@ -101,7 +102,18 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
         (dict(distributed_optimizer_instances=2), "distributed_optimizer_instances"),
         (dict(bf16=False), "fp16/bf16"),
         (dict(fsdp_enabled=True), "fsdp"),
-        (dict(fp8_enabled=True), "fp8"),
+        (
+            dict(encoder_fp8_enabled=True, encoder_fp8_recipe="delayed"),
+            "encoder_fp8_recipe",
+        ),
+        (
+            dict(encoder_fp8_enabled=True, encoder_fp8_recipe=None),
+            "encoder_fp8_recipe",
+        ),
+        (
+            dict(encoder_fp8_enabled=True, encoder_fp8_recipe="custom"),
+            "encoder_fp8_recipe",
+        ),
         (dict(cuda_graph_enabled=True), "cuda_graph"),
         (dict(activation_offload_enabled=True), "activation_offload"),
         (dict(overlap_grad_reduce=True), "overlap_grad_reduce"),
@@ -128,6 +140,38 @@ def test_unsupported_checkpoint_mode_allowed_without_save_or_load():
 
 def test_fp16_configuration_accepted_for_overflow_tests():
     validate_mdp_config(MdpConfig(enable=True), _options(bf16=False, fp16=True))
+
+
+def test_decoder_only_fp8_accepted():
+    """fp8_enabled describes the decoder's --fp8 flag; the vision encoder's
+    TransformerConfig never inherits it unless a vision_config_override sets
+    fp8, so decoder-only FP8 (encoder_fp8_enabled=False) must not be rejected."""
+    validate_mdp_config(
+        MdpConfig(enable=True),
+        _options(fp8_enabled=True, encoder_fp8_enabled=False),
+    )
+
+
+@pytest.mark.parametrize("recipe", ["tensorwise", "blockwise", "mxfp8"])
+def test_encoder_fp8_accepted_for_validated_recipes(recipe):
+    validate_mdp_config(
+        MdpConfig(enable=True),
+        _options(
+            fp8_enabled=True, encoder_fp8_enabled=True, encoder_fp8_recipe=recipe
+        ),
+    )
+
+
+def test_encoder_fp8_delayed_recipe_rejected():
+    with pytest.raises(MdpConfigurationError, match="encoder_fp8_recipe"):
+        validate_mdp_config(
+            MdpConfig(enable=True),
+            _options(
+                fp8_enabled=True,
+                encoder_fp8_enabled=True,
+                encoder_fp8_recipe="delayed",
+            ),
+        )
 
 
 def test_error_messages_carry_option_value_and_suggestion():

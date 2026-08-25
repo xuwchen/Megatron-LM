@@ -127,6 +127,14 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         if getattr(args, "use_tp_pp_dp_mapping", False)
         else SUPPORTED_RANK_ORDER
     )
+    # Read encoder FP8 state from the same --mdp-vision-config-override entries
+    # mdp_config_from_args() parses, rather than the real vision_config object,
+    # since validate_from_args() runs before the adapter builder constructs it.
+    # maybe_build_mdp_domain() re-asserts this against the real vision_config once
+    # it exists, so this is not a silent assumption.
+    vision_overrides = dict(mdp_config_from_args(args).vision_config_overrides)
+    encoder_fp8_enabled = vision_overrides.get("fp8") is not None
+    encoder_fp8_recipe = vision_overrides.get("fp8_recipe")
     return MdpCompatibilityOptions(
         world_size=args.world_size,
         tensor_parallel_size=args.tensor_model_parallel_size,
@@ -146,6 +154,8 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
         fp8_enabled=getattr(args, "fp8", None) is not None,
+        encoder_fp8_enabled=encoder_fp8_enabled,
+        encoder_fp8_recipe=encoder_fp8_recipe,
         cuda_graph_enabled=cuda_graph,
         activation_offload_enabled=offload,
         overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),
@@ -180,7 +190,8 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         )
 
     mdp_config = mdp_config_from_args(args)
-    validate_mdp_config(mdp_config, compatibility_options_from_args(args))
+    compat_options = compatibility_options_from_args(args)
+    validate_mdp_config(mdp_config, compat_options)
 
     rank_map = build_rank_map(
         MdpRankSpec(
@@ -209,6 +220,26 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         optimizer_config=optimizer_config,
         encoder_pgs=encoder_pgs,
     )
+    # Defense-in-depth: compatibility_options_from_args() computed
+    # encoder_fp8_enabled from the --mdp-vision-config-override entries alone
+    # (before the real vision_config existed). Now that build_encoder_domain() has
+    # applied those overrides via dataclasses.replace and __post_init__ has run,
+    # cross-check the prediction against the actual effective_config so a future
+    # adapter that ignores/mangles the override channel fails loudly instead of
+    # silently training the encoder in an unvalidated FP8 state (or silently
+    # missing a real one).
+    effective_fp8 = getattr(encoder_domain.effective_config, "fp8", None) is not None
+    if effective_fp8 != compat_options.encoder_fp8_enabled:
+        raise MdpConfigurationError(
+            "MDP: encoder_fp8_enabled prediction mismatch violates: "
+            f"compatibility_options_from_args() predicted encoder_fp8_enabled="
+            f"{compat_options.encoder_fp8_enabled!r} from --mdp-vision-config-override, "
+            f"but the real effective vision config has fp8={getattr(encoder_domain.effective_config, 'fp8', None)!r} "
+            f"(encoder_fp8_enabled would actually be {effective_fp8!r}). "
+            "validate_mdp_config() ran against a prediction that does not match "
+            "what actually got built — fix compatibility_options_from_args() or "
+            "the adapter's override handling before trusting FP8 validation here."
+        )
     assert_parameter_disjointness(encoder_domain.encoder_ddp, model)
 
     if mdp_config.encoder_max_payload_rows is not None:
