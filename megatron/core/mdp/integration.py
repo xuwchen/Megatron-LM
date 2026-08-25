@@ -146,6 +146,13 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
         fp8_enabled=getattr(args, "fp8", None) is not None,
+        # The vision encoder's TransformerConfig is built independently of `args`
+        # (examples/multimodal_dev/models/qwen35_vl/configuration.py) and never
+        # inherits args.fp8, and VISION_CONFIG_OVERRIDE_ALLOWLIST does not include
+        # any fp8 field, so the encoder can never actually be FP8 through any
+        # currently wired path. maybe_build_mdp_domain() re-asserts this against the
+        # real vision_config once it is built, so this is not a silent assumption.
+        encoder_fp8_enabled=False,
         cuda_graph_enabled=cuda_graph,
         activation_offload_enabled=offload,
         overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),
@@ -201,6 +208,17 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
     )
 
     adapter, vision_config = _ADAPTER_BUILDER(args)
+    if getattr(vision_config, "fp8", None) is not None:
+        raise MdpConfigurationError(
+            "MDP: encoder_fp8_enabled=True violates: encoder FP8 disabled. The "
+            "vision_config built by this adapter has fp8 set, but "
+            "compatibility_options_from_args() reported encoder_fp8_enabled=False "
+            "at validate_from_args() time (before the adapter builder ran). Update "
+            "compatibility_options_from_args() to compute encoder_fp8_enabled from "
+            "the real vision config before relying on FP8 for the encoder domain — "
+            "the WORLD-replicated/recompute-based encoder gradient path is not "
+            "validated with FP8 (see config.py). Suggested value: False."
+        )
     encoder_domain = build_encoder_domain(
         adapter=adapter,
         model_config=vision_config,

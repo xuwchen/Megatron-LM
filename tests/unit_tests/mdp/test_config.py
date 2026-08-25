@@ -33,6 +33,7 @@ def _options(**overrides):
         bf16=True,
         fsdp_enabled=False,
         fp8_enabled=False,
+        encoder_fp8_enabled=False,
         cuda_graph_enabled=False,
         activation_offload_enabled=False,
         overlap_grad_reduce=False,
@@ -101,7 +102,7 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
         (dict(distributed_optimizer_instances=2), "distributed_optimizer_instances"),
         (dict(bf16=False), "fp16/bf16"),
         (dict(fsdp_enabled=True), "fsdp"),
-        (dict(fp8_enabled=True), "fp8"),
+        (dict(encoder_fp8_enabled=True), "encoder FP8"),
         (dict(cuda_graph_enabled=True), "cuda_graph"),
         (dict(activation_offload_enabled=True), "activation_offload"),
         (dict(overlap_grad_reduce=True), "overlap_grad_reduce"),
@@ -128,6 +129,25 @@ def test_unsupported_checkpoint_mode_allowed_without_save_or_load():
 
 def test_fp16_configuration_accepted_for_overflow_tests():
     validate_mdp_config(MdpConfig(enable=True), _options(bf16=False, fp16=True))
+
+
+def test_decoder_only_fp8_accepted():
+    """fp8_enabled describes the decoder's --fp8 flag; the vision encoder's
+    TransformerConfig never inherits it (see maybe_build_mdp_domain's
+    defense-in-depth assertion against the real vision_config), so decoder-only
+    FP8 must not be rejected. Only encoder_fp8_enabled gates the reject."""
+    validate_mdp_config(
+        MdpConfig(enable=True),
+        _options(fp8_enabled=True, encoder_fp8_enabled=False),
+    )
+
+
+def test_encoder_fp8_rejected_even_with_decoder_fp8_off():
+    with pytest.raises(MdpConfigurationError, match="encoder FP8"):
+        validate_mdp_config(
+            MdpConfig(enable=True),
+            _options(fp8_enabled=False, encoder_fp8_enabled=True),
+        )
 
 
 def test_error_messages_carry_option_value_and_suggestion():

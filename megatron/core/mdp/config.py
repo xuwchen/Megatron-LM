@@ -68,6 +68,7 @@ class MdpCompatibilityOptions:
     bf16: bool
     fsdp_enabled: bool
     fp8_enabled: bool
+    encoder_fp8_enabled: bool
     cuda_graph_enabled: bool
     activation_offload_enabled: bool
     overlap_grad_reduce: bool
@@ -238,15 +239,26 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "MDP requires the standard DistributedDataParallel gradient-buffer path.",
             "False",
         )
-    if options.fp8_enabled:
+    if options.encoder_fp8_enabled:
         _reject(
-            "fp8_enabled",
-            options.fp8_enabled,
-            "FP8 disabled",
-            "FP8/MXFP8 gradient-buffer reuse is not validated with MDP; the vision "
-            "config override channel is reserved for a future FP8 recipe.",
+            "encoder_fp8_enabled",
+            options.encoder_fp8_enabled,
+            "encoder FP8 disabled",
+            "FP8/MXFP8 gradient-buffer reuse for the WORLD-replicated, "
+            "recompute-based encoder domain is not validated with MDP (amax/scale "
+            "state must stay consistent between the P2 no_grad forward and the P5 "
+            "recompute forward, and the encoder's fp8_group must be WORLD, not the "
+            "decoder's amax-reduction group); the vision config override channel is "
+            "reserved for a future FP8 recipe.",
             "False",
         )
+    # options.fp8_enabled describes the *decoder's* --fp8 flag only. The vision
+    # encoder's TransformerConfig is built independently (see
+    # examples/multimodal_dev/models/qwen35_vl/configuration.py) and never reads
+    # args.fp8, so decoder-only FP8 does not touch the encoder domain at all and is
+    # not rejected here. maybe_build_mdp_domain() asserts vision_config.fp8 is None
+    # as a defense-in-depth check against a future adapter accidentally wiring FP8
+    # into the vision config without updating encoder_fp8_enabled above.
     if options.cuda_graph_enabled:
         _reject(
             "cuda_graph_enabled",
