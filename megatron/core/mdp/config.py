@@ -42,6 +42,16 @@ VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
         "fp8_amax_compute_algo",
         "fp8_wgrad",
         "fp8_dot_product_attention",
+        # Structural override for MXFP8 experiments (Approach A / mdp-mxfp8-opta):
+        # Qwen3.5-VL's "Large" ViT variant (9b/27b/35b_a3b/122b_a10b/397b_a17b)
+        # hard-codes ffn_hidden_size=4304, which is not divisible by 32 and
+        # therefore incompatible with MXFP8's hardware block-scaled weight
+        # quantization (TE's quantizer.cpp create_tensor asserts
+        # flat_first_dim % 32 == 0 on fc1/fc2's static weight shape, not just
+        # runtime activations). This override lets a mechanism-validation run
+        # pick an aligned value (e.g. 4320) without touching a real checkpoint
+        # -- it is NOT checkpoint-compatible with the official 4304-dim weights.
+        "ffn_hidden_size",
     }
 )
 
