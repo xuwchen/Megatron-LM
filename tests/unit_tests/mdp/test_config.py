@@ -197,6 +197,7 @@ class _FakeTransformerConfig:
     recompute_num_layers: object = None
     recompute_modules: object = None
     hidden_size: int = 64
+    ffn_hidden_size: int = 4304
 
     def __post_init__(self):
         if self.recompute_granularity not in (None, "selective", "full"):
@@ -231,6 +232,19 @@ def test_apply_overrides_rejects_keys_outside_allowlist():
     assert "hidden_size" not in VISION_CONFIG_OVERRIDE_ALLOWLIST
     with pytest.raises(MdpConfigurationError, match="allowlist"):
         apply_vision_config_overrides(_FakeTransformerConfig(), (("hidden_size", 128),))
+
+
+def test_apply_overrides_ffn_hidden_size_for_mxfp8_alignment():
+    """MXFP8 Approach A (mdp-mxfp8-opta): Qwen3.5-VL's Large ViT hard-codes
+    ffn_hidden_size=4304, not divisible by 32, incompatible with MXFP8's
+    hardware block-scaled weight quantization. This override lets a
+    mechanism-validation run (no real checkpoint) pick an aligned value."""
+    assert "ffn_hidden_size" in VISION_CONFIG_OVERRIDE_ALLOWLIST
+    base = _FakeTransformerConfig(ffn_hidden_size=4304)
+    result = apply_vision_config_overrides(base, (("ffn_hidden_size", 4320),))
+    assert result.ffn_hidden_size == 4320
+    assert result.ffn_hidden_size % 32 == 0
+    assert base.ffn_hidden_size == 4304
 
 
 # ---------------------- args snapshot (integration) ----------------------
