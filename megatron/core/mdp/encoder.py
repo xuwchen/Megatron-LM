@@ -10,6 +10,7 @@ domain. The encoder never enters the decoder schedule model list.
 """
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -215,3 +216,47 @@ def finalize_encoder_grads(encoder_ddp, *, globally_reduced_num_tokens: torch.Te
     # Python float the kernel would otherwise receive.
     scale = (1.0 / denominator.double()).float().reshape(())
     encoder_ddp.scale_gradients(scale)
+
+
+@contextmanager
+def encoder_fp8_amax_group_context(world_group):
+    """Patch TE's FP8 amax-reduction group to WORLD for the encoder forward.
+
+    ``megatron.core.fp8_utils.get_fp8_context`` (called deep inside
+    ``TransformerBlock``/TE layer construction via ``self.config``, with no
+    ``pg_collection`` parameter) always resolves the amax/scale-sync group
+    through the module-level ``megatron.core.parallel_state`` singleton:
+    ``get_amax_reduction_group(with_context_parallel=True, ...)`` returns
+    ``_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP`` — the *decoder's* TP x CP x DP
+    group. At TP=1/CP=1 (required by MDP) that's just the decoder's DP group,
+    which for a shape like PP=4/EP=2/decoder_dp=2 is a *2-rank* subgroup that
+    has nothing to do with the encoder's actual WORLD-sized replication
+    domain (every rank runs a full encoder replica over different
+    LPT-assigned vision chunks, not a DP-style shard of the same
+    distribution). Reducing FP8 amax/scale over that mismatched 2-rank group
+    would silently mix in statistics from an unrelated pair of ranks instead
+    of the true 8-rank encoder domain, and does not correctly generalize
+    across parallel shapes (a checkpoint mode with world_size==tp*pp*cp,
+    i.e. decoder_dp==1, would degenerate the group to a single rank —
+    equivalent to no cross-rank sync at all).
+
+    This only matters for FP8 recipes that actually synchronize amax/scale
+    across ``fp8_group`` (delayed scaling always does; current/tensorwise
+    scaling may still reduce for consistency depending on TE version). There
+    is no ``pg_collection`` parameter on ``get_fp8_context`` to fix this
+    properly without a much larger change across every ``get_fp8_context``
+    call site in ``transformer_block.py``/``transformer_engine.py``/etc., so
+    this monkeypatches ``parallel_state.get_amax_reduction_group`` for the
+    duration of the encoder-only forward call — never during decoder
+    forward/backward, so it does not affect decoder FP8 correctness.
+    """
+    from megatron.core import parallel_state
+
+    real_get_amax_reduction_group = parallel_state.get_amax_reduction_group
+    try:
+        parallel_state.get_amax_reduction_group = (
+            lambda with_context_parallel=False, tp_only_amax_red=False: world_group
+        )
+        yield
+    finally:
+        parallel_state.get_amax_reduction_group = real_get_amax_reduction_group

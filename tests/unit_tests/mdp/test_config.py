@@ -102,7 +102,18 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
         (dict(distributed_optimizer_instances=2), "distributed_optimizer_instances"),
         (dict(bf16=False), "fp16/bf16"),
         (dict(fsdp_enabled=True), "fsdp"),
-        (dict(encoder_fp8_enabled=True), "encoder FP8"),
+        (
+            dict(encoder_fp8_enabled=True, encoder_fp8_recipe="delayed"),
+            "encoder_fp8_recipe",
+        ),
+        (
+            dict(encoder_fp8_enabled=True, encoder_fp8_recipe=None),
+            "encoder_fp8_recipe",
+        ),
+        (
+            dict(encoder_fp8_enabled=True, encoder_fp8_recipe="custom"),
+            "encoder_fp8_recipe",
+        ),
         (dict(cuda_graph_enabled=True), "cuda_graph"),
         (dict(activation_offload_enabled=True), "activation_offload"),
         (dict(overlap_grad_reduce=True), "overlap_grad_reduce"),
@@ -133,20 +144,47 @@ def test_fp16_configuration_accepted_for_overflow_tests():
 
 def test_decoder_only_fp8_accepted():
     """fp8_enabled describes the decoder's --fp8 flag; the vision encoder's
-    TransformerConfig never inherits it (see maybe_build_mdp_domain's
-    defense-in-depth assertion against the real vision_config), so decoder-only
-    FP8 must not be rejected. Only encoder_fp8_enabled gates the reject."""
+    TransformerConfig never inherits it unless a vision_config_override sets
+    fp8 (see maybe_build_mdp_domain's defense-in-depth cross-check against the
+    real effective vision config), so decoder-only FP8 (encoder_fp8_enabled=
+    False) must not be rejected. Only encoder_fp8_enabled gates the reject."""
     validate_mdp_config(
         MdpConfig(enable=True),
         _options(fp8_enabled=True, encoder_fp8_enabled=False),
     )
 
 
-def test_encoder_fp8_rejected_even_with_decoder_fp8_off():
-    with pytest.raises(MdpConfigurationError, match="encoder FP8"):
+@pytest.mark.parametrize("recipe", ["tensorwise", "blockwise", "mxfp8"])
+def test_encoder_fp8_accepted_for_validated_recipes(recipe):
+    validate_mdp_config(
+        MdpConfig(enable=True),
+        _options(
+            fp8_enabled=True, encoder_fp8_enabled=True, encoder_fp8_recipe=recipe
+        ),
+    )
+
+
+def test_encoder_fp8_delayed_recipe_rejected():
+    with pytest.raises(MdpConfigurationError, match="encoder_fp8_recipe"):
         validate_mdp_config(
             MdpConfig(enable=True),
-            _options(fp8_enabled=False, encoder_fp8_enabled=True),
+            _options(
+                fp8_enabled=True,
+                encoder_fp8_enabled=True,
+                encoder_fp8_recipe="delayed",
+            ),
+        )
+
+
+def test_encoder_fp8_rejected_even_with_decoder_fp8_off():
+    """The decoder's own --fp8 flag being off must not bypass the encoder's
+    recipe-allowlist reject -- these are independent checks."""
+    with pytest.raises(MdpConfigurationError, match="encoder_fp8_recipe"):
+        validate_mdp_config(
+            MdpConfig(enable=True),
+            _options(
+                fp8_enabled=False, encoder_fp8_enabled=True, encoder_fp8_recipe=None
+            ),
         )
 
 

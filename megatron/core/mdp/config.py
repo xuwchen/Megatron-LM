@@ -30,8 +30,38 @@ VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
         "recompute_method",
         "recompute_num_layers",
         "recompute_modules",
+        # FP8 recipe fields for the encoder (Approach B: full FP8). "delayed"
+        # scaling is intentionally excluded from what the encoder's fp8_recipe
+        # may validly be — see ENCODER_FP8_RECIPE_ALLOWLIST below.
+        "fp8",
+        "fp8_recipe",
+        "fp8_param",
+        "fp8_margin",
+        "fp8_interval",
+        "fp8_amax_history_len",
+        "fp8_amax_compute_algo",
+        "fp8_wgrad",
+        "fp8_dot_product_attention",
     }
 )
+
+# fp8_recipe values validated for the MDP encoder domain. "delayed" scaling is
+# excluded on purpose, even though it is a valid TransformerConfig.fp8_recipe value
+# in general: TEDelayedScaling keeps a persistent, stateful amax-history ring buffer
+# per FP8-enabled module that is pushed to on every fp8_autocast forward call. This
+# branch's current P2/P4/P5 flow only calls the encoder forward once per iteration
+# (P2 builds the graph with autograd enabled and P5 calls .backward() on the same
+# graph — there is no separate no_grad-forward-then-recompute pair despite an
+# earlier design-doc draft describing one), so the double-push risk that motivated
+# excluding "delayed" does not currently apply. It is still excluded because (a)
+# amax history state is not captured by any MDP checkpoint/eval-boundary reset path,
+# so cross-iteration state leaking into P0/eval hand-off is unvalidated, and (b) if
+# the recompute design from the draft doc is implemented later, delayed scaling
+# would need to be revisited anyway. "tensorwise" (Float8CurrentScaling),
+# "blockwise" (Float8BlockScaling), and "mxfp8" (MXFP8BlockScaling) all derive scale
+# directly from the current tensor with no persisted history, so none of them are
+# sensitive to how many times forward runs per iteration.
+ENCODER_FP8_RECIPE_ALLOWLIST: frozenset = frozenset({"tensorwise", "blockwise", "mxfp8"})
 
 
 @dataclass(frozen=True)
@@ -77,6 +107,7 @@ class MdpCompatibilityOptions:
     checkpoint_mode: str
     save_requested: bool
     load_requested: bool
+    encoder_fp8_recipe: Optional[str] = None
 
 
 def _reject(option: str, value: Any, condition: str, why: str, suggestion: str = "") -> None:
@@ -239,26 +270,26 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "MDP requires the standard DistributedDataParallel gradient-buffer path.",
             "False",
         )
+    # options.fp8_enabled describes the *decoder's* --fp8 flag only and is not
+    # rejected here: the vision encoder's TransformerConfig is built independently
+    # (examples/multimodal_dev/models/qwen35_vl/configuration.py) and never inherits
+    # args.fp8, so decoder-only FP8 does not touch the encoder domain at all.
+    # maybe_build_mdp_domain() cross-checks this prediction against the real
+    # effective vision config once build_encoder_domain() has applied the
+    # --mdp-vision-config-override entries, so a future adapter that ignores or
+    # mangles the override channel fails loudly instead of silently drifting.
     if options.encoder_fp8_enabled:
-        _reject(
-            "encoder_fp8_enabled",
-            options.encoder_fp8_enabled,
-            "encoder FP8 disabled",
-            "FP8/MXFP8 gradient-buffer reuse for the WORLD-replicated, "
-            "recompute-based encoder domain is not validated with MDP (amax/scale "
-            "state must stay consistent between the P2 no_grad forward and the P5 "
-            "recompute forward, and the encoder's fp8_group must be WORLD, not the "
-            "decoder's amax-reduction group); the vision config override channel is "
-            "reserved for a future FP8 recipe.",
-            "False",
-        )
-    # options.fp8_enabled describes the *decoder's* --fp8 flag only. The vision
-    # encoder's TransformerConfig is built independently (see
-    # examples/multimodal_dev/models/qwen35_vl/configuration.py) and never reads
-    # args.fp8, so decoder-only FP8 does not touch the encoder domain at all and is
-    # not rejected here. maybe_build_mdp_domain() asserts vision_config.fp8 is None
-    # as a defense-in-depth check against a future adapter accidentally wiring FP8
-    # into the vision config without updating encoder_fp8_enabled above.
+        if options.encoder_fp8_recipe not in ENCODER_FP8_RECIPE_ALLOWLIST:
+            _reject(
+                "encoder_fp8_recipe",
+                options.encoder_fp8_recipe,
+                f"encoder_fp8_recipe in {sorted(ENCODER_FP8_RECIPE_ALLOWLIST)}",
+                "'delayed' scaling keeps a stateful amax-history buffer per "
+                "FP8-enabled module; the MDP encoder gradient path is not validated "
+                "against it (see ENCODER_FP8_RECIPE_ALLOWLIST's docstring for the "
+                "full rationale). 'custom' recipes are also unvalidated.",
+                "tensorwise",
+            )
     if options.cuda_graph_enabled:
         _reject(
             "cuda_graph_enabled",

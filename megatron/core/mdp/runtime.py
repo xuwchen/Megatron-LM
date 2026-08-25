@@ -31,7 +31,11 @@ from megatron.core.mdp.bridge import (
     ModalityBridge,
 )
 from megatron.core.mdp.config import MdpConfig
-from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
+from megatron.core.mdp.encoder import (
+    EncoderDomain,
+    encoder_fp8_amax_group_context,
+    finalize_encoder_grads,
+)
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
 from megatron.core.mdp.observability import (
@@ -268,24 +272,36 @@ class MdpRuntime:
             window.release_pixels()
 
         # P2: grad-enabled encoder forward per chunk (no_grad for evaluation).
+        #
+        # encoder_fp8_amax_group_context patches TE's FP8 amax/scale-sync group to
+        # WORLD for the duration of this forward only: get_fp8_context() (called deep
+        # inside TransformerBlock/TE layer code via self.config, with no pg_collection
+        # parameter) otherwise resolves the decoder's parallel_state singleton
+        # (TP x CP x DP), which at the MDP-required TP=1/CP=1 collapses to just the
+        # decoder's DP group — unrelated to the encoder's actual WORLD-sized
+        # replication domain. See encoder.py's docstring for the full rationale. A
+        # no-op context when FP8 is not enabled on the encoder config.
         chunk_outputs = []
         encoder = self.encoder_domain.encoder_ddp
         forward_start = time.monotonic()
-        for chunk_index, chunk in enumerate(self._chunk_layouts):
-            payload = chunk_payloads[chunk_index]
-            payload_valid = payload[: chunk.total_payload_rows]
-            if forward_only:
-                with torch.no_grad(), nvtx_phase("p2_encoder_forward"):
-                    output = self.adapter.encode(encoder, payload_valid, chunk)
-            else:
-                with nvtx_phase("p2_encoder_forward"):
-                    output = self.adapter.encode(encoder, payload_valid, chunk)
-                if output.shape[0] and (not output.requires_grad or output.grad_fn is None):
-                    raise MdpStateError(
-                        "MDP: encoder chunk output is not graph-connected in training; "
-                        "adapter.encode must run with gradients enabled."
-                    )
-            chunk_outputs.append(output)
+        with encoder_fp8_amax_group_context(self.process_groups.world_group):
+            for chunk_index, chunk in enumerate(self._chunk_layouts):
+                payload = chunk_payloads[chunk_index]
+                payload_valid = payload[: chunk.total_payload_rows]
+                if forward_only:
+                    with torch.no_grad(), nvtx_phase("p2_encoder_forward"):
+                        output = self.adapter.encode(encoder, payload_valid, chunk)
+                else:
+                    with nvtx_phase("p2_encoder_forward"):
+                        output = self.adapter.encode(encoder, payload_valid, chunk)
+                    if output.shape[0] and (
+                        not output.requires_grad or output.grad_fn is None
+                    ):
+                        raise MdpStateError(
+                            "MDP: encoder chunk output is not graph-connected in "
+                            "training; adapter.encode must run with gradients enabled."
+                        )
+                chunk_outputs.append(output)
 
         self._encoder_forward_ms = (time.monotonic() - forward_start) * 1000.0
 
