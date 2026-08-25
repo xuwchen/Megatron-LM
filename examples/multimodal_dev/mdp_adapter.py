@@ -145,10 +145,79 @@ class Qwen35VLMdpAdapter:
         # (~2.4 ms/iter measured) followed by D2H readbacks inside the
         # encoder. The encoder moves it to the device itself on the uncached
         # (QWEN35_VL_GRID_CACHE=0) fallback paths that do tensor math on it.
-        grid_thw = torch.tensor(
-            [segment.grid_thw for segment in layout.segments], dtype=torch.long
-        )
-        return encoder(payload, grid_thw)
+        grids = [segment.grid_thw for segment in layout.segments]
+
+        # TE's forward-pass assert_dim_for_fp8_exec requires the packed leading
+        # dim (payload.shape[0]) divisible by 8, but the backward wgrad GEMM
+        # (cublaslt_gemm.cu CanonicalizeGemmInput) is stricter: it requires the
+        # leading dim divisible by 16 ("Caller must pad", observed empirically
+        # via a training-time crash, not just the forward-only assert). Pad to
+        # 16 to satisfy both, matching the decoder-side fix's margin
+        # (forward_step.py's pack_or_pad_batch pad_to_multiple=16).
+        #
+        # MXFP8 is stricter still: TE's quantizer.cpp create_tensor asserts
+        # flat_first_dim % MXFP8_BLOCK_SIZE == 0 (MXFP8_BLOCK_SIZE=32, the
+        # native OCP microscaling block granularity) — observed empirically as
+        # a training-time crash with 16-aligned padding ("MXFP8 requires
+        # tensor dims that are divisible by 32"). Align to 32 specifically for
+        # fp8_recipe='mxfp8'; other recipes keep the smaller 16 margin (no
+        # reason to over-pad and waste encoder compute/memory when not
+        # required).
+        #
+        # Every real grid entry's row count t*h*w is a multiple of
+        # spatial_merge_size**2 (h and w are always even, being patch-grid
+        # units of an even-merge image), so payload.shape[0] itself is already
+        # a multiple of merge**2 (4 for this model). One extra synthetic
+        # all-zero grid item is ever needed to reach the next multiple of
+        # ALIGN: pad by at most (ALIGN - merge**2) rows, never more. This
+        # padding is entirely local to this call — MDP core's
+        # `chunk.total_payload_rows` and everything in bridge.py/storage.py
+        # are unaware of it: we strip the padding item's output rows before
+        # returning, so the returned tensor has exactly the same shape core
+        # already expects (sum of each real segment's merged output rows),
+        # matching the unpadded behavior.
+        encoder_config = self._unwrap_config(encoder)
+        fp8_enabled = getattr(encoder_config, "fp8", None) is not None
+        fp8_recipe = getattr(encoder_config, "fp8_recipe", None)
+        pad_grid = None
+        ALIGN = 32 if fp8_recipe == "mxfp8" else 16
+        if fp8_enabled and payload.shape[0] % ALIGN != 0:
+            merge = self.spatial_merge_size
+            pad_rows = (ALIGN - payload.shape[0] % ALIGN) % ALIGN
+            unit = merge * merge
+            if pad_rows % unit != 0:
+                raise RuntimeError(
+                    "MDP encoder FP8 padding: payload.shape[0]="
+                    f"{payload.shape[0]} needs {pad_rows} more rows to reach a "
+                    f"multiple of {ALIGN}, but {pad_rows} is not a multiple of "
+                    f"spatial_merge_size**2 ({unit}); the 'every real grid "
+                    "row-count is a multiple of merge**2' assumption this padding "
+                    "relies on does not hold for this vision config — pad_grid "
+                    "needs a general solution, not just a single (k, merge, merge) "
+                    "item."
+                )
+            pad_grid = (pad_rows // unit, merge, merge)
+            payload = torch.cat(
+                [payload, payload.new_zeros(pad_rows, payload.shape[1])], dim=0
+            )
+            grids = grids + [pad_grid]
+
+        grid_thw = torch.tensor(grids, dtype=torch.long)
+        output = encoder(payload, grid_thw)
+        if pad_grid is not None:
+            merge = self.spatial_merge_size
+            pad_output_rows = pad_grid[0] * (pad_grid[1] // merge) * (pad_grid[2] // merge)
+            if pad_output_rows:
+                output = output[:-pad_output_rows]
+        return output
+
+    @staticmethod
+    def _unwrap_config(encoder: torch.nn.Module):
+        """Dig through DDP/Float16Module wrappers to the real module's config."""
+        module = encoder
+        while not hasattr(module, "config") and hasattr(module, "module"):
+            module = module.module
+        return getattr(module, "config", None)
 
 
 def build_mdp_adapter(args, language_config) -> Qwen35VLMdpAdapter:
