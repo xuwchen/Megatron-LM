@@ -20,6 +20,7 @@ from megatron.core.mdp.checkpoint import (
     add_encoder_state,
     assert_weight_only_checkpoint,
 )
+from megatron.core.mdp.encoder import zero_pad_vision_mlp_channels
 from megatron.core.mdp.errors import MdpCheckpointError
 
 _DISTRIBUTED = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -199,3 +200,118 @@ def test_encoder_state_round_trips_strictly(tmp_path_factory):
         ):
             assert torch.equal(source_param, target_param)
         assert torch.equal(target(probe), source_out)
+
+
+# ------------- zero_pad_vision_ffn: official (unpadded) checkpoint load -------------
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
+def test_official_checkpoint_loads_into_zero_padded_vision_ffn(tmp_path_factory):
+    """A checkpoint saved from the real (official, unpadded) architecture must
+    load cleanly into a --mdp-zero-pad-vision-ffn model: real channels take the
+    official weights, padding channels land at exactly zero (not leftover
+    random init) -- the same invariant zero_pad_vision_mlp_channels()
+    establishes for training-from-scratch, now also true after a load."""
+    from megatron.core.distributed import (
+        DistributedDataParallel,
+        DistributedDataParallelConfig,
+    )
+    from megatron.core.mdp.checkpoint import encoder_sharded_state_dict
+    from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
+    from megatron.core.mdp.encoder import build_encoder_pg_collection
+    from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+    from megatron.core.transformer.mlp import MLP
+    from megatron.core.transformer.spec_utils import get_submodules
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    real_ffn, padded_ffn = 6, 8
+
+    world = torch.distributed.get_world_size()
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
+    )
+    groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
+    encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
+
+    def _mlp_config(ffn_hidden_size, seed):
+        torch.manual_seed(seed)
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=1,
+            ffn_hidden_size=ffn_hidden_size,
+            gated_linear_unit=False,
+            add_bias_linear=True,
+            use_cpu_initialization=True,
+            calculate_per_token_loss=True,
+        )
+
+    class _MLPEncoder(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            mlp_submodules = get_submodules(get_gpt_layer_local_submodules().mlp)
+            self.mlp = MLP(config, submodules=mlp_submodules)
+
+        def forward(self, x):
+            return self.mlp(x)[0]
+
+    def _build_ddp(config):
+        return DistributedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_distributed_optimizer=False,
+                overlap_grad_reduce=False,
+                overlap_param_gather=False,
+            ),
+            module=_MLPEncoder(config).cuda(),
+            pg_collection=encoder_pgs,
+        )
+
+    # "Official" (unpadded) source, as if loaded from a real released checkpoint.
+    source = _build_ddp(_mlp_config(real_ffn, seed=7))
+    real_fc1 = source.module.mlp.linear_fc1.weight.data.clone()
+    real_fc2 = source.module.mlp.linear_fc2.weight.data.clone()
+
+    # --mdp-zero-pad-vision-ffn target, built the way build_encoder_domain()
+    # builds it: construct, then zero-pad once.
+    target = _build_ddp(_mlp_config(padded_ffn, seed=99))
+    zero_pad_vision_mlp_channels(target.module, real_ffn_hidden_size=real_ffn)
+    # Sanity: before loading, target's real channels do NOT already match
+    # source (different seeds) -- the load below is what must make them match.
+    assert not torch.equal(target.module.mlp.linear_fc1.weight.data[:real_ffn, :], real_fc1)
+
+    if torch.distributed.get_rank() == 0:
+        directory = str(tmp_path_factory.mktemp("mdp_ckpt_official"))
+    else:
+        directory = None
+    holder = [directory]
+    torch.distributed.broadcast_object_list(holder, src=0)
+    directory = holder[0]
+
+    save_state = encoder_sharded_state_dict(source, vision_ffn_may_be_padded=False)
+    dist_checkpointing.save(save_state, directory)
+    torch.distributed.barrier()
+
+    load_skeleton = encoder_sharded_state_dict(target, vision_ffn_may_be_padded=True)
+    loaded = dist_checkpointing.load(load_skeleton, directory)
+    prefix = "vision_model.module."
+    assert all(key.startswith(prefix) for key in loaded)
+    target.module.load_state_dict(
+        {key[len(prefix) :]: value for key, value in loaded.items()}, strict=True
+    )
+
+    with torch.no_grad():
+        # Real channels: exactly the official weights.
+        assert torch.equal(target.module.mlp.linear_fc1.weight.data[:real_ffn, :], real_fc1)
+        assert torch.equal(target.module.mlp.linear_fc2.weight.data[:, :real_ffn], real_fc2)
+        # Padding channels: exactly zero, not target's stale pre-load init.
+        assert torch.equal(
+            target.module.mlp.linear_fc1.weight.data[real_ffn:, :],
+            torch.zeros_like(target.module.mlp.linear_fc1.weight.data[real_ffn:, :]),
+        )
+        assert torch.equal(
+            target.module.mlp.linear_fc2.weight.data[:, real_ffn:],
+            torch.zeros_like(target.module.mlp.linear_fc2.weight.data[:, real_ffn:]),
+        )

@@ -1306,7 +1306,11 @@ def generate_state_dict(
 
         mdp_runtime = mdp_integration.get_runtime()
         if mdp_runtime is not None:
-            add_encoder_state(state_dict, mdp_runtime.encoder_domain.encoder_ddp)
+            add_encoder_state(
+                state_dict,
+                mdp_runtime.encoder_domain.encoder_ddp,
+                vision_ffn_may_be_padded=mdp_runtime.config.zero_pad_vision_ffn,
+            )
 
     # Optimizer stuff.
     if not args.no_save_optim:
