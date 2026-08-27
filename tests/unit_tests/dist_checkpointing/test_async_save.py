@@ -119,6 +119,17 @@ class TestAsyncSave:
             with pytest.raises(ModuleNotFoundError):
                 get_async_strategy("nvrx", module="CachedMetadataFileSystemReader")
 
+    def test_get_async_strategy_version_check_fails(self):
+        """get_async_strategy("nvrx") must raise -- not silently accept -- an explicit request
+        for the nvrx strategy when the installed nvidia-resiliency-ext is too old, even though
+        its async-checkpointing symbols are still importable."""
+        with mock.patch(
+            'megatron.core.dist_checkpointing.strategies.torch.is_nvrx_min_version',
+            return_value=False,
+        ):
+            with pytest.raises(ImportError, match="nvidia-resiliency-ext"):
+                get_async_strategy("nvrx")
+
 
 _NVRX_SUBMODULES = [
     'nvidia_resiliency_ext.checkpointing.async_ckpt.core',
@@ -150,7 +161,13 @@ class TestHasNvrxAsyncSupport:
             assert has_nvrx_async_support() is True
 
     def test_version_check_fails(self):
-        """Raises AssertionError when all NVRx symbols are present but version is too old."""
+        """Returns False (not an exception) when NVRx symbols are present but version is too old.
+
+        has_nvrx_async_support() is a plain availability probe -- callers that need a hard
+        failure on an explicit request for the "nvrx" strategy go through
+        get_async_strategy("nvrx"), which raises ImportError itself (see
+        test_get_async_strategy_version_check_fails below).
+        """
         with (
             mock.patch(
                 'megatron.core.dist_checkpointing.strategies.nvrx.import_module',
@@ -161,5 +178,4 @@ class TestHasNvrxAsyncSupport:
                 return_value=False,
             ),
         ):
-            with pytest.raises(AssertionError, match="Minimum required nvidia-resiliency-ext"):
-                has_nvrx_async_support()
+            assert has_nvrx_async_support() is False
