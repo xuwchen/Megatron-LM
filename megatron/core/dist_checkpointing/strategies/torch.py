@@ -50,7 +50,12 @@ from ..mapping import (
 )
 from .async_utils import AsyncRequest
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
-from .nvrx import has_nvrx_async_support, make_nvrx_async_request
+from .nvrx import (
+    NVRX_MIN_VERSION,
+    has_nvrx_async_support,
+    is_nvrx_min_version,
+    make_nvrx_async_request,
+)
 
 if TYPE_CHECKING:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
@@ -1078,6 +1083,14 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tupl
             raise ModuleNotFoundError(
                 "A compatible `nvidia-resiliency-ext` installation is required for "
                 '`async_strategy="nvrx"`. Please install it or set `async_strategy` to `mcore`.'
+            )
+        if not is_nvrx_min_version():
+            raise ImportError(
+                f"async_strategy=\"nvrx\" requires nvidia-resiliency-ext >= "
+                f"{NVRX_MIN_VERSION}, but an older version is installed. Its async "
+                "checkpointing symbols are importable but not supported by this code "
+                "path. Upgrade nvidia-resiliency-ext, or set async_strategy to "
+                '"mcore".'
             )
     elif async_strategy == "mcore":
         # do mcore async imports
