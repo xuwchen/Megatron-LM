@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -12,6 +13,7 @@ from .utils import (
     ParameterMetadata,
     ReshardPlan,
     ShardingDescriptor,
+    TensorReshardSpec,
     TransferOp,
     _build_layer_module_prefix_map,
     _get_rank_in_group,
@@ -21,6 +23,28 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _NativeParameterPart:
+    global_shape: tuple[int, ...]
+    src_local_shape: tuple[int, ...]
+    dst_local_shape: tuple[int, ...]
+    src_slice: tuple[slice, ...] | None
+    dst_slice: tuple[slice, ...] | None
+
+
+def _find_source_metadata(
+    src_param_metadata: dict[str, list[ParameterMetadata]], resolved_name: str
+) -> list[ParameterMetadata] | None:
+    """Find source metadata, including the tied-output embedding alias."""
+    src_meta_list = src_param_metadata.get(resolved_name)
+    if not src_meta_list and resolved_name.endswith("output_layer.weight"):
+        for embedding_name in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
+            src_meta_list = src_param_metadata.get(embedding_name)
+            if src_meta_list:
+                break
+    return src_meta_list
 
 
 def _sort_ops_by_dst_offset(ops, dim):

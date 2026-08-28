@@ -20,6 +20,25 @@ from .utils import ReshardPlan, get_refit_tensor_dict
 logger = logging.getLogger(__name__)
 
 
+def refresh_module_caches(
+    dst_module: torch.nn.Module | list[torch.nn.Module] | tuple[torch.nn.Module, ...] | None,
+) -> None:
+    """Refresh parameter-derived caches in the destination module(s).
+
+    Lists and tuples let external refit callers, including Megatron Bridge,
+    pass virtual-pipeline model chunks directly. ``None`` is a no-op for
+    send-only ranks. The ``dst_module`` parameter name remains stable for
+    callers that use keyword arguments.
+    """
+    if dst_module is None:
+        return
+    roots = dst_module if isinstance(dst_module, (list, tuple)) else (dst_module,)
+    for root in roots:
+        for module in root.modules():
+            if isinstance(module, MegatronModule):
+                module.refresh_cache()
+
+
 @dataclass
 class _Writeback:
     """Tagged-union for what to do with a received tensor after service.run().

@@ -297,7 +297,6 @@ def permute_tokens(
     num_local_experts: int,
     valid_tokens: torch.Tensor,
     alignment: int = 1,
-    return_batch_invariant_inverse_map: bool = False,
     row_alignment: int = 1,
 ) -> tuple:
     """Permute tokens into expert-grouped order.
@@ -315,8 +314,6 @@ def permute_tokens(
         valid_tokens: scalar int32 CUDA tensor with the number of valid tokens this
             iteration. Fixed address; value updated each step before graph replay.
         alignment: per-expert token alignment (default 1).
-        return_batch_invariant_inverse_map: if True, also return the map used by
-            batch-invariant unpermute.
         row_alignment: alignment for the fixed output-buffer row count (default 1).
 
     Returns:

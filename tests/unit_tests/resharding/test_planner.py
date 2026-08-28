@@ -13,10 +13,14 @@ from itertools import product
 import pytest
 import torch
 
+import megatron.core.resharding.planner as planner
 from megatron.core.resharding.planner import (
     _build_descriptors_for_param,
+    _build_tensor_reshard_specs,
     _finalize_dp_transfers,
     _plan_tp,
+    build_plan_from_rosters,
+    index_metadata_rosters,
 )
 from megatron.core.resharding.shard_planner import plan_sharded_transfer
 from megatron.core.resharding.utils import ParameterMetadata, ShardingDescriptor

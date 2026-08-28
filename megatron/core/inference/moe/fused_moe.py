@@ -172,7 +172,6 @@ def mcore_fused_moe(
             valid_tokens,
             alignment=expert_alignment,
             row_alignment=MXFP8_SCALE_ROW_BLOCK if use_mxfp8 else 1,
-            return_batch_invariant_inverse_map=batch_invariant_mode,
         )
 
     # --- FC1 -> activation -> FC2 ---

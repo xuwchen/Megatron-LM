@@ -277,6 +277,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             size = [grad.size(-2), grad.size(-1)]
             if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
+            # Only forward the kwarg when enabled; older emerging_optimizers do not
+            # accept it at all, and __init__ has already rejected use_syrk on those.
+            ns_kwargs = {"use_syrk": True} if use_syrk else {}
             orth_grad = newton_schulz_tp(
                 grad,
                 steps=num_ns_steps,
