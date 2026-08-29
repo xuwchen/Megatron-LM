@@ -312,9 +312,18 @@ class _GDNBase(MegatronModule):
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
         self.recompute_gdn = False
+        self.recompute_qkv = False
+        self.qkv_checkpoint = None
         if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
             self.recompute_gdn = "gdn" in self.config.recompute_modules
+            self.recompute_qkv = "gdn_qkv" in self.config.recompute_modules
+        # "gdn" already replays the projection block, so stacking the two only pays the
+        # checkpoint cost twice.
+        assert not (self.recompute_gdn and self.recompute_qkv), (
+            "recompute_modules must not contain both 'gdn' and 'gdn_qkv': whole-module "
+            "recompute already covers the projection/prep block."
+        )
 
         self.out_proj = build_module(
             submodules.out_proj,

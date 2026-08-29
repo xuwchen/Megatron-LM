@@ -286,9 +286,11 @@ class GatedDeltaNet(_GDNBase):
 
         return out, out_bias
 
-    def _forward_compute(
+
+    def _qkv_proj_and_prep(
         self,
         hidden_states,
+        *,
         batch,
         seq_len_post_headwise,
         cp_size_headwise,
@@ -298,9 +300,13 @@ class GatedDeltaNet(_GDNBase):
         cu_seqlens_q,
         packed_seq_params,
         chunkwise_cp_context,
+        inv_box,
     ):
-        """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
-        # Input projection
+        """in_proj -> CP all-to-all -> pre_gated_delta_rule; returns the kernel's inputs.
+
+        ``inv_box`` carries the THD/CP inverse permutation (deterministic integer metadata)
+        back to the caller so it stays outside any checkpoint boundary wrapping this block.
+        """
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
@@ -376,6 +382,53 @@ class GatedDeltaNet(_GDNBase):
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
+        inv_box[0] = thd_cp_a2a_inv
+        return query, key, value, gate, beta, g
+
+    def _forward_compute(
+        self,
+        hidden_states,
+        batch,
+        seq_len_post_headwise,
+        cp_size_headwise,
+        cp_group_headwise,
+        cp_size_chunkwise,
+        cp_group_chunkwise,
+        cu_seqlens_q,
+        packed_seq_params,
+        chunkwise_cp_context,
+    ):
+        """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
+        # The projection/prep block (in_proj -> CP a2a -> pre_gated_delta_rule) is the
+        # "gdn_qkv" recompute tier: its six float outputs feed the gated-delta-rule kernel
+        # and nothing else, so they can be discarded after the forward and rebuilt by
+        # replaying just this block — the kernel itself is never re-run (that is what the
+        # heavier "gdn" tier does).
+        _inv_box = [None]
+        _qkv_fn = partial(
+            self._qkv_proj_and_prep,
+            batch=batch,
+            seq_len_post_headwise=seq_len_post_headwise,
+            cp_size_headwise=cp_size_headwise,
+            cp_group_headwise=cp_group_headwise,
+            cp_size_chunkwise=cp_size_chunkwise,
+            cp_group_chunkwise=cp_group_chunkwise,
+            cu_seqlens_q=cu_seqlens_q,
+            packed_seq_params=packed_seq_params,
+            chunkwise_cp_context=chunkwise_cp_context,
+            inv_box=_inv_box,
+        )
+        if self.recompute_qkv and self.training:
+            self.qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            query, key, value, gate, beta, g = self.qkv_checkpoint.checkpoint(
+                _qkv_fn, hidden_states
+            )
+        else:
+            query, key, value, gate, beta, g = _qkv_fn(hidden_states)
+        # Deterministic integer metadata: identical on replay, so the box is safe to reuse.
+        thd_cp_a2a_inv = _inv_box[0]
+        kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
+
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
             **kernel_inputs,
@@ -424,6 +477,8 @@ class GatedDeltaNet(_GDNBase):
 
         if self.recompute_norm_out and self.training:
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
+        if self.recompute_qkv and self.training:
+            self.qkv_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
 
