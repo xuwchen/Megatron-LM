@@ -105,10 +105,14 @@ def _split_tensor_factory(
         )
         return chunk_sh_tens
 
-    return ShardedTensorFactory(
+    factory = ShardedTensorFactory(
         orig_sh_ten.key,
         orig_sh_ten.data,
         sh_ten_build_fn,
         cat_with_oom_fallback,
         orig_sh_ten.replica_id,
+        flattened_range=orig_sh_ten.flattened_range,
     )
+    if getattr(orig_sh_ten, "is_data_parallel_fully_shard", False):
+        factory.is_data_parallel_fully_shard = True
+    return factory
