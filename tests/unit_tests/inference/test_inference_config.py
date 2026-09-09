@@ -47,6 +47,8 @@ class TestInferenceConfig:
             (None, AsyncScheduleMode.LEGACY),
             ("serial", AsyncScheduleMode.SERIAL),
             (AsyncScheduleMode.SERIAL, AsyncScheduleMode.SERIAL),
+            ("overlap", AsyncScheduleMode.OVERLAP),
+            (AsyncScheduleMode.OVERLAP, AsyncScheduleMode.OVERLAP),
         ],
     )
     def test_async_sched_mode_default_and_coercion(self, async_sched_mode, expected):
@@ -62,8 +64,8 @@ class TestInferenceConfig:
     def test_async_sched_argparse_plumbing(self):
         """Ensure the CLI exposes async scheduling mode."""
         parser = _add_inference_args(ArgumentParser())
-        args = parser.parse_args(["--inference-dynamic-batching-async-sched-mode", "serial"])
-        assert args.inference_dynamic_batching_async_sched_mode == "serial"
+        args = parser.parse_args(["--inference-dynamic-batching-async-sched-mode", "overlap"])
+        assert args.inference_dynamic_batching_async_sched_mode == "overlap"
 
     def test_inference_setup_config_maps_async_sched_mode(self):
         """Ensure declarative inference config maps async scheduling mode to runtime config."""
@@ -73,7 +75,7 @@ class TestInferenceConfig:
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
         )
-        setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="serial")
+        setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="overlap")
 
         inference_config = setup_config.to_inference_config(
             model=model,
@@ -83,4 +85,4 @@ class TestInferenceConfig:
             verbose=False,
         )
 
-        assert inference_config.async_sched_mode == AsyncScheduleMode.SERIAL
+        assert inference_config.async_sched_mode == AsyncScheduleMode.OVERLAP

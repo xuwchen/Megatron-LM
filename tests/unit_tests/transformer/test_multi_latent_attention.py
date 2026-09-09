@@ -96,9 +96,9 @@ def make_test_packed_seq_params_with_padding(
     return packed_seq_params
 
 
-def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
+def get_mla_self_attn_submodules(linear_qkv_down_proj=None, qk_layernorm=False):
     submodules = get_gpt_layer_with_transformer_engine_submodules(
-        multi_latent_attention=True
+        multi_latent_attention=True, qk_layernorm=qk_layernorm
     ).self_attention.submodules
     assert isinstance(submodules, MLASelfAttentionSubmodules)
     if linear_qkv_down_proj is not None:
@@ -107,10 +107,10 @@ def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
     return submodules
 
 
-def get_fused_mla_submodules():
+def get_fused_mla_submodules(qk_layernorm=False):
     """Get submodules for FusedMLASelfAttention via the mla_down_proj_fusion spec path."""
     submodules = get_gpt_layer_with_transformer_engine_submodules(
-        multi_latent_attention=True, mla_down_proj_fusion=True
+        multi_latent_attention=True, mla_down_proj_fusion=True, qk_layernorm=qk_layernorm
     ).self_attention.submodules
     assert isinstance(submodules, MLASelfAttentionSubmodules)
     assert submodules.linear_qkv_down_proj is not None
@@ -172,9 +172,48 @@ class TestParallelMLAAttention:
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
         assert num_weights == 65036
 
+    def test_attention_latent_norm_epsilon_on_fused_projections(self):
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            qk_layernorm=True,
+            layernorm_epsilon=1.0e-5,
+            attention_latent_norm_epsilon=1.0e-6,
+        )
+        attention = MLASelfAttention(
+            config,
+            get_mla_self_attn_submodules(qk_layernorm=True),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        assert attention.linear_q_up_proj.eps == pytest.approx(1.0e-6)
+        assert attention.linear_kv_up_proj.eps == pytest.approx(1.0e-6)
+
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
         pass
+
+    def test_no_rope_rejects_cache_mla_latents(self):
+        self.transformer_config.no_rope_freq = [1, 0]
+        self.transformer_config.cache_mla_latents = True
+
+        with pytest.raises(
+            AssertionError, match="Caching MLA latents is not supported for layers without RoPE"
+        ):
+            MLASelfAttention(
+                self.transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
 
     def test_gpu_forward(self):
         if is_te_min_version("1.10.0"):
@@ -199,6 +238,35 @@ class TestParallelMLAAttention:
             assert output.shape[1] == micro_batch_size
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
+
+    def test_gpu_forward_no_rope(self):
+        if is_te_min_version("1.10.0"):
+            self.transformer_config.no_rope_freq = [1, 0]
+            no_rope_attention = MLASelfAttention(
+                self.transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+            config = no_rope_attention.config
+            sequence_length = 32
+            micro_batch_size = 2
+
+            assert not no_rope_attention.use_rope
+            assert no_rope_attention.rotary_pos_emb is None
+
+            no_rope_attention.cuda()
+            hidden_states = torch.ones(
+                (sequence_length, micro_batch_size, config.hidden_size), device="cuda"
+            )
+            attention_mask = torch.ones(
+                (1, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
+            )
+
+            output, bias = no_rope_attention(hidden_states, attention_mask)
+
+            assert output.shape == hidden_states.shape
+            assert bias.shape == (config.hidden_size,)
 
     @pytest.mark.experimental
     def test_gpu_forward_with_yarn_rope_fusion(self):
@@ -1828,6 +1896,31 @@ class TestFusedMLASelfAttention:
         assert isinstance(self.fused_attention, MLASelfAttention)
         assert self.fused_attention.layer_number == 1
         assert hasattr(self.fused_attention, 'linear_qkv_down_proj')
+
+    def test_attention_latent_norm_epsilon_on_fused_projections(self):
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            qk_layernorm=True,
+            layernorm_epsilon=1.0e-5,
+            attention_latent_norm_epsilon=1.0e-6,
+        )
+        attention = FusedMLASelfAttention(
+            config,
+            get_fused_mla_submodules(qk_layernorm=True),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        assert attention.linear_q_up_proj.eps == pytest.approx(1.0e-6)
+        assert attention.linear_kv_up_proj.eps == pytest.approx(1.0e-6)
 
     def test_fused_weight_shape(self):
         config = self.transformer_config
