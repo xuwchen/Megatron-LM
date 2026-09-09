@@ -348,6 +348,18 @@ GTP backward reduce-scatter overlap across local CUDA-graph boundaries is enable
 
 ### 2.6 FP32-accumulation wgrad reduce-scatter (optional)
 
+The configured `main_grad` precision applies to every producer. Native autograd
+embedding backward returns the parameter dtype; when `main_grad` is FP32, GTP
+promotes this FP16/BF16 gradient before mean scaling and communication, matching
+non-GTP DDP accumulation. The promoted scratch uses the normal wgrad pool and
+release lifecycle. This avoids rounding the global mean back to the parameter
+dtype before an FP32 accumulation. TE producers that already return FP32 and
+runs with low-precision main gradients retain their existing paths.
+
+The native embedding regression compares exact main gradients against independent
+PyTorch embedding backward plus FP32 all-reduce. It covers FP16/BF16 inputs,
+synchronous/asynchronous GTP reduction, and both reduce-scatter implementations.
+
 ```bash
 --gtp-remat-reduce-scatter-with-fp32-accumulation      # default: off
 ```
