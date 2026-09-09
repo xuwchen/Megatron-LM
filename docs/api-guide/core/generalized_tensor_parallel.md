@@ -929,3 +929,24 @@ values are generated; only FSDP2 and meta-device initialization defer materializ
 This matters for compact Muon buffers, which do not remap weights into a persistent
 DDP parameter buffer. The builder regression checks actual parameter devices and
 unchanged initial values before precision and DDP wrappers run.
+
+Semantic fused-projection factories retain a backlink to the live GTP shard and
+accept either logical model data or physical optimizer shards. Muon FP32 masters
+and momentum are gathered (with CPU offload respected), split under the same
+query/key/value or GLU keys, and padded/sliced back on load. They must not fall
+back to an unsplit physical-shard checkpoint key.
+
+With strict checkpoint loading, RNG/rerun objects explicitly excluded from runtime
+restoration are still loaded into temporary staging entries using their saved
+coordinates. Their reads are distributed across current ranks, and the entries
+are discarded before applying training state. Model/optimizer key and shard
+integrity validation remains unchanged, including rejection of extra model keys.
+
+The strict semantic optimizer checkpoint regression reuses one four-rank GTP
+process-group grid across its parameterized save/load cases. Model and runtime
+objects are recreated per case; synchronized cleanup resets GTP state without
+racing Gloo teardown against the next case's group construction.
+
+Ignored runtime objects are enumerated through
+`dist_checkpointing.serialization.load_sharded_metadata`, which includes saved
+`ShardedObject` coordinates as well as tensor metadata.
