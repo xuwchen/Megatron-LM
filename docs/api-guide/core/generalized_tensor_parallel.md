@@ -922,3 +922,10 @@ cannot select Muon's synchronization path. This preserves the owning bucket's
 effective overlap policy even when the optimizer request differs. Direct construction without model chunks retains
 the OptimizerConfig fallback. The initialization regression and multi-iteration
 sync/overlap checks live in `tests/unit_tests/test_layer_wise_optimizer.py`.
+
+The config-container model builder moves CPU-initialized parameters to CUDA before
+precision conversion and DDP wrapping. CPU initialization determines where initial
+values are generated; only FSDP2 and meta-device initialization defer materialization.
+This matters for compact Muon buffers, which do not remap weights into a persistent
+DDP parameter buffer. The builder regression checks actual parameter devices and
+unchanged initial values before precision and DDP wrappers run.
