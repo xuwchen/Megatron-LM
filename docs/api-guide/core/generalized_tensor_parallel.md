@@ -913,3 +913,12 @@ GEMM selects FAST_TF32 independently of PyTorch's matmul precision setting.
 For full-FP32 Muon reference runs, `--muon-fp32-matmul-prec highest` is accepted
 by the training CLI and passed to emerging-optimizers. The supported values
 match PyTorch (`highest`, `high`, `medium`); `low` is not a valid backend mode.
+
+
+LayerWise Muon reads the resolved DDP configuration from its own bucket groups
+before selecting parameter synchronization. Compact Muon buffers disable DistOpt
+locally while sibling Adam buffers retain it, so the model-level configuration
+cannot select Muon's synchronization path. This preserves the owning bucket's
+effective overlap policy even when the optimizer request differs. Direct construction without model chunks retains
+the OptimizerConfig fallback. The initialization regression and multi-iteration
+sync/overlap checks live in `tests/unit_tests/test_layer_wise_optimizer.py`.
