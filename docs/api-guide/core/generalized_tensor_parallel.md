@@ -904,3 +904,8 @@ The four-rank regression `test_kimi_latent_rmsnorm_gtp.py` compares padded
 and unpadded fused projections against native PyTorch RMSNorm plus a full
 linear weight, checking output, input/scale/bias gradients and summed
 weight gradients, including replicated parameter shapes.
+
+The standalone Kimi RMSNorm/linear reference test covers both GTP gradient
+normalization modes: a DP mean by default and a sum for per-token loss. Run its
+strict FP32 comparisons with `NVIDIA_TF32_OVERRIDE=0`, because TE's FP32 cuBLAS
+GEMM selects FAST_TF32 independently of PyTorch's matmul precision setting.

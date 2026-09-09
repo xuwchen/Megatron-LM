@@ -18,6 +18,7 @@ if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
 from megatron.core.tensor_parallel.gtp_api import (
+    GTP_CONFIG,
     is_gtp_param,
     wait_for_gtp_grad_reduction_on_current_stream,
 )
@@ -27,10 +28,13 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
 )
 
 
+@pytest.mark.parametrize("per_token_loss", [False, True])
 @pytest.mark.parametrize("output_size", [80, 128])
 @pytest.mark.parametrize("bias", [False, True])
-def test_fused_latent_projection_matches_full_matrix(output_size, bias):
+def test_fused_latent_projection_matches_full_matrix(output_size, bias, per_token_loss, monkeypatch):
     """Check padding, replicated norm/bias, forward, dgrad, and global wgrad."""
+    # This standalone layer has no training driver to configure global GTP state.
+    monkeypatch.setattr(GTP_CONFIG, "calculate_per_token_loss", per_token_loss)
     world = dist.get_world_size()
     if world != 4:
         pytest.skip("Run with four torchrun ranks")
@@ -90,6 +94,10 @@ def test_fused_latent_projection_matches_full_matrix(output_size, bias):
     if bias:
         torch.testing.assert_close(layer.bias.grad, ref_bias.grad, atol=2e-5, rtol=2e-5)
     dist.all_reduce(weight.grad, group=pgc.gtp_remat)
+    # Default GTP returns the DP mean; token-loss mode returns a sum for the
+    # training driver to normalize by the global token count.
+    if not per_token_loss:
+        weight.grad.div_(world)
     padded = F.pad(weight.grad, (0, 0, 0, layer.weight.pad_length))
     expected_shard = padded.chunk(world)[pgc.gtp_remat.rank()]
     torch.testing.assert_close(layer.weight.main_grad, expected_shard, atol=3e-5, rtol=3e-5)
