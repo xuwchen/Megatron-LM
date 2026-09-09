@@ -909,3 +909,7 @@ The standalone Kimi RMSNorm/linear reference test covers both GTP gradient
 normalization modes: a DP mean by default and a sum for per-token loss. Run its
 strict FP32 comparisons with `NVIDIA_TF32_OVERRIDE=0`, because TE's FP32 cuBLAS
 GEMM selects FAST_TF32 independently of PyTorch's matmul precision setting.
+
+For full-FP32 Muon reference runs, `--muon-fp32-matmul-prec highest` is accepted
+by the training CLI and passed to emerging-optimizers. The supported values
+match PyTorch (`highest`, `high`, `medium`); `low` is not a valid backend mode.
