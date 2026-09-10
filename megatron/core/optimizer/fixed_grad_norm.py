@@ -14,6 +14,8 @@ from typing import Any
 
 import torch
 
+from megatron.core.utils import nvtx_decorator
+
 BLOCK_SIZE = 1024
 METADATA_ATTR = '_fixed_grad_norm_metadata'
 _PLAN_CACHE: dict[tuple, Any] = {}
@@ -183,6 +185,7 @@ def _get_plan(grads: list[torch.Tensor], group: Any, device: torch.device) -> _P
 
 
 @torch.no_grad()
+@nvtx_decorator(message="fixed_grad_norm_fp32")
 def get_fixed_grad_norm_fp32(grads: list[torch.Tensor], group: Any = None) -> torch.Tensor:
     """Compute a canonical FP32 L2 norm across arbitrary named parameter shards.
 

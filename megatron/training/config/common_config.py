@@ -65,6 +65,10 @@ class ProfilingConfig:
     record_shapes: bool = False
     """Record shapes of tensors in `torch.autograd.profiler.emit_nvtx` for the Nsys profiler."""
 
+    profile_no_autograd_nvtx: bool = False
+    """Omit per-operation autograd NVTX during Nsight profiling. CUDA capture and
+    explicit NVTX ranges remain available; this option reduces annotation overhead."""
+
     nvtx_ranges: bool = False
     """Enable NVTX range annotations for profiling. When enabled, inserts NVTX markers
     to categorize execution in profiler output."""

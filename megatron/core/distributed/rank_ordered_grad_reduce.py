@@ -12,6 +12,8 @@ from typing import Any, Iterable
 
 import torch
 
+from megatron.core.utils import nvtx_decorator
+
 
 class RankOrderedReductionWork:
     """Own FP32 communication buffers and finish one rank-ordered reduction."""
@@ -35,6 +37,7 @@ class RankOrderedReductionWork:
         self.gather = gather
 
     @torch.no_grad()
+    @nvtx_decorator(message="rank_ordered_grad_reduce.finish")
     def wait(self) -> None:
         """Complete FP32 arithmetic/copies on the caller's stream exactly once."""
         if self.destination is None:
