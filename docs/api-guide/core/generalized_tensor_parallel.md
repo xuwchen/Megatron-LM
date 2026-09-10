@@ -1145,3 +1145,47 @@ passed its separate 17-case suite at `e712704b96f0`.
 Observed CW mean iteration times over steps 21-100 are 1516.16625 ms non-GTP
 and 2169.3325 ms GTP4. The new paths add communication and kernel overhead;
 OCI MXFP8 Nsight performance has not been re-measured for this configuration.
+
+
+### Kimi-K3 controlled performance diagnosis (2026-09-10)
+
+Training revision `af6b9b6643906d99a985212ce9a5f0ab65d1d683` adds optional
+`--profile-no-autograd-nvtx` and explicit fixed-order helper scopes; it does not
+change arithmetic. The accepted CW accuracy revision and its scope remain as
+recorded above. A separate 64-GB200 performance comparison uses the nine-block
+full-width proxy, MXFP8, TP1/PP1/EP64/CP1, SL4096, GBS4096, balanced mock routing,
+whole-matrix duplicated layer-wise Muon, chunked optimizer-state offload and
+eager execution. Both FP64 controls and both fixed-order FP32 controls are false.
+All four quiet arms use the same sixteen nodes and updates 6-16:
+
+| Layout | MBS | Mean seconds/update | Rank-0 peak allocated GiB |
+|---|---:|---:|---:|
+| non-GTP | 1 | 32.332336 | 90.264219 |
+| GTP8 | 1 | 40.358936 | 70.282998 |
+| non-GTP | 2 | 30.338327 | 99.642520 |
+| GTP8 | 2 | 32.216345 | 74.194141 |
+
+GTP overhead is 24.83% at MBS1 and 6.19% at MBS2.
+MBS2 halves directly attributed weight materializations from 14,592 to 7,296
+all-gather kernels/update and GTP weight-gradient reduce-scatters from 5,056 to
+2,528. This identifies per-microbatch communication as an optimization priority.
+The 6.149 s reduction in the GTP-vs-baseline gap also includes compute and
+MoE scheduling effects; it is not an isolated communication wall-time estimate.
+
+A separate CW four-H100 2x2 quiet experiment measures native/fixed-order FP32
+means of 1413.153/1511.750 ms for non-GTP and 1983.960/2152.013 ms for GTP4.
+Enabling both fixed-order controls adds 168.053 ms to GTP4. Its fixed norm
+launches 10,950 kernels/update on rank 0, including 9,740 binary-tree addition
+kernels. Profiled norm host/GPU-sum times are 228.241/17.600 ms; those are not
+quiet wall-time deltas. Batching/fusing the same explicit FP32 tree is a
+separate optimization target and must retain the unchanged accuracy gates.
+
+Twelve valid per-rank captures cover completed updates 10-12, with start=9,
+end=12, and per-worker output names. Independent integer-nanosecond interval
+unions match native report totals within 8.57e-12 s/update. Nsight substantially
+perturbs MBS1: OCI captured logged means are 37.527/55.263 s for non-GTP/GTP8,
+versus quiet 32.332/40.359 s. GPU idle and peer waits do not establish deficient
+SM occupancy or network bandwidth. This short performance diagnostic does not
+establish numerical parity for native-FP32 MXFP8 or benchmark the fixed-order
+accuracy paths on OCI. Artifacts are retained in the development toolkit's
+`runtime/gtp_kimi_k3/perf_bottleneck/`, including raw reports and hashed manifests.
