@@ -1042,3 +1042,13 @@ reference removed all sampled first-update differences through Muon and BF16
 rounding. Subsequent updates exposed additional norm-reduction rounding. These
 observations motivate the explicit controls; full-model validation of the
 production implementation is still pending.
+
+FLA 0.5.2 also autotunes the KDA gate-backward warp count. Fixed-input H100
+probes show that changing this count changes the FP32 `A_log` reduction while
+leaving gate-input and bias gradients identical. Megatron deterministic mode
+does not select a fixed external autotuner configuration. The numerical
+comparison example in `examples/kimi_k3/fla_h100/` uses FLA's supported cache
+interface to keep gate backward at four warps and two stages across both
+layouts. This is separate from the FP64 communication/norm controls. The
+first 100-update pair with only those two controls still failed 12 gradient
+gates, despite passing its loss gates; fixed-gate full validation is pending.
