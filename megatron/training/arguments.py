@@ -4386,6 +4386,12 @@ def _add_distributed_args(parser):
         'apparently needs to be divisible by a power of 2 for high busbw.',
     )
     group.add_argument(
+        '--grad-norm-in-fixed-order',
+        action='store_true',
+        default=False,
+        help='Compute gradient L2 norms with a fixed FP32 tree over logical parameter blocks.',
+    )
+    group.add_argument(
         '--grad-norm-in-fp64',
         action='store_true',
         default=False,
