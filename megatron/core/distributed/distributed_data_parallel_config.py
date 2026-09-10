@@ -12,6 +12,9 @@ from ..utils import is_torch_min_version
 class DistributedDataParallelConfig:
     """Configuration for DistributedDataParallel."""
 
+    grad_reduce_in_rank_order: bool = False
+    """Reduce FP32 contributions in ascending process-group rank order."""
+
     grad_reduce_in_fp64: bool = False
     """Use FP64 gradient communication with FP32 local accumulation and storage."""
 
@@ -311,6 +314,17 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.grad_reduce_in_rank_order:
+            if self.grad_reduce_in_fp64:
+                raise ValueError("grad_reduce_in_rank_order cannot enable FP64 communication")
+            if not self.grad_reduce_in_fp32:
+                raise ValueError("grad_reduce_in_rank_order requires FP32 gradient buffers")
+            if self.num_distributed_optimizer_instances != 1:
+                raise ValueError(
+                    "grad_reduce_in_rank_order supports one distributed optimizer instance"
+                )
+            if self.use_megatron_fsdp or self.reduce_scatter_with_fp32_accumulation:
+                raise ValueError("grad_reduce_in_rank_order requires native DDP gradient buffers")
         if self.grad_reduce_in_fp64:
             if not self.grad_reduce_in_fp32:
                 raise ValueError("grad_reduce_in_fp64 requires FP32 gradient buffers")

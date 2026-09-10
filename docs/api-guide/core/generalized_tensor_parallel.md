@@ -1076,3 +1076,24 @@ was 9.7567%, at iteration 78, against the unchanged allowance of
 updates were skipped or NaN. This ordinary FP32 mode remains unaligned under
 that complete protocol; fixing the FLA gate configuration alone is insufficient.
 The historical FP64 diagnostic pass does not meet the ordinary FP32 requirement.
+
+
+### FP32 reductions in process-group rank order
+
+`--grad-reduce-in-rank-order` opts into a fixed FP32 addition order for native
+DDP, GTP sharded weights, and replicated GTP gradients. All-to-all exchanges
+contributions without arithmetic; each rank adds its shard in ascending group
+rank order. All-reduce also all-gathers the reduced shards. All wire buffers,
+local additions and destinations remain FP32. The option is mutually exclusive
+with FP64 gradient communication and leaves gradient-norm accumulation at its
+existing setting. For FP32 comparisons, keep both FP64 options disabled.
+
+The option requires eager execution, FP32 gradient buffers, one distributed
+optimizer instance and no GTP symmetric-memory registration. It retains a
+full-size FP32 receive buffer and launches explicit addition kernels. It fixes
+per-element order within a group, independently of bucket length or shard
+ownership; it does not promise equivalence for arbitrary hierarchical group
+decompositions. Native NCCL remains the default. Layout-invariance, cancellation,
+async lifetime and CLI regressions are in
+`tests/unit_tests/distributed/test_rank_ordered_grad_reduce.py`. Complete CW
+training parity and the overhead of this candidate are pending validation.

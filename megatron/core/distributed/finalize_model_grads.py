@@ -544,6 +544,7 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
     egtp_remat_group: Optional[torch.distributed.ProcessGroup],
     calculate_per_token_loss: bool = False,
     grad_reduce_in_fp64: bool = False,
+    grad_reduce_in_rank_order: bool = False,
 ):
     """Complete the gtp_remat / egtp_remat axis reduction for replicated parameters.
 
@@ -597,7 +598,11 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
             if calculate_per_token_loss
             else torch.distributed.ReduceOp.AVG
         )
-        if grad_reduce_in_fp64:
+        if grad_reduce_in_rank_order:
+            from .rank_ordered_grad_reduce import all_reduce_rank_ordered
+
+            all_reduce_rank_ordered(coalesced, op=op, group=group)
+        elif grad_reduce_in_fp64:
             from .fp64_grad_reduce import all_reduce_fp64
 
             all_reduce_fp64(coalesced, op=op, group=group)
@@ -724,6 +729,7 @@ def finalize_model_grads(
         egtp_remat_group,
         calculate_per_token_loss=config.calculate_per_token_loss,
         grad_reduce_in_fp64=config.grad_reduce_in_fp64,
+        grad_reduce_in_rank_order=config.grad_reduce_in_rank_order,
     )
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()

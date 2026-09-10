@@ -808,10 +808,24 @@ class _ParamAndGradBucketGroup:
             communication_group = self.data_parallel_group
 
         grad_reduce_handle = None
-        if self.ddp_config.grad_reduce_in_fp64:
+        if self.ddp_config.grad_reduce_in_fp64 or self.ddp_config.grad_reduce_in_rank_order:
+            if self.ddp_config.grad_reduce_in_rank_order:
+                from .rank_ordered_grad_reduce import (
+                    RankOrderedReductionWorkGroup,
+                    all_reduce_rank_ordered,
+                    reduce_scatter_rank_ordered,
+                )
+
+                staged_all_reduce = all_reduce_rank_ordered
+                staged_reduce_scatter = reduce_scatter_rank_ordered
+                work_group = RankOrderedReductionWorkGroup
+            else:
+                staged_all_reduce = all_reduce_fp64
+                staged_reduce_scatter = reduce_scatter_fp64
+                work_group = GradientReductionWorkGroup
             # Each handle owns its staging tensors and deferred FP32 copy. Do not
             # put these collectives inside a coalescing manager, which would only
-            # wait on NCCL and lose the roundback/lifetime operation.
+            # wait on NCCL and lose the deferred arithmetic/lifetime operation.
             works = []
             with stream_context:
                 for idx, bucket in enumerate(self.buckets):
@@ -824,7 +838,7 @@ class _ParamAndGradBucketGroup:
                             self.intra_distributed_optimizer_instance_rank
                         ]
                         works.append(
-                            reduce_scatter_fp64(
+                            staged_reduce_scatter(
                                 local_view,
                                 bucket.grad_data,
                                 op=reduce_op,
@@ -834,14 +848,14 @@ class _ParamAndGradBucketGroup:
                         )
                     else:
                         works.append(
-                            all_reduce_fp64(
+                            staged_all_reduce(
                                 bucket.grad_data,
                                 op=reduce_op,
                                 group=communication_group,
                                 async_op=async_op,
                             )
                         )
-            cm = GradientReductionWorkGroup(works)
+            cm = work_group(works)
         else:
             # Coalesce communication kernels across buckets in the bucket group.
             grad_reduce_handle = None

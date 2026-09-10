@@ -1368,6 +1368,18 @@ def validate_args(args, defaults={}):
                     "--accumulate-allreduce-grads-in-fp32 already reduces in fp32"
                 )
 
+    if getattr(args, 'grad_reduce_in_rank_order', False):
+        assert not getattr(args, 'grad_reduce_in_fp64', False)
+        assert args.accumulate_allreduce_grads_in_fp32
+        assert args.main_grads_dtype == torch.float32
+        assert (
+            args.cuda_graph_impl == "none"
+        ), "Rank-ordered gradient reduction requires eager execution"
+        assert not args.use_megatron_fsdp and not args.use_torch_fsdp2
+        assert args.num_distributed_optimizer_instances == 1
+        assert not getattr(args, 'gtp_remat_nccl_ub', False)
+        assert not getattr(args, 'gtp_expert_remat_nccl_ub', False)
+
     if getattr(args, 'grad_reduce_in_fp64', False):
         assert (
             args.accumulate_allreduce_grads_in_fp32

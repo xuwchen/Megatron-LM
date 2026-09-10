@@ -2994,6 +2994,7 @@ def setup_model_and_optimizer(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
             grad_reduce_in_fp64=getattr(args, 'grad_reduce_in_fp64', False),
+            grad_reduce_in_rank_order=getattr(args, 'grad_reduce_in_rank_order', False),
             pad_for_alignment=getattr(args, 'gtp_remat_pad_for_alignment', None),
         )
 

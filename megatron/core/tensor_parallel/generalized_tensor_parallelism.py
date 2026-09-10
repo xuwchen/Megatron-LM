@@ -453,6 +453,9 @@ class GTPRematConfig:
     # same-key writers may need more slots to keep all in-flight RS inputs distinct.
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
+    grad_reduce_in_rank_order: bool = False
+    """Reduce FP32 contributions in ascending remat-group rank order."""
+
     grad_reduce_in_fp64: bool = False
 
 
@@ -486,12 +489,15 @@ def configure_gtp_remat_from_recipe(
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
     grad_reduce_in_fp64=False,
+    grad_reduce_in_rank_order=False,
     pad_for_alignment=None,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction) from the training recipe.
     Must be called once BEFORE model construction.
     """
+    if grad_reduce_in_rank_order and grad_reduce_in_fp64:
+        raise ValueError("Rank-ordered FP32 and FP64 gradient reduction are mutually exclusive")
     # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
     # check_param_states=False: GTP buffer reuse (notably under CUDA-graph capture) trips the
     # param-state debug asserts, so keep them off for GTP runs.
@@ -500,6 +506,7 @@ def configure_gtp_remat_from_recipe(
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
         grad_reduce_in_fp64=grad_reduce_in_fp64,
+        grad_reduce_in_rank_order=grad_reduce_in_rank_order,
     )
     # An explicit value wins over the recipe default. The alignment pad is otherwise
     # unreachable from the training flow: only these three quantized branches set it,
@@ -2105,11 +2112,23 @@ class GTPShardedParam(torch.nn.Parameter):
             rs_ctx = nullcontext()
 
         with rs_ctx:
-            if GTP_CONFIG.grad_reduce_in_fp64:
-                from megatron.core.distributed.fp64_grad_reduce import (
-                    GradientReductionWorkGroup,
-                    reduce_scatter_fp64,
-                )
+            if GTP_CONFIG.grad_reduce_in_fp64 or GTP_CONFIG.grad_reduce_in_rank_order:
+                if GTP_CONFIG.grad_reduce_in_rank_order:
+                    from megatron.core.distributed.rank_ordered_grad_reduce import (
+                        RankOrderedReductionWorkGroup,
+                        reduce_scatter_rank_ordered,
+                    )
+
+                    staged_reduce_scatter = reduce_scatter_rank_ordered
+                    work_group = RankOrderedReductionWorkGroup
+                else:
+                    from megatron.core.distributed.fp64_grad_reduce import (
+                        GradientReductionWorkGroup,
+                        reduce_scatter_fp64,
+                    )
+
+                    staged_reduce_scatter = reduce_scatter_fp64
+                    work_group = GradientReductionWorkGroup
 
                 outputs, works = [], []
                 for out_buffer, tensor in zip(out_buffers, wgrads):
@@ -2117,7 +2136,7 @@ class GTPShardedParam(torch.nn.Parameter):
                         shape = (tensor.shape[0] // self.group.size(), *tensor.shape[1:])
                         out_buffer = torch.empty(shape, device=tensor.device, dtype=tensor.dtype)
                     works.append(
-                        reduce_scatter_fp64(
+                        staged_reduce_scatter(
                             out_buffer,
                             tensor,
                             op=torch.distributed.ReduceOp.SUM,
@@ -2126,11 +2145,7 @@ class GTPShardedParam(torch.nn.Parameter):
                         )
                     )
                     outputs.append(out_buffer)
-                return (
-                    outputs,
-                    GradientReductionWorkGroup(works) if async_op else None,
-                    release_bufs,
-                )
+                return (outputs, work_group(works) if async_op else None, release_bufs)
 
             # fp32-accum all-to-all: skipped at size <= 2 and on symm-registered groups.
             if (

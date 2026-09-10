@@ -300,6 +300,12 @@ class TransformerConfig(ModelParallelConfig):
     test_mode: bool = False
     """Whether to run real-time tests."""
 
+    grad_reduce_in_rank_order: bool = False
+    """Use FP32 all-to-all and rank-ordered additions for gradient reductions.
+    Requires eager native DDP, FP32 gradient buffers, one optimizer instance and
+    no GTP symmetric memory. Uses full-size FP32 receive buffers; unlike native
+    NCCL reductions, addition order does not depend on gradient bucket length."""
+
     grad_reduce_in_fp64: bool = False
     """Use FP64 gradient communication, including replicated GTP parameter gradients,
     and round once into FP32 gradient buffers. For numerical layout comparisons;
