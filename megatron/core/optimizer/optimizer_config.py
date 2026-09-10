@@ -392,6 +392,9 @@ class OptimizerConfig:
     ################
     # Miscellaneous
     ################
+    grad_norm_in_fixed_order: bool = False
+    """Use a fixed FP32 tree over logical parameter blocks for gradient norms."""
+
     grad_norm_in_fp64: bool = False
     """Accumulate gradient norms in FP64 for comparisons across optimizer layouts."""
 

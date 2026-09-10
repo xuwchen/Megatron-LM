@@ -1368,6 +1368,14 @@ def validate_args(args, defaults={}):
                     "--accumulate-allreduce-grads-in-fp32 already reduces in fp32"
                 )
 
+    if getattr(args, 'grad_norm_in_fixed_order', False):
+        assert not getattr(args, 'grad_norm_in_fp64', False)
+        assert args.tensor_model_parallel_size == 1 and args.pipeline_model_parallel_size == 1
+        assert args.cuda_graph_impl == "none", "Fixed-order norms require eager execution"
+        assert not args.use_megatron_fsdp and not args.use_torch_fsdp2
+        assert not args.use_precision_aware_optimizer
+        assert args.main_grads_dtype == torch.float32
+
     if getattr(args, 'grad_reduce_in_rank_order', False):
         assert not getattr(args, 'grad_reduce_in_fp64', False)
         assert args.accumulate_allreduce_grads_in_fp32

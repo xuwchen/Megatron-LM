@@ -54,6 +54,7 @@ from ..tensor_parallel import (
 )
 from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
+from .fixed_grad_norm import get_fixed_grad_norm_fp32
 
 
 def get_grad_norm_fp32(
@@ -61,6 +62,7 @@ def get_grad_norm_fp32(
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     use_fp64: bool = False,
+    use_fixed_order: bool = False,
 ) -> float:
     """Calculate the p-norm of gradients in FP32 precision.
 
@@ -79,6 +81,7 @@ def get_grad_norm_fp32(
             used for reducing gradient statistics (e.g., norms and zero counts).
 
         use_fp64 (bool): Accumulate norm reductions in FP64 and return a Python scalar.
+        use_fixed_order (bool): Use a canonical FP32 L2 tree across optimizer shards.
 
     Returns:
         float: The total norm of the parameters, treated as a single vector.
@@ -90,6 +93,11 @@ def get_grad_norm_fp32(
     data_parallel_group = None
     for grad in grads_for_norm:
         data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
+
+    if use_fixed_order:
+        if use_fp64 or float(norm_type) != 2.0 or data_parallel_group is not None:
+            raise ValueError('Fixed-order norms require FP32 L2 gradients without DTensor sharding')
+        return get_fixed_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group)
 
     grads_for_norm = [to_local_if_dtensor(grad) for grad in grads_for_norm]
 

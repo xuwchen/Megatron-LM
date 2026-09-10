@@ -52,6 +52,7 @@ from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .cpu_offloading.chunked_optimizer_state_offload import ChunkedOptimizerStateOffloader
+from .fixed_grad_norm import copy_fixed_grad_norm_metadata
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
@@ -135,8 +136,11 @@ def _is_separate_grad_norm_group(grad_norm_group: Optional[str]) -> bool:
     return True
 
 
-def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+def copy_optimizer_param_metadata(
+    destination: torch.Tensor, source: torch.Tensor, shard_start: int = 0
+) -> None:
     """Copy optimizer-relevant metadata when creating param views/copies."""
+    copy_fixed_grad_norm_metadata(destination, source, shard_start)
     if hasattr(source, 'allreduce'):
         destination.allreduce = source.allreduce
     if hasattr(source, 'shared'):
@@ -362,6 +366,8 @@ class MegatronOptimizer(ABC):
             )
             is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(param)
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
+                if self.config.grad_norm_in_fixed_order:
+                    copy_fixed_grad_norm_metadata(grad, param)
                 grads_for_norm.append(grad)
         return grads_for_norm
 
@@ -445,6 +451,7 @@ class MegatronOptimizer(ABC):
             grads_for_norm,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
             use_fp64=self.config.grad_norm_in_fp64,
+            use_fixed_order=self.config.grad_norm_in_fixed_order,
         )
         return total_norm
 
@@ -459,6 +466,7 @@ class MegatronOptimizer(ABC):
                     grouped_grads,
                     grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
                     use_fp64=self.config.grad_norm_in_fp64,
+                    use_fixed_order=self.config.grad_norm_in_fixed_order,
                 )
                 self.grad_norms_by_group[grad_norm_group] = group_grad_norm
         return self.grad_norms_by_group
@@ -479,6 +487,7 @@ class MegatronOptimizer(ABC):
             grads_for_norm,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
             use_fp64=self.config.grad_norm_in_fp64,
+            use_fixed_order=self.config.grad_norm_in_fixed_order,
         )
 
         if clip_grad > 0.0 and params:
@@ -2085,6 +2094,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 grads_for_norm,
                 grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
                 use_fp64=self.config.grad_norm_in_fp64,
+                use_fixed_order=self.config.grad_norm_in_fixed_order,
             )
         else:
             grad_norms = []
@@ -2150,6 +2160,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 grouped_grads,
                 grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
                 use_fp64=self.config.grad_norm_in_fp64,
+                use_fixed_order=self.config.grad_norm_in_fixed_order,
             )
         else:
             group_norms = []
@@ -2159,6 +2170,7 @@ class ChainedOptimizer(MegatronOptimizer):
                     grouped_grads,
                     grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),
                     use_fp64=optimizer.config.grad_norm_in_fp64,
+                    use_fixed_order=optimizer.config.grad_norm_in_fixed_order,
                 )
                 group_norms.append(norm if norm else 0.0)
             return math.sqrt(sum([x**2 for x in group_norms]))

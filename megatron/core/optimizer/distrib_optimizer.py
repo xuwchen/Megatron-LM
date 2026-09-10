@@ -529,7 +529,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             shard_model_param, model_param
                         )
                         tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
-                        copy_optimizer_param_metadata(shard_model_param, model_param)
+                        copy_optimizer_param_metadata(
+                            shard_model_param, model_param, param_range.start
+                        )
                         shard_model_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
                             model_param, param_range.start, param_range.end
                         )
@@ -564,7 +566,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             shard_main_param, model_param
                         )
                         tensor_parallel.copy_gtp_attributes(shard_main_param, model_param)
-                        copy_optimizer_param_metadata(shard_main_param, model_param)
+                        copy_optimizer_param_metadata(
+                            shard_main_param, model_param, param_range.start
+                        )
                         shard_main_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
                             model_param, param_range.start, param_range.end
                         )
@@ -592,7 +596,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         shard_model_param, model_param
                     )
                     tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
-                    copy_optimizer_param_metadata(shard_model_param, model_param)
+                    copy_optimizer_param_metadata(shard_model_param, model_param, param_range.start)
                     shard_model_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
                         model_param, param_range.start, param_range.end
                     )

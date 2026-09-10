@@ -66,6 +66,7 @@ from .emerging_optimizers import (
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
 )
+from .fixed_grad_norm import configure_fixed_grad_norm_metadata
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
 from .optimizer import (
@@ -1025,6 +1026,14 @@ def get_megatron_optimizer(
             len(model_chunks) == 1
         ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
         return get_mimo_optimizer(model_chunks[0], config)
+
+    if config.grad_norm_in_fixed_order:
+        if config.grad_norm_in_fp64 or config.use_precision_aware_optimizer:
+            raise ValueError('Fixed-order norms require FP32 native optimizer gradients')
+        if pg_collection is None:
+            # Compatibility bootstrap for callers using the existing MPU defaults.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        configure_fixed_grad_norm_metadata(model_chunks, pg_collection)
 
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.

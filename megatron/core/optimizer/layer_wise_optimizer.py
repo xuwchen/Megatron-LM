@@ -1180,7 +1180,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm()
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=None, use_fp64=self.config.grad_norm_in_fp64
+            grads_for_norm,
+            grad_stats_parallel_group=None,
+            use_fp64=self.config.grad_norm_in_fp64,
+            use_fixed_order=self.config.grad_norm_in_fixed_order,
         )
         return grad_norm
 
@@ -1218,7 +1221,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=None, use_fp64=self.config.grad_norm_in_fp64
+            grads_for_norm,
+            grad_stats_parallel_group=None,
+            use_fp64=self.config.grad_norm_in_fp64,
+            use_fixed_order=self.config.grad_norm_in_fixed_order,
         )
         return grad_norm
 

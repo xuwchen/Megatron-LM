@@ -1097,3 +1097,18 @@ decompositions. Native NCCL remains the default. Layout-invariance, cancellation
 async lifetime and CLI regressions are in
 `tests/unit_tests/distributed/test_rank_ordered_grad_reduce.py`. Complete CW
 training parity and the overhead of this candidate are pending validation.
+
+
+### FP32 gradient norms over fixed logical blocks
+
+`--grad-norm-in-fixed-order` preserves a parameter's logical element offsets
+through GTP and optimizer sharding. It computes FP32 squared sums over fixed
+1024-element blocks, exchanges completed powers and raw split-block fragments,
+and reduces the canonical parameter/block sequence with a fixed FP32 binary
+tree. Padding is excluded and ownership metadata must cover each logical
+parameter exactly once. The square root and clipping coefficient remain FP32;
+the L2 definition and clipping threshold are unchanged. This option requires
+eager native optimizers, TP1/PP1 and FP32 gradients, and rejects FP64 norms,
+FSDP and precision-aware optimizers. It costs extra kernels and communication.
+Training validation is pending; rank-ordered communication alone failed the
+100-update CW gradient gate, with first norm divergence at iteration 3.
