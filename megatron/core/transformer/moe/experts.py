@@ -62,6 +62,7 @@ except ImportError:  # pragma: no cover - TE-less environments have no GTP
     HAVE_GTP = False
 
     def is_gtp_param(_param):
+        """Return False when the optional GTP implementation is unavailable."""
         return False
 
 

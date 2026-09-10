@@ -574,6 +574,8 @@ class TestGatedDeltaProductFlops:
         expected_delta = 3 * num_gdp_layers * forward_delta_per_layer
 
         assert flops_m4 - flops_m3 == expected_delta
+
+
 class TestAttentionResidualFlops:
     """AttnRes FLOPs must follow the runtime depth-source schedule."""
 

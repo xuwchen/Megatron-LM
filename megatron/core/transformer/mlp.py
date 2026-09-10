@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover - TE-less environments have no GTP
     HAVE_GTP = False
 
     def is_gtp_param(_param):
+        """Return False when the optional GTP implementation is unavailable."""
         return False
 
 

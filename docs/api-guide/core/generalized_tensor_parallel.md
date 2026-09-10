@@ -898,67 +898,122 @@ All tests require ≥ 4 GPUs and TransformerEngine >= 2.19; they self-skip when 
 ## Kimi-K3 integration on dev
 
 The Kimi-K3 preview combines KDA low-rank decay projections, gated MLA,
-attention residuals, and Stable LatentMoE. The fused latent up-projection
-`TERMSNormDuplicatedLinear` accepts explicit `gtp_remat_group` and
-`gtp_replica_group` arguments and participates in the common presharding
-context when `moe_latent_proj` is opted in. Its linear weight is sharded;
-RMSNorm scale and optional bias retain their complete logical shapes.
-The owning TP group remains checkpoint metadata only: the duplicated
-projection executes without TE tensor-parallel communication.
+attention residuals, Stable LatentMoE, SiTU GLU, and quantile balancing.
+This integration preserves the source history from dev GTP PR #6882,
+precision/checkpoint PR #6608, and `kimi_k3_preview_20260907`.
+
+### Dependencies and optimizer semantics
+
+The validated TransformerEngine revision is
+`0a2ebe942b9f6a66aa0292502966e73114a7b912` (2.20.0.dev0), which provides both
+GTP and `SiTUGLU`. The runs also use FLA 0.5.2 and emerging-optimizers 0.3.0.
+Build TE against the target PyTorch/container and GPU architecture; the H100
+BF16 and GB200 MXFP8 runs use separate binary builds.
 
 For a numerical comparison with the preview's TP1 non-GTP Muon baseline,
-use `muon_tp_mode=duplicated` on both arms. The `blockwise` mode independently
-orthogonalizes each GTP shard and therefore changes the optimizer update
-when the GTP degree changes. Compare from one checkpoint and retain identical
-logical batch/data ordering and learned router settings.
+use `--muon-tp-mode duplicated` on both arms. The `blockwise` mode independently
+orthogonalizes each GTP shard and changes the optimizer update when the GTP
+degree changes. Compare from one model and full optimizer checkpoint, retaining
+identical logical batch/data ordering, schedules, and learned router settings.
 
-The four-rank regression `test_kimi_latent_rmsnorm_gtp.py` compares padded
-and unpadded fused projections against native PyTorch RMSNorm plus a full
-linear weight, checking output, input/scale/bias gradients and summed
-weight gradients, including replicated parameter shapes.
+`--muon-fp32-matmul-prec` accepts the backend's `highest`, `high`, and `medium`
+precision modes. The BF16 numerical comparison uses `highest`; both MXFP8
+performance arms use `medium`. `low` is not a valid backend mode.
 
-The standalone Kimi RMSNorm/linear reference test covers both GTP gradient
-normalization modes: a DP mean by default and a sum for per-token loss. Run its
-strict FP32 comparisons with `NVIDIA_TF32_OVERRIDE=0`, because TE's FP32 cuBLAS
-GEMM selects FAST_TF32 independently of PyTorch's matmul precision setting.
+### Model and optimizer integration
 
-For full-FP32 Muon reference runs, `--muon-fp32-matmul-prec highest` is accepted
-by the training CLI and passed to emerging-optimizers. The supported values
-match PyTorch (`highest`, `high`, `medium`); `low` is not a valid backend mode.
+The fused latent up-projection `TERMSNormDuplicatedLinear` accepts explicit
+`gtp_remat_group` and `gtp_replica_group` arguments and participates in the
+common presharding context with `--gtp-remat-opt-in-modules moe_latent_proj`.
+Its linear weight is sharded; RMSNorm scale and optional bias retain their
+complete logical shapes. The owning TP group remains checkpoint metadata only:
+the duplicated projection executes without TE tensor-parallel communication.
 
-
-LayerWise Muon reads the resolved DDP configuration from its own bucket groups
-before selecting parameter synchronization. Compact Muon buffers disable DistOpt
+LayerWise Muon reads the DDP configuration from its own bucket groups before
+selecting parameter synchronization. Compact Muon buffers disable DistOpt
 locally while sibling Adam buffers retain it, so the model-level configuration
-cannot select Muon's synchronization path. This preserves the owning bucket's
-effective overlap policy even when the optimizer request differs. Direct construction without model chunks retains
-the OptimizerConfig fallback. The initialization regression and multi-iteration
-sync/overlap checks live in `tests/unit_tests/test_layer_wise_optimizer.py`.
+cannot select Muon's synchronization path. Direct construction without model
+chunks retains the OptimizerConfig fallback.
 
-The config-container model builder moves CPU-initialized parameters to CUDA before
-precision conversion and DDP wrapping. CPU initialization determines where initial
-values are generated; only FSDP2 and meta-device initialization defer materialization.
-This matters for compact Muon buffers, which do not remap weights into a persistent
-DDP parameter buffer. The builder regression checks actual parameter devices and
-unchanged initial values before precision and DDP wrappers run.
+The config-container model builder moves CPU-initialized parameters to CUDA
+before precision conversion and DDP wrapping. CPU initialization determines
+where initial values are generated; only FSDP2 and meta-device initialization
+defer materialization. Compact Muon buffers do not remap weights into a
+persistent DDP parameter buffer, making correct device placement necessary.
 
-Semantic fused-projection factories retain a backlink to the live GTP shard and
-accept either logical model data or physical optimizer shards. Muon FP32 masters
-and momentum are gathered (with CPU offload respected), split under the same
-query/key/value or GLU keys, and padded/sliced back on load. They must not fall
-back to an unsplit physical-shard checkpoint key.
+Native embedding gradients use FP32 before mean scaling and reduce-scatter
+when their destination `main_grad` is FP32, avoiding an intermediate BF16/FP16
+roundback. See [FP32 gradient accumulation](#26-fp32-accumulation-wgrad-reduce-scatter-optional).
 
-With strict checkpoint loading, RNG/rerun objects explicitly excluded from runtime
-restoration are still loaded into temporary staging entries using their saved
-coordinates. Their reads are distributed across current ranks, and the entries
-are discarded before applying training state. Model/optimizer key and shard
-integrity validation remains unchanged, including rejection of extra model keys.
+### Checkpoint interoperability
 
-The strict semantic optimizer checkpoint regression reuses one four-rank GTP
-process-group grid across its parameterized save/load cases. Model and runtime
-objects are recreated per case; synchronized cleanup resets GTP state without
-racing Gloo teardown against the next case's group construction.
+Semantic fused-projection factories retain a backlink to the live GTP shard
+and accept either logical model data or physical optimizer shards. Muon FP32
+masters and momentum are gathered, with CPU offload respected, split under the
+same query/key/value or GLU keys, and padded/sliced back on load. They must not
+fall back to an unsplit physical-shard checkpoint key.
 
-Ignored runtime objects are enumerated through
-`dist_checkpointing.serialization.load_sharded_metadata`, which includes saved
-`ShardedObject` coordinates as well as tensor metadata.
+With strict checkpoint loading, RNG/rerun objects explicitly excluded from
+runtime restoration are still loaded into temporary staging entries using
+their saved coordinates from
+`dist_checkpointing.serialization.load_sharded_metadata`. Reads are distributed
+across current ranks, and the entries are discarded before applying training
+state. Model/optimizer key and shard integrity validation remains unchanged,
+including rejection of extra model keys.
+
+### Regression coverage
+
+| Test | Contract |
+|---|---|
+| `generalized_tensor_parallel/test_kimi_latent_rmsnorm_gtp.py` | Padded/unpadded fused projections against native RMSNorm plus linear; output, input/scale/bias gradients, weight gradients, and replicated shapes; DP-mean and per-token-sum modes. |
+| `generalized_tensor_parallel/test_gtp_embedding_grad_precision.py` | Eight combinations of FP16/BF16, synchronous/asynchronous reduction, and the FP32-accumulation option against native embedding backward, with zero tolerance. |
+| `dist_checkpointing/test_gtp_semantic_runtime_state.py` | Bidirectional model/master/momentum resharding, CPU/GPU optimizer state, and strict loading of ignored runtime objects while rejecting unexpected model keys. |
+| `test_layer_wise_optimizer.py` | Owned-bucket versus sibling DDP policy and multiple synchronous/overlapped parameter updates. |
+| `training/models/test_dist_utils.py` | Parameter device and initial-value preservation before precision/DDP wrapping. |
+| `test_argument_utils.py` | Muon CLI precision choices match the optimizer backend. |
+
+Paths above are relative to `tests/unit_tests/`. Run distributed regressions on
+four GPUs in the prepared training environment. Strict FP32 references require
+`NVIDIA_TF32_OVERRIDE=0`, because TE's FP32 cuBLAS GEMM can select FAST_TF32
+independently of PyTorch's matmul precision setting. For example:
+
+```bash
+NVIDIA_TF32_OVERRIDE=0 TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 \
+  python -m torch.distributed.run --standalone --nproc-per-node=4 -m pytest -q \
+  tests/unit_tests/generalized_tensor_parallel/test_kimi_latent_rmsnorm_gtp.py
+```
+
+The strict semantic checkpoint regression retains one four-rank GTP grid
+across its parameterized cases. Each case recreates model/runtime objects;
+synchronized cleanup resets GTP state before the next case.
+
+### Recorded validation
+
+The complete 29-layer slim proxy ran on four H100 GPUs in BF16 with
+TP1/PP1/EP4/CP1, sequence length 4096, microbatch 1, and global batch 4.
+Both non-GTP and GTP4 strictly loaded a common iteration-1 model and full
+optimizer checkpoint and completed updates 2-101 using indexed mock data,
+learned routing, and fixed RNG restarts. First-loss error was zero; maximum
+and mean loss absolute errors were 0.0198536 and 0.00197576, passing the
+predeclared loss gates of 0.001 for the first error, 0.05 for the maximum,
+and 0.005 for the mean. Eight updates failed the additional gradient-norm
+gate `abs(error) <= 0.001 + 0.05 * abs(baseline)`. Full numerical parity and
+real-data convergence are therefore not claimed. A separate shared
+iteration-98 restart passed its three per-step gates without replacing or
+relaxing the original 100-update protocol.
+
+The nine-layer full-width proxy ran on 64 GB200 GPUs with MXFP8,
+TP1/PP1/EP64/CP1, sequence length 4096, microbatch 1, and global batch 4096.
+GTP8 uses `--tensor-parallel-num-weight-shards 8`,
+`--expert-tensor-parallel-num-weight-shards 1`, and the latent projection
+opt-in. Conventional activation sequence parallelism is disabled at TP1 in
+both layouts; GTP weight sharding remains active. Both arms execute 64
+microbatches per rank per update.
+
+After five warmup updates, the mean over updates 6-20 was 31.281 seconds for
+non-GTP and 39.006 seconds for GTP8 (+24.70%). Rank-0 peak allocated memory
+fell from 90.264 to 70.283 GiB (-22.14%); this includes warmup and is not the
+maximum over all ranks. Each layout has one unprofiled run with independent
+full-model initialization. Three-update Nsight captures of ranks 0 and 63
+identify additional GTP AllGather/ReduceScatter communication; instrumented
+timings are analyzed separately from unprofiled throughput.

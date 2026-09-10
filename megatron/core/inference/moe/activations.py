@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Padding-aware activation kernels for fused MoE.
 
 These kernels skip padding rows (where permutation_map == -1) to avoid

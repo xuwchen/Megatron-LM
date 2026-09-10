@@ -31,7 +31,9 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
 @pytest.mark.parametrize("per_token_loss", [False, True])
 @pytest.mark.parametrize("output_size", [80, 128])
 @pytest.mark.parametrize("bias", [False, True])
-def test_fused_latent_projection_matches_full_matrix(output_size, bias, per_token_loss, monkeypatch):
+def test_fused_latent_projection_matches_full_matrix(
+    output_size, bias, per_token_loss, monkeypatch
+):
     """Check padding, replicated norm/bias, forward, dgrad, and global wgrad."""
     # This standalone layer has no training driver to configure global GTP state.
     monkeypatch.setattr(GTP_CONFIG, "calculate_per_token_loss", per_token_loss)

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import replace
 from typing import Optional
@@ -74,6 +74,8 @@ def _split_tensor_factory(
 # non-SSM fused projections (the gated MLP fc1) can use them without importing ssm.
 # Re-exported here to keep the existing call sites and tests stable.
 from megatron.core.tensor_parallel.gtp_ckpt import (  # noqa: F401,E402  pylint: disable=C0413
-    _gtp_gather_rows_for_save,
-    _gtp_slice_rows_on_load,
+    _gtp_gather_rows_for_save as _gtp_gather_rows_for_save,
+)
+from megatron.core.tensor_parallel.gtp_ckpt import (
+    _gtp_slice_rows_on_load as _gtp_slice_rows_on_load,
 )

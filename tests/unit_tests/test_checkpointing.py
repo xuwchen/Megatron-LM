@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
 from types import SimpleNamespace
@@ -186,6 +186,8 @@ def test_load_args_restores_gdp_num_householder_from_checkpoint(
         restored_args, _ = load_args_from_checkpoint(args)
 
     assert restored_args.gdp_num_householder == expected_num_householder
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123

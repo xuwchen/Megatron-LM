@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fused MoE: permute -> FC1 -> activation -> FC2 -> unpermute.
 
 Supports BF16 weights with torch.nn.functional.grouped_mm.

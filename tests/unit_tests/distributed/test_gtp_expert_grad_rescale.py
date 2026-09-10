@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Cover the GTP/EGTP share of the DP normalization for expert gradients.
 
 GTP carves its ranks out of the data-parallel axis, so DDP's 1/DP scaling shrinks as GTP
