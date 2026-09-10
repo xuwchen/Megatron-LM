@@ -1095,8 +1095,10 @@ per-element order within a group, independently of bucket length or shard
 ownership; it does not promise equivalence for arbitrary hierarchical group
 decompositions. Native NCCL remains the default. Layout-invariance, cancellation,
 async lifetime and CLI regressions are in
-`tests/unit_tests/distributed/test_rank_ordered_grad_reduce.py`. Complete CW
-training parity and the overhead of this candidate are pending validation.
+`tests/unit_tests/distributed/test_rank_ordered_grad_reduce.py`. The communication-only candidate `e712704b96f0` completed the CW
+100-update comparison but failed 15 gradient-norm gates. Its first norm
+difference was 7.62939453125e-6 at iteration 3; fixed communication order alone
+is insufficient for the predeclared tolerance.
 
 
 ### FP32 gradient norms over fixed logical blocks
@@ -1110,5 +1112,36 @@ parameter exactly once. The square root and clipping coefficient remain FP32;
 the L2 definition and clipping threshold are unchanged. This option requires
 eager native optimizers, TP1/PP1 and FP32 gradients, and rejects FP64 norms,
 FSDP and precision-aware optimizers. It costs extra kernels and communication.
-Training validation is pending; rank-ordered communication alone failed the
-100-update CW gradient gate, with first norm divergence at iteration 3.
+The complete CW comparison passed at `03d7f00364a7af7ad7236c1b7750b4a0be36cca9`
+using both `--grad-reduce-in-rank-order` and `--grad-norm-in-fixed-order`, with
+both FP64 options false and the fixed FLA gate configuration above. It ran the
+full 29-layer slim proxy (58 hybrid entries), BF16, TP1/PP1/EP4/CP1, SL4096,
+MBS1/GBS4, on four H100 GPUs. Both arms restored the same iteration-1 full
+model/optimizer checkpoint and completed updates 2 through 101.
+
+| Recorded metric, all 100 updates | Maximum absolute difference | Result |
+|---|---:|---|
+| Loss | 0 | Pass: first/max/mean limits 0.001 / 0.05 / 0.005 |
+| Gradient norm | 0 | Pass: each step <= 0.001 + 0.05 * abs(non-GTP norm) |
+| Learning rate, batch size, consumed samples | 0 | Equal |
+
+Neither arm skipped updates or reported NaNs. Parameter-norm logging has
+maximum relative difference 1.502838700607613e-5 and is not an acceptance gate;
+this comparison does not assert bitwise equality of final checkpoint tensors.
+The loss and gradient-norm values above come from unrounded TensorBoard scalars.
+
+CW allocation `18264625`, node `pool0-01876`, ran non-GTP remote job
+`20260910-065630-cbf8` and GTP4 remote job `20260910-070402-6040`. All 888
+arguments and the fixed FLA launch-file hash were verified. The ordinary FP32
+fixed-gate failure and rank-ordered-communication-only failure remain separate
+failed results; these optional flags default to false.
+
+The fixed-norm GPU suite `tests/unit_tests/optimizer/test_fixed_grad_norm.py`
+passes all 17 cases on each of four H100 ranks in the CI image, including a
+native FP32 L2 reference, arbitrary shard boundaries, padding, empty ranks,
+invalid ownership, and CLI propagation. The unchanged communication helper
+passed its separate 17-case suite at `e712704b96f0`.
+
+Observed CW mean iteration times over steps 21-100 are 1516.16625 ms non-GTP
+and 2169.3325 ms GTP4. The new paths add communication and kernel overhead;
+OCI MXFP8 Nsight performance has not been re-measured for this configuration.
