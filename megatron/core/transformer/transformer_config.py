@@ -301,7 +301,10 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to run real-time tests."""
 
     grad_reduce_in_fp64: bool = False
-    """Use FP64 gradient communication, including replicated GTP parameter gradients."""
+    """Use FP64 gradient communication, including replicated GTP parameter gradients,
+    and round once into FP32 gradient buffers. For numerical layout comparisons;
+    doubles communication bytes and uses temporary FP64 buffers. Requires native
+    DDP, eager execution, and one distributed optimizer instance."""
 
     calculate_per_token_loss: bool = False
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the

@@ -4372,14 +4372,6 @@ def _add_distributed_args(parser):
         help='Accumulate gradient norms in FP64 while keeping optimizer gradients in FP32.',
     )
     group.add_argument(
-        '--grad-reduce-in-fp64',
-        action='store_true',
-        default=False,
-        help='Use FP64 gradient communication and round once into FP32 gradient buffers. '
-        'For numerical comparisons across sharding layouts; doubles communication bytes and '
-        'uses temporary FP64 buffers. Native DDP, eager execution, and one DistOpt instance only.',
-    )
-    group.add_argument(
         '--ddp-reduce-scatter-with-fp32-accumulation',
         action='store_true',
         default=False,

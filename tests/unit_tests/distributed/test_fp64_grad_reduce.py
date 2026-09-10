@@ -2,6 +2,7 @@
 
 """GPU numerical references for gradient communication and norm accumulation."""
 
+import argparse
 import itertools
 import math
 
@@ -16,6 +17,7 @@ from megatron.core.distributed.fp64_grad_reduce import (
     reduce_scatter_fp64,
 )
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.training.arguments import add_megatron_arguments
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -129,3 +131,12 @@ def test_collective_rejects_wrong_storage_dtype():
             op=dist.ReduceOp.SUM,
             group=dist.group.WORLD,
         )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_training_cli_precision_options(enabled):
+    parser = add_megatron_arguments(argparse.ArgumentParser())
+    argv = ["--grad-reduce-in-fp64", "--grad-norm-in-fp64"] if enabled else []
+    args = parser.parse_args(argv)
+    assert args.grad_reduce_in_fp64 is enabled
+    assert args.grad_norm_in_fp64 is enabled
