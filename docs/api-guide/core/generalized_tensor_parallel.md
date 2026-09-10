@@ -989,8 +989,9 @@ synchronized cleanup resets GTP state before the next case.
 
 ### Recorded validation
 
-The complete 29-layer slim proxy ran on four H100 GPUs in BF16 with
-TP1/PP1/EP4/CP1, sequence length 4096, microbatch 1, and global batch 4.
+The original FP32-reduction comparison ran the complete 29-layer slim proxy
+on four H100 GPUs in BF16 with TP1/PP1/EP4/CP1, sequence length 4096,
+microbatch 1, and global batch 4.
 Both non-GTP and GTP4 strictly loaded a common iteration-1 model and full
 optimizer checkpoint and completed updates 2-101 using indexed mock data,
 learned routing, and fixed RNG restarts. First-loss error was zero; maximum
@@ -998,8 +999,8 @@ and mean loss absolute errors were 0.0198536 and 0.00197576, passing the
 predeclared loss gates of 0.001 for the first error, 0.05 for the maximum,
 and 0.005 for the mean. Eight updates failed the additional gradient-norm
 gate `abs(error) <= 0.001 + 0.05 * abs(baseline)`. Full numerical parity and
-real-data convergence are therefore not claimed. A separate shared
-iteration-98 restart passed its three per-step gates without replacing or
+real-data convergence are therefore not claimed for that original configuration.
+A separate shared iteration-98 restart passed its three per-step gates without replacing or
 relaxing the original 100-update protocol.
 
 The nine-layer full-width proxy ran on 64 GB200 GPUs with MXFP8,
@@ -1040,8 +1041,8 @@ CW diagnostics found identical pre-communication local gradients but different
 FP32 collective results in non-GTP and GTP4. An independent FP64 communication
 reference removed all sampled first-update differences through Muon and BF16
 rounding. Subsequent updates exposed additional norm-reduction rounding. These
-observations motivate the explicit controls; full-model validation of the
-production implementation is still pending.
+observations motivate the explicit controls. Complete validation also requires
+the fixed FLA gate configuration described below.
 
 FLA 0.5.2 also autotunes the KDA gate-backward warp count. Fixed-input H100
 probes show that changing this count changes the FP32 `A_log` reduction while
@@ -1051,4 +1052,11 @@ comparison example in `examples/kimi_k3/fla_h100/` uses FLA's supported cache
 interface to keep gate backward at four warps and two stages across both
 layouts. This is separate from the FP64 communication/norm controls. The
 first 100-update pair with only those two controls still failed 12 gradient
-gates, despite passing its loss gates; fixed-gate full validation is pending.
+gates, despite passing its loss gates. The fixed-gate pair at `7151de992a00`
+completed all 100 updates (2–101) and passed every original gate. Loss and
+gradient-norm TensorBoard scalars matched at every update; LR/batch/sample
+counters matched, with zero skipped or NaN updates. Parameter-norm statistics
+retained maximum absolute/relative differences 0.019165 / 1.493e-5 and were
+not an acceptance gate. This result does not claim bitwise identity of all
+final model/optimizer state, ordinary FP32-mode parity, or OCI performance
+validation of these precision controls.

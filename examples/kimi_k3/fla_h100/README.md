@@ -21,5 +21,10 @@ change the gate equation or disable its gradient computation. Keep FLA 0.5.2
 pinned, since the cache schema and kernel names are dependency interfaces.
 
 The accompanying GTP comparison also uses explicit FP64 gradient communication
-and gradient-norm accumulation. Its complete 100-update validation is pending;
-fixing the gate launch configuration alone is not a parity result.
+and gradient-norm accumulation. Together, these controls passed the complete
+100-update CW comparison: loss and gradient-norm TensorBoard scalars matched
+at every update, with zero skipped
+or NaN updates. This validates this explicit comparison mode, not default FP32
+communication or bitwise identity of every final state. Parameter-norm statistics
+retained a maximum relative difference of 1.493e-5. Fixing the gate launch
+configuration alone has not been validated as a sufficient condition.
