@@ -12,6 +12,9 @@ from ..utils import is_torch_min_version
 class DistributedDataParallelConfig:
     """Configuration for DistributedDataParallel."""
 
+    grad_reduce_in_fp64: bool = False
+    """Use FP64 gradient communication with FP32 local accumulation and storage."""
+
     grad_reduce_in_fp32: bool = False
     """If true, reduce grads in fp32."""
 
@@ -308,6 +311,13 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.grad_reduce_in_fp64:
+            if not self.grad_reduce_in_fp32:
+                raise ValueError("grad_reduce_in_fp64 requires FP32 gradient buffers")
+            if self.num_distributed_optimizer_instances != 1:
+                raise ValueError("grad_reduce_in_fp64 supports one distributed optimizer instance")
+            if self.use_megatron_fsdp or self.reduce_scatter_with_fp32_accumulation:
+                raise ValueError("grad_reduce_in_fp64 requires native DDP gradient communication")
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 

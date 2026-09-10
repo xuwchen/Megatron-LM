@@ -453,6 +453,7 @@ class GTPRematConfig:
     # same-key writers may need more slots to keep all in-flight RS inputs distinct.
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
+    grad_reduce_in_fp64: bool = False
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -484,6 +485,7 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
+    grad_reduce_in_fp64=False,
     pad_for_alignment=None,
 ):
     """
@@ -497,6 +499,7 @@ def configure_gtp_remat_from_recipe(
         calculate_per_token_loss=calculate_per_token_loss,
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
+        grad_reduce_in_fp64=grad_reduce_in_fp64,
     )
     # An explicit value wins over the recipe default. The alignment pad is otherwise
     # unreachable from the training flow: only these three quantized branches set it,
@@ -2102,6 +2105,33 @@ class GTPShardedParam(torch.nn.Parameter):
             rs_ctx = nullcontext()
 
         with rs_ctx:
+            if GTP_CONFIG.grad_reduce_in_fp64:
+                from megatron.core.distributed.fp64_grad_reduce import (
+                    GradientReductionWorkGroup,
+                    reduce_scatter_fp64,
+                )
+
+                outputs, works = [], []
+                for out_buffer, tensor in zip(out_buffers, wgrads):
+                    if out_buffer is None:
+                        shape = (tensor.shape[0] // self.group.size(), *tensor.shape[1:])
+                        out_buffer = torch.empty(shape, device=tensor.device, dtype=tensor.dtype)
+                    works.append(
+                        reduce_scatter_fp64(
+                            out_buffer,
+                            tensor,
+                            op=torch.distributed.ReduceOp.SUM,
+                            group=self.group,
+                            async_op=async_op,
+                        )
+                    )
+                    outputs.append(out_buffer)
+                return (
+                    outputs,
+                    GradientReductionWorkGroup(works) if async_op else None,
+                    release_bufs,
+                )
+
             # fp32-accum all-to-all: skipped at size <= 2 and on symm-registered groups.
             if (
                 GTP_CONFIG.reduce_scatter_with_fp32_accumulation

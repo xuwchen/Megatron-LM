@@ -300,6 +300,9 @@ class TransformerConfig(ModelParallelConfig):
     test_mode: bool = False
     """Whether to run real-time tests."""
 
+    grad_reduce_in_fp64: bool = False
+    """Use FP64 gradient communication, including replicated GTP parameter gradients."""
+
     calculate_per_token_loss: bool = False
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""

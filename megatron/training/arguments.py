@@ -1368,6 +1368,19 @@ def validate_args(args, defaults={}):
                     "--accumulate-allreduce-grads-in-fp32 already reduces in fp32"
                 )
 
+    if getattr(args, 'grad_reduce_in_fp64', False):
+        assert (
+            args.accumulate_allreduce_grads_in_fp32
+        ), "--grad-reduce-in-fp64 requires --accumulate-allreduce-grads-in-fp32"
+        assert args.main_grads_dtype == torch.float32
+        assert args.cuda_graph_impl == "none", "--grad-reduce-in-fp64 requires eager execution"
+        assert (
+            not args.use_megatron_fsdp and not args.use_torch_fsdp2
+        ), "--grad-reduce-in-fp64 supports native DDP only"
+        assert args.num_distributed_optimizer_instances == 1
+        assert not getattr(args, 'gtp_remat_nccl_ub', False)
+        assert not getattr(args, 'gtp_expert_remat_nccl_ub', False)
+
     if args.cuda_graph_impl == "full_iteration":
         assert (
             not args.check_for_nan_in_loss_and_grad
@@ -4351,6 +4364,20 @@ def _add_distributed_args(parser):
         'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
         'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
         'apparently needs to be divisible by a power of 2 for high busbw.',
+    )
+    group.add_argument(
+        '--grad-norm-in-fp64',
+        action='store_true',
+        default=False,
+        help='Accumulate gradient norms in FP64 while keeping optimizer gradients in FP32.',
+    )
+    group.add_argument(
+        '--grad-reduce-in-fp64',
+        action='store_true',
+        default=False,
+        help='Use FP64 gradient communication and round once into FP32 gradient buffers. '
+        'For numerical comparisons across sharding layouts; doubles communication bytes and '
+        'uses temporary FP64 buffers. Native DDP, eager execution, and one DistOpt instance only.',
     )
     group.add_argument(
         '--ddp-reduce-scatter-with-fp32-accumulation',

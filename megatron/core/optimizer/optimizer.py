@@ -442,7 +442,9 @@ class MegatronOptimizer(ABC):
         """Compute and return grad norm."""
         grads_for_norm = self.get_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm,
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+            use_fp64=self.config.grad_norm_in_fp64,
         )
         return total_norm
 
@@ -454,7 +456,9 @@ class MegatronOptimizer(ABC):
             if self.has_grad_norm_group(grad_norm_group):
                 grouped_grads = self.get_grads_for_grad_norm(grad_norm_group)
                 group_grad_norm = get_grad_norm_fp32(
-                    grouped_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+                    grouped_grads,
+                    grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+                    use_fp64=self.config.grad_norm_in_fp64,
                 )
                 self.grad_norms_by_group[grad_norm_group] = group_grad_norm
         return self.grad_norms_by_group
@@ -472,7 +476,9 @@ class MegatronOptimizer(ABC):
         else:
             grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm,
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+            use_fp64=self.config.grad_norm_in_fp64,
         )
 
         if clip_grad > 0.0 and params:
@@ -2076,7 +2082,9 @@ class ChainedOptimizer(MegatronOptimizer):
             for optimizer in self.chained_optimizers:
                 grads_for_norm += optimizer.get_grads_for_grad_norm()
             grad_norm = get_grad_norm_fp32(
-                grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+                grads_for_norm,
+                grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+                use_fp64=self.config.grad_norm_in_fp64,
             )
         else:
             grad_norms = []
@@ -2139,7 +2147,9 @@ class ChainedOptimizer(MegatronOptimizer):
             for optimizer in self.chained_optimizers:
                 grouped_grads += optimizer.get_grads_for_grad_norm(grad_norm_group)
             return get_grad_norm_fp32(
-                grouped_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+                grouped_grads,
+                grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+                use_fp64=self.config.grad_norm_in_fp64,
             )
         else:
             group_norms = []
@@ -2148,6 +2158,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 norm = get_grad_norm_fp32(
                     grouped_grads,
                     grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),
+                    use_fp64=optimizer.config.grad_norm_in_fp64,
                 )
                 group_norms.append(norm if norm else 0.0)
             return math.sqrt(sum([x**2 for x in group_norms]))

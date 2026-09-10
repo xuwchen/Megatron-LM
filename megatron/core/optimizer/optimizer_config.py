@@ -392,6 +392,9 @@ class OptimizerConfig:
     ################
     # Miscellaneous
     ################
+    grad_norm_in_fp64: bool = False
+    """Accumulate gradient norms in FP64 for comparisons across optimizer layouts."""
+
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""
 

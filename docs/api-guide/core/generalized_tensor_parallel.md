@@ -1017,3 +1017,28 @@ maximum over all ranks. Each layout has one unprofiled run with independent
 full-model initialization. Three-update Nsight captures of ranks 0 and 63
 identify additional GTP AllGather/ReduceScatter communication; instrumented
 timings are analyzed separately from unprofiled throughput.
+
+### Optional precision controls for layout comparisons
+
+`--grad-reduce-in-fp64` stages native DDP and GTP gradient collectives in FP64,
+then rounds each completed result into its normal FP32 gradient destination.
+It also covers gradients of replicated GTP parameters. Local wgrad computation,
+BF16 model weights, FP32 optimizer states, and loss normalization are unchanged.
+The option doubles gradient communication bytes and requires temporary FP64
+buffers; it is intended for numerical investigations, not default benchmarking.
+Its current scope is eager native DDP with one distributed optimizer instance,
+without GTP symmetric-memory registration. Unsupported configurations fail validation.
+
+`--grad-norm-in-fp64` independently computes gradient-norm powers and reductions
+in FP64 before clipping. It covers ordinary, chained, and LayerWise optimizers,
+including separate clipping groups. It returns a Python scalar so clipping uses
+the existing scalar-coefficient kernel. Both flags default to false. Neither
+option promises bitwise equivalence for arbitrary changes to the model's local
+compute kernels or parallel topology.
+
+CW diagnostics found identical pre-communication local gradients but different
+FP32 collective results in non-GTP and GTP4. An independent FP64 communication
+reference removed all sampled first-update differences through Muon and BF16
+rounding. Subsequent updates exposed additional norm-reduction rounding. These
+observations motivate the explicit controls; full-model validation of the
+production implementation is still pending.

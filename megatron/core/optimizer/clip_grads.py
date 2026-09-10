@@ -60,6 +60,7 @@ def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    use_fp64: bool = False,
 ) -> float:
     """Calculate the p-norm of gradients in FP32 precision.
 
@@ -77,6 +78,8 @@ def get_grad_norm_fp32(
         grad_stats_parallel_group (ProcessGroup, optional): The process group
             used for reducing gradient statistics (e.g., norms and zero counts).
 
+        use_fp64 (bool): Accumulate norm reductions in FP64 and return a Python scalar.
+
     Returns:
         float: The total norm of the parameters, treated as a single vector.
     """
@@ -89,6 +92,23 @@ def get_grad_norm_fp32(
         data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
 
     grads_for_norm = [to_local_if_dtensor(grad) for grad in grads_for_norm]
+
+    # FP64 is an explicit numerical-validation option. Keep this separate from
+    # the default fused FP32 path, including its scalar/tensor return convention.
+    if use_fp64 and float(norm_type) != inf:
+        total_power = torch.zeros((), dtype=torch.float64, device='cuda')
+        for grad in grads_for_norm:
+            total_power.add_(grad.double().abs().pow(float(norm_type)).sum())
+        if data_parallel_group:
+            torch.distributed.all_reduce(
+                total_power, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
+            )
+        torch.distributed.all_reduce(
+            total_power, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+        )
+        # A Python scalar selects the supported scalar clipping kernel; the TE
+        # tensor-coefficient kernel expects an FP32 coefficient tensor.
+        return total_power.item() ** (1.0 / float(norm_type))
 
     # Norm parameters.
     norm_type = float(norm_type)
