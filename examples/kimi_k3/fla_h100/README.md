@@ -20,11 +20,17 @@ sequence length 4096), not a general performance recommendation. It does not
 change the gate equation or disable its gradient computation. Keep FLA 0.5.2
 pinned, since the cache schema and kernel names are dependency interfaces.
 
-The accompanying GTP comparison also uses explicit FP64 gradient communication
-and gradient-norm accumulation. Together, these controls passed the complete
-100-update CW comparison: loss and gradient-norm TensorBoard scalars matched
-at every update, with zero skipped
-or NaN updates. This validates this explicit comparison mode, not default FP32
-communication or bitwise identity of every final state. Parameter-norm statistics
-retained a maximum relative difference of 1.493e-5. Fixing the gate launch
-configuration alone has not been validated as a sufficient condition.
+The current comparison uses ordinary FP32 gradient communication and norm
+accumulation: leave `--grad-reduce-in-fp64` and `--grad-norm-in-fp64` disabled
+(their defaults). A complete 100-update CW pair with this fixed gate setting
+and both FP64 flags false passed its loss gates but failed 10 gradient-norm
+gates. Maximum/mean loss absolute errors were 0.0198536 / 0.00208606, and the
+maximum norm error relative to baseline was 9.7567%. Fixing this kernel alone
+is therefore insufficient for the original per-update norm gate of
+`0.001 + 0.05 * abs(baseline)`.
+
+A historical pair using both FP64 controls together with this kernel setting
+matched recorded loss and gradient-norm scalars across 100 updates. That
+conditional diagnostic pass does not establish ordinary FP32-mode parity or
+bitwise identity of every final state. These kernel settings have only been
+examined on the CW H100 proxy and are not validated OCI performance settings.

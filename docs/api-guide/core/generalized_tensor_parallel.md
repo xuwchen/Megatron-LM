@@ -1060,3 +1060,19 @@ retained maximum absolute/relative differences 0.019165 / 1.493e-5 and were
 not an acceptance gate. This result does not claim bitwise identity of all
 final model/optimizer state, ordinary FP32-mode parity, or OCI performance
 validation of these precision controls.
+
+
+### Ordinary FP32 with a fixed FLA gate
+
+The subsequent full 100-update comparison at `3fe55c73da2f` kept the fixed
+FLA gate setting but explicitly disabled both FP64 controls. Both layouts
+completed updates 2–101 from the same model and full optimizer checkpoint,
+with all workload arguments matching apart from layout and output paths.
+First/max/mean loss absolute errors were 0 / 0.0198536 / 0.00208606, passing
+the original loss gates. Ten gradient-norm gates failed at iterations 38, 44,
+66, 78, 80, 86, 93, 94, 98 and 100. The largest error relative to baseline
+was 9.7567%, at iteration 78, against the unchanged allowance of
+`0.001 + 0.05 * abs(baseline)`. All sample/LR/batch counters matched and no
+updates were skipped or NaN. This ordinary FP32 mode remains unaligned under
+that complete protocol; fixing the FLA gate configuration alone is insufficient.
+The historical FP64 diagnostic pass does not meet the ordinary FP32 requirement.
