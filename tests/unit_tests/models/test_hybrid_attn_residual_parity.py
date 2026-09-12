@@ -76,11 +76,17 @@ def _native_aggregate(values, query, norm_weight, eps):
     return (scores.softmax(-1).unsqueeze(-2) @ vf).squeeze(-2).to(values.dtype)
 
 
+@pytest.mark.parametrize("native_precision", [False, True])
 @pytest.mark.parametrize("layer_number", [1, 2])
 @pytest.mark.parametrize("fused_bda", [False, True])
 @pytest.mark.parametrize("training", [False, True])
-def test_hybrid_partial_matches_native(layer_number, fused_bda, training):
+def test_hybrid_partial_matches_native(
+    layer_number, fused_bda, training, native_precision
+):
     config = _config(
+        rmsnorm_impl="torch" if native_precision else "te",
+        attn_res_impl="torch" if native_precision else "eager",
+        native_situ_glu=native_precision,
         enable_attention_residuals=True,
         attn_res_block_layers=24,
         activation_func=situlu,
@@ -107,19 +113,27 @@ def test_hybrid_partial_matches_native(layer_number, fused_bda, training):
     ]
     assert set(params) == set(names)
     ref = {name: params[name].detach().clone().requires_grad_(True) for name in names}
-    source = torch.randn(128, 1, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    partial = source if layer_number == 1 else torch.randn_like(source, requires_grad=True)
+    source = torch.randn(
+        128, 1, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    partial = (
+        source if layer_number == 1 else torch.randn_like(source, requires_grad=True)
+    )
     rsource = source.detach().clone().requires_grad_(True)
-    rpartial = rsource if layer_number == 1 else partial.detach().clone().requires_grad_(True)
+    rpartial = (
+        rsource if layer_number == 1 else partial.detach().clone().requires_grad_(True)
+    )
     values = [rsource] if layer_number == 1 else [rsource, rpartial]
     aggregated = _native_aggregate(values, ref[names[0]], ref[names[1]], 1e-5)
     normalized = aggregated.float()
-    normalized = normalized * torch.rsqrt(normalized.square().mean(-1, keepdim=True) + 1e-5)
+    normalized = normalized * torch.rsqrt(
+        normalized.square().mean(-1, keepdim=True) + 1e-5
+    )
     normalized = normalized.to(aggregated.dtype) * ref[names[2]]
     gate, up = F.linear(normalized, ref[names[3]]).float().chunk(2, -1)
-    activated = (4 * torch.tanh(gate / 4) * torch.sigmoid(gate) * (25 * torch.tanh(up / 25))).to(
-        torch.bfloat16
-    )
+    activated = (
+        4 * torch.tanh(gate / 4) * torch.sigmoid(gate) * (25 * torch.tanh(up / 25))
+    ).to(torch.bfloat16)
     branch = F.linear(activated, ref[names[4]])
     expected = branch if layer_number == 1 else rpartial + branch
     raw = []
@@ -172,21 +186,31 @@ def test_kda_gated_norm_matches_native(deterministic, zero_centered):
     ).cuda()
     with torch.no_grad():
         layer.out_norm.weight.normal_(mean=0.0 if zero_centered else 1.0, std=0.1)
-    x = torch.randn(1, 128, 32, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x = torch.randn(
+        1, 128, 32, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
     gate = torch.randn_like(x, requires_grad=True)
     rx = x.detach().clone().requires_grad_(True)
     rg = gate.detach().clone().requires_grad_(True)
     rw = layer.out_norm.weight.detach().clone().requires_grad_(True)
     effective_weight = rw + 1 if zero_centered else rw
     rf = rx.float()
-    normalized = rf * torch.rsqrt(rf.square().mean(-1, keepdim=True) + config.layernorm_epsilon)
-    expected = (normalized * effective_weight.float() * torch.sigmoid(rg.float())).to(x.dtype)
+    normalized = rf * torch.rsqrt(
+        rf.square().mean(-1, keepdim=True) + config.layernorm_epsilon
+    )
+    expected = (normalized * effective_weight.float() * torch.sigmoid(rg.float())).to(
+        x.dtype
+    )
     actual = layer._apply_gated_norm(x, gate).view_as(expected)
     _assert_similarity(actual, expected, relative_l2=0.0005)
     upstream = torch.randn_like(actual)
     actual.backward(upstream)
     expected.backward(upstream)
-    for a, b in [(x.grad, rx.grad), (gate.grad, rg.grad), (layer.out_norm.weight.grad, rw.grad)]:
+    for a, b in [
+        (x.grad, rx.grad),
+        (gate.grad, rg.grad),
+        (layer.out_norm.weight.grad, rw.grad),
+    ]:
         _assert_similarity(a, b)
 
 
@@ -214,27 +238,34 @@ def test_native_rmsnorm_linear_parity(kind, zero_centered):
         )
         if kind == "column":
             layer = TELayerNormColumnParallelLinear(
-                1024, 2048, gather_output=False, is_expert=False, pg_collection=pgc, **kwargs
+                1024,
+                2048,
+                gather_output=False,
+                is_expert=False,
+                pg_collection=pgc,
+                **kwargs,
             ).cuda()
         else:
             layer = TERMSNormDuplicatedLinear(
                 1024, 2048, parallel_mode="duplicated", **kwargs
             ).cuda()
         norm = layer.layer_norm_weight
-        assert 'layer_norm_weight' in layer.state_dict()
-        assert 'weight' in layer.state_dict()
+        assert "layer_norm_weight" in layer.state_dict()
+        assert "weight" in layer.state_dict()
     assert norm.tensor_model_parallel is False
     with torch.no_grad():
         norm.add_(torch.randn_like(norm) * 0.05)
     ref_norm = norm.detach().clone().requires_grad_()
-    x = torch.randn(128, 1, 1024, dtype=torch.bfloat16, device='cuda', requires_grad=True)
+    x = torch.randn(
+        128, 1, 1024, dtype=torch.bfloat16, device="cuda", requires_grad=True
+    )
     ref_x = x.detach().clone().requires_grad_()
     xf = ref_x.float()
     normalized = (
         xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + config.layernorm_epsilon)
     ).to(ref_x.dtype)
     expected = normalized * (ref_norm + 1 if zero_centered else ref_norm)
-    if kind != 'norm':
+    if kind != "norm":
         ref_weight = layer.weight.detach().clone().requires_grad_()
         expected = F.linear(expected, ref_weight)
         actual, _ = layer(x)
@@ -246,5 +277,5 @@ def test_native_rmsnorm_linear_parity(kind, zero_centered):
     expected.backward(dy)
     _assert_similarity(x.grad, ref_x.grad)
     _assert_similarity(norm.grad, ref_norm.grad)
-    if kind != 'norm':
+    if kind != "norm":
         _assert_similarity(layer.weight.grad, ref_weight.grad)
