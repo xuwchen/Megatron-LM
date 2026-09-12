@@ -1,0 +1,36 @@
+# BF16 HF parity with native arithmetic ordering and FlashAttention 2.
+ARGS:
+  transformer_impl: transformer_engine
+  attention_backend: flash
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  expert_model_parallel_size: 4
+  expert_tensor_parallel_size: 1
+  context_parallel_size: 1
+  distributed_backend: nccl
+  moe_token_dispatcher_type: alltoall
+  moe_grouped_gemm: true
+  bf16: true
+  seq_length: 4096
+  micro_batch_size: 1
+  global_batch_size: 4
+  seed: 20260821
+  ckpt_format: torch_dist
+  grad_reduce_in_fp64: false
+  grad_norm_in_fp64: false
+  grad_reduce_in_rank_order: false
+  grad_norm_in_fixed_order: false
+  use_cpu_initialization: true
+  tensor_parallel_num_weight_shards: 4
+  expert_tensor_parallel_num_weight_shards: 1
+  sequence_parallel: true
+  gtp_remat_reduce_scatter_with_fp32_accumulation: true
+  gtp_remat_opt_in_modules: [moe_latent_proj]
+  rmsnorm_impl: torch
+  attn_res_impl: torch
+  native_situ_glu: true
+  use_te_activation_func: false
+  use_transformer_engine_op_fuser: false
+  moe_router_use_torch_linear: true
+  moe_router_dtype: fp32
+  moe_apply_probs_on_output: true

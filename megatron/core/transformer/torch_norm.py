@@ -114,7 +114,9 @@ class L2Norm(torch.nn.Module, LayerNormInterface):
         return self._norm(x)
 
 
-def native_rms_norm(x, weight, eps, zero_centered_gamma=False):
+def native_rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, zero_centered_gamma: bool = False
+) -> torch.Tensor:
     """Normalize in FP32, round to input dtype, then apply the learned scale."""
     xf = x.float()
     normalized = (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)).to(x.dtype)
@@ -125,7 +127,7 @@ def native_rms_norm(x, weight, eps, zero_centered_gamma=False):
 class NativeRMSNorm(torch.nn.Module):
     """Autograd RMSNorm preserving native PyTorch cast and multiplication order."""
 
-    def __init__(self, config, hidden_size, eps=1e-5):
+    def __init__(self, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
         self.zero_centered_gamma = config.layernorm_zero_centered_gamma
@@ -142,6 +144,6 @@ class NativeRMSNorm(torch.nn.Module):
         self.weight.allreduce = True
         self.weight.tensor_model_parallel = False
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply native normalization and scale with full autograd support."""
         return native_rms_norm(x, self.weight, self.eps, self.zero_centered_gamma)

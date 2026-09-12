@@ -1189,3 +1189,54 @@ SM occupancy or network bandwidth. This short performance diagnostic does not
 establish numerical parity for native-FP32 MXFP8 or benchmark the fixed-order
 accuracy paths on OCI. Artifacts are retained in the development toolkit's
 `runtime/gtp_kimi_k3/perf_bottleneck/`, including raw reports and hashed manifests.
+
+
+### Kimi-K3 BF16 HF reference parity (2026-09-11)
+
+The production arithmetic at `822b8c3b7` passes the Kimi kit's original
+cosine >= 0.999 and relative-L2 <= 0.01 gates with GTP4/EP4 on four CW H100s.
+The reference is pinned HF Kimi-K3 revision
+`a590ce090cb049c93a33dfe8c208ec652aa20503`, using an HF-native random
+29-layer slim checkpoint (seed 20260821, H1024, 32 experts). This is not a
+pretrained checkpoint or a full-width 9-layer performance proxy. Inputs are
+random BF16 embeddings; tokenization and embedding lookup are outside the test.
+
+| Check | SL128 relative L2 | SL4096 relative L2 |
+|---|---:|---:|
+| Natural routing, complete logits | 0 | 0 |
+| HF top-k replay, complete logits | 0 | 0 |
+
+At SL4096, 59 component cases pass. Maximum component output relative L2 is
+0.000145827 and maximum input-gradient relative L2 is 0.003150032. E2E is
+forward-only because the HF routed-MoE reference uses a no-grad inference
+path. Component input gradients and native unit parameter gradients do not
+establish HF end-to-end training-gradient or optimizer parity.
+
+The opt-in precision recipe is
+`examples/kimi_k3/hf_parity_gtp4.yaml`, in the kit's `ARGS` format. It selects:
+
+- `rmsnorm_impl=torch`: normalize in FP32, cast to BF16, then multiply scale;
+  norm/linear modules retain checkpoint keys and the TE/GTP linear operation.
+- `attn_res_impl=torch`: native normalized-key scoring and batched depth
+  aggregation, with ordinary autograd.
+- `native_situ_glu=true`: retain native FP32 pointwise operation ordering;
+  TE activation, bias/activation fusion, and the TE operation fuser are disabled.
+- `moe_router_use_torch_linear=true` and `moe_router_dtype=fp32`: use FP32
+  operands for the router linear operation.
+- `moe_apply_probs_on_output=true`: apply probabilities after expert FC2 and
+  combine in FP32, then cast back before latent up normalization.
+- `attention_backend=flash`, with FlashAttention 2 enabled on both sides
+  (`NVTE_FLASH_ATTN_V2=1`, `NVTE_FLASH_ATTN_V3=0`, `NVTE_FLASH_ATTN_V4=0`).
+
+The branch also corrects BF16 loss of information from subtracting an
+aggregated residual after addition, and fuses KDA output norm/gate before the
+BF16 cast. Acceptance uses production code without diagnostic replacements.
+All four ranks audit 254 actual GTP parameters. Both FP64 communication and
+training norm flags remain false; fixed-order training reduction/norm flags
+are not required for this forward comparison.
+
+Native arithmetic costs additional kernels and autograd storage. FP32 expert
+output all-to-all communication doubles its payload versus BF16. These controls
+are currently for unquantized all-to-all MoE and default off. Prior training
+and MXFP8 performance results above describe earlier arithmetic/configurations;
+they do not establish this precision recipe's optimizer parity or throughput.
