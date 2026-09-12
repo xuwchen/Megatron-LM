@@ -903,6 +903,24 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
     """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
 
+    moe_router_use_torch_linear: bool = False
+    """Use torch linear with operands cast to moe_router_dtype. This retains the
+    native FP32 reduction order for reference parity, at additional activation memory cost."""
+
+    rmsnorm_impl: Literal['te', 'torch'] = 'te'
+    """RMSNorm implementation. The torch path normalizes in FP32, casts to the
+    input dtype, then applies the scale. It also separates fused norm/linear modules
+    while preserving parameter names and linear parallelism."""
+
+    native_situ_glu: bool = False
+    """Evaluate SiTU-GLU with unfused native FP32 pointwise operations, retaining
+    their rounding order. Requires TE activation and bias/activation fusion disabled."""
+
+    moe_apply_probs_on_output: bool = False
+    """Weight complete expert outputs in FP32 and combine in FP32 before casting
+    back to params_dtype. This increases all-to-all communication volume for BF16/FP16;
+    currently supports the alltoall dispatcher with FP32 router probabilities."""
+
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
@@ -1386,7 +1404,8 @@ class TransformerConfig(ModelParallelConfig):
     Function built from plain PyTorch ops) or 'compile' (a plain PyTorch forward wrapped in
     torch.compile, with AOTAutograd generating its backward and one specialization per depth
     arity; falls back to the eager custom Function with a warning if compilation is unavailable),
-    or 'fla' (FLA's three-kernel fused training implementation with checkpoint_level=1; requires
+    or 'torch' (native RMSNorm-then-dot and batched source reduction, with extra
+    FP32 activation storage for autograd), or 'fla' (FLA's three-kernel fused training implementation with checkpoint_level=1; requires
     flash-linear-attention). The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall
     per aggregation on GB200 at small hidden sizes — so 'fla' is recommended when the optional
     dependency is installed, with 'compile' as the dependency-free optimized path."""
@@ -1651,9 +1670,9 @@ class TransformerConfig(ModelParallelConfig):
                 "enable_attention_residuals requires attn_res_block_layers to be a "
                 f"positive integer, got {self.attn_res_block_layers!r}."
             )
-        if self.attn_res_impl not in ("eager", "compile", "fla"):
+        if self.attn_res_impl not in ("eager", "compile", "fla", "torch"):
             raise ValueError(
-                "attn_res_impl must be 'eager', 'compile', or 'fla', "
+                "attn_res_impl must be 'eager', 'compile', 'fla', or 'torch', "
                 f"got {self.attn_res_impl!r}."
             )
         unsupported = []
@@ -1751,6 +1770,34 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.rmsnorm_impl not in ('te', 'torch'):
+            raise ValueError("rmsnorm_impl must be 'te' or 'torch'.")
+        if self.rmsnorm_impl == 'torch':
+            if self.normalization != 'RMSNorm' or self.fused_residual_rmsnorm:
+                raise ValueError(
+                    "Torch RMSNorm requires RMSNorm without fused residual normalization."
+                )
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError("Torch RMSNorm does not support the TE operation fuser.")
+        if self.native_situ_glu and (
+            self.use_te_activation_func
+            or self.bias_activation_fusion
+            or self.use_transformer_engine_op_fuser
+        ):
+            raise ValueError(
+                "Native SiTU-GLU requires TE activation, bias activation, and operation fusion disabled."
+            )
+        if self.moe_router_use_torch_linear and self.moe_router_dtype != 'fp32':
+            raise ValueError("Torch router linear currently requires moe_router_dtype='fp32'.")
+        if self.moe_apply_probs_on_output:
+            if self.moe_apply_probs_on_input:
+                raise ValueError("MoE probabilities cannot be applied on both input and output.")
+            if self.moe_token_dispatcher_type != 'alltoall' or self.moe_router_dtype != 'fp32':
+                raise ValueError("Output MoE probabilities require alltoall and FP32 routing.")
+            if self.fp8 or self.fp4:
+                raise ValueError(
+                    "Output MoE probability weighting currently supports unquantized training only."
+                )
 
         # Imported lazily because the module-spec module imports TransformerConfig.
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (

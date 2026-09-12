@@ -53,7 +53,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.torch_norm import LayerNormInterface
+from megatron.core.transformer.torch_norm import LayerNormInterface, NativeRMSNorm, native_rms_norm
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -842,6 +842,9 @@ class TENorm:
                 "Please install it with `pip install transformer-engine`."
             )
 
+        if config.rmsnorm_impl == 'torch':
+            return NativeRMSNorm(config, hidden_size, eps)
+
         use_fused_residual = config.fused_residual_rmsnorm and has_residual
         if use_fused_residual and config.normalization != "RMSNorm":
             raise ValueError("Fused residual is only supported " "for RMSNorm normalization")
@@ -1146,6 +1149,11 @@ class TELinear(te.pytorch.Linear):
 class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
     """Transformer Engine RMSNormLinear with weights duplicated across TP ranks."""
 
+    def __new__(cls, *args, config, **kwargs):
+        if config.rmsnorm_impl == 'torch':
+            return TorchRMSNormDuplicatedLinear(*args, config=config, **kwargs)
+        return super().__new__(cls)
+
     def __init__(
         self,
         input_size: int,
@@ -1286,6 +1294,11 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """Wrapper for the Transformer-Engine's `LayerNormLinear` layer
     that combines layernorm and linear layers."""
+
+    def __new__(cls, *args, config, **kwargs):
+        if config.rmsnorm_impl == 'torch':
+            return TorchRMSNormColumnParallelLinear(*args, config=config, **kwargs)
+        return super().__new__(cls)
 
     def __init__(
         self,
@@ -1679,6 +1692,55 @@ class TEColumnParallelLinear(TELinear):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
         if self.config.delay_wgrad_compute:
             super().backward_dw()
+
+
+def _init_native_linear_norm(module, config, input_size, eps=None):
+    """Retain fused norm/linear checkpoint keys and replicated norm metadata."""
+    module.eps = config.layernorm_epsilon if eps is None else eps
+    module.zero_centered_gamma = config.layernorm_zero_centered_gamma
+    module.layer_norm_weight = Parameter(
+        torch.full(
+            (input_size,),
+            0.0 if module.zero_centered_gamma else 1.0,
+            dtype=config.params_dtype,
+            device=module.weight.device,
+        )
+    )
+    module.layer_norm_weight.allreduce = True
+    module.layer_norm_weight.sequence_parallel = config.sequence_parallel
+    module.layer_norm_weight.tensor_model_parallel = False
+
+
+class TorchRMSNormDuplicatedLinear(TELinear):
+    """Native RMSNorm followed by TE linear, retaining GTP and checkpoint layout."""
+
+    def __init__(self, input_size, output_size, *, config, **kwargs):
+        if kwargs.get('parallel_mode') != 'duplicated' or kwargs.get('is_expert', False):
+            raise ValueError('Native duplicated RMSNormLinear requires non-expert duplicated mode.')
+        super().__init__(input_size, output_size, config=config, **kwargs)
+        _init_native_linear_norm(self, config, input_size)
+
+    def forward(self, x):
+        """Normalize before the parallel linear operation."""
+        return super().forward(
+            native_rms_norm(x, self.layer_norm_weight, self.eps, self.zero_centered_gamma)
+        )
+
+
+class TorchRMSNormColumnParallelLinear(TEColumnParallelLinear):
+    """Native RMSNorm followed by a TE column linear with unchanged state keys."""
+
+    def __init__(self, input_size, output_size, *, config, eps=None, **kwargs):
+        if kwargs.get('is_expert', False):
+            raise ValueError('Native RMSNormColumnParallelLinear does not support experts.')
+        super().__init__(input_size, output_size, config=config, **kwargs)
+        _init_native_linear_norm(self, config, input_size, eps)
+
+    def forward(self, x):
+        """Normalize before the parallel linear operation."""
+        return super().forward(
+            native_rms_norm(x, self.layer_norm_weight, self.eps, self.zero_centered_gamma)
+        )
 
 
 class TELMHeadColumnParallelLinear(TEColumnParallelLinear):

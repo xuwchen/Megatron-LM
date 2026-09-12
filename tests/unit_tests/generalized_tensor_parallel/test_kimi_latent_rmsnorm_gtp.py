@@ -28,11 +28,12 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
 )
 
 
+@pytest.mark.parametrize("rmsnorm_impl", ["te", "torch"])
 @pytest.mark.parametrize("per_token_loss", [False, True])
 @pytest.mark.parametrize("output_size", [80, 128])
 @pytest.mark.parametrize("bias", [False, True])
 def test_fused_latent_projection_matches_full_matrix(
-    output_size, bias, per_token_loss, monkeypatch
+    output_size, bias, per_token_loss, rmsnorm_impl, monkeypatch
 ):
     """Check padding, replicated norm/bias, forward, dgrad, and global wgrad."""
     # This standalone layer has no training driver to configure global GTP state.
@@ -45,6 +46,8 @@ def test_fused_latent_projection_matches_full_matrix(
     _set_random_seed(1234)
     pgc = ProcessGroupCollection.use_mpu_process_groups()
     config = TransformerConfig(
+        normalization="RMSNorm",
+        rmsnorm_impl=rmsnorm_impl,
         num_layers=1,
         hidden_size=64,
         num_attention_heads=4,

@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import situlu, squared_relu
+from megatron.core.activations import native_situlu, situlu, squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -946,11 +946,9 @@ class TEGroupedMLP(MegatronModule):
                         intermediate_parallel, self.config.moe_mlp_glu_interleave_size
                     )
                 if self.activation_func is situlu:
-                    intermediate_parallel = situlu(
-                        intermediate_parallel,
-                        self.config.situ_glu_beta1,
-                        self.config.situ_glu_beta2,
-                    )
+                    intermediate_parallel = (
+                        native_situlu if self.config.native_situ_glu else situlu
+                    )(intermediate_parallel, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
                 else:
                     intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
@@ -998,7 +996,9 @@ class TEGroupedMLP(MegatronModule):
                                 x, self.config.moe_mlp_glu_interleave_size
                             )
                         if self.config.activation_func is situlu:
-                            return situlu(x, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
+                            return (native_situlu if self.config.native_situ_glu else situlu)(
+                                x, self.config.situ_glu_beta1, self.config.situ_glu_beta2
+                            )
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)

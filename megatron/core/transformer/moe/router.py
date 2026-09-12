@@ -129,7 +129,15 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
+        if self.config.moe_router_use_torch_linear:
+            shape = input.shape
+            logits = torch.nn.functional.linear(
+                input.reshape(-1, shape[-1]).to(router_dtype),
+                self.weight.to(router_dtype),
+                None if self.bias is None else self.bias.to(router_dtype),
+            ).view(*shape[:-1], self.weight.shape[0])
+        else:
+            logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
         return logits
 
     @abstractmethod

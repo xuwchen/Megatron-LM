@@ -658,6 +658,11 @@ class MoELayer(BaseMoELayer):
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
         dispatched_input = self._maybe_record_overload_factor(dispatched_input, tokens_per_expert)
+        output_probs = permuted_probs if self.config.moe_apply_probs_on_output else None
+        if output_probs is not None:
+            # Experts keep their normal activation/FC2 implementation; all actual
+            # route weighting is deferred until after the complete branch output.
+            permuted_probs = torch.ones_like(permuted_probs)
         if (
             hasattr(self, "_inference_token_dispatcher")
             and getattr(self, "is_inference_cuda_graphed_iteration", True)
@@ -672,6 +677,8 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        if output_probs is not None:
+            expert_output = expert_output.float() * output_probs.reshape(-1, 1)
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
         return output, mlp_bias
@@ -694,6 +701,8 @@ class MoELayer(BaseMoELayer):
         fc2_latent_proj, so the dimensions match the full hidden dim."""
 
         output = self.token_dispatcher.combine_postprocess(output)
+        if self.config.moe_apply_probs_on_output:
+            output = output.to(self.config.params_dtype)
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 

@@ -12,6 +12,11 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import situlu
+from megatron.core.extensions.transformer_engine import (
+    TELayerNormColumnParallelLinear,
+    TENorm,
+    TERMSNormDuplicatedLinear,
+)
 from megatron.core.models.hybrid.hybrid_block import AttnResHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -183,3 +188,63 @@ def test_kda_gated_norm_matches_native(deterministic, zero_centered):
     expected.backward(upstream)
     for a, b in [(x.grad, rx.grad), (gate.grad, rg.grad), (layer.out_norm.weight.grad, rw.grad)]:
         _assert_similarity(a, b)
+
+
+@pytest.mark.parametrize("kind", ["norm", "column", "duplicated"])
+@pytest.mark.parametrize("zero_centered", [False, True])
+def test_native_rmsnorm_linear_parity(kind, zero_centered):
+    """Check native BF16 rounding, parameter keys, and input/parameter gradients."""
+    config = _config(
+        rmsnorm_impl="torch",
+        layernorm_zero_centered_gamma=zero_centered,
+        gradient_accumulation_fusion=False,
+    )
+    pgc = ProcessGroupCollection.use_mpu_process_groups()
+    if kind == "norm":
+        layer = TENorm(config, 1024, eps=config.layernorm_epsilon).cuda()
+        norm = layer.weight
+    else:
+        kwargs = dict(
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            tp_group=pgc.tp,
+        )
+        if kind == "column":
+            layer = TELayerNormColumnParallelLinear(
+                1024, 2048, gather_output=False, is_expert=False, pg_collection=pgc, **kwargs
+            ).cuda()
+        else:
+            layer = TERMSNormDuplicatedLinear(
+                1024, 2048, parallel_mode="duplicated", **kwargs
+            ).cuda()
+        norm = layer.layer_norm_weight
+        assert 'layer_norm_weight' in layer.state_dict()
+        assert 'weight' in layer.state_dict()
+    assert norm.tensor_model_parallel is False
+    with torch.no_grad():
+        norm.add_(torch.randn_like(norm) * 0.05)
+    ref_norm = norm.detach().clone().requires_grad_()
+    x = torch.randn(128, 1, 1024, dtype=torch.bfloat16, device='cuda', requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    xf = ref_x.float()
+    normalized = (
+        xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + config.layernorm_epsilon)
+    ).to(ref_x.dtype)
+    expected = normalized * (ref_norm + 1 if zero_centered else ref_norm)
+    if kind != 'norm':
+        ref_weight = layer.weight.detach().clone().requires_grad_()
+        expected = F.linear(expected, ref_weight)
+        actual, _ = layer(x)
+    else:
+        actual = layer(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    dy = torch.randn_like(actual)
+    actual.backward(dy)
+    expected.backward(dy)
+    _assert_similarity(x.grad, ref_x.grad)
+    _assert_similarity(norm.grad, ref_norm.grad)
+    if kind != 'norm':
+        _assert_similarity(layer.weight.grad, ref_weight.grad)

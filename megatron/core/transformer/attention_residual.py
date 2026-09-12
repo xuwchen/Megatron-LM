@@ -698,6 +698,16 @@ class _AttnResAggregation(torch.autograd.Function):
         return (grad_query, grad_norm_weight, None, *grad_values)
 
 
+def _native_attn_res(pseudo_query, key_norm_weight, eps, values):
+    """Evaluate the reference RMSNorm-then-dot and batched depth reduction order."""
+    shape = values[0].shape
+    v = torch.stack(list(values), dim=-2).reshape(-1, len(values), shape[-1])
+    vf = v.float()
+    keys = vf * torch.rsqrt(vf.square().mean(-1, keepdim=True) + eps)
+    scores = (keys * (key_norm_weight.float() * pseudo_query.float())).sum(-1)
+    return torch.matmul(scores.softmax(-1).unsqueeze(1), vf).squeeze(1).to(v.dtype).reshape(shape)
+
+
 class AttentionResidual(MegatronModule):
     """Per-sublayer AttnRes aggregation: ``h = softmax-attention over depth sources``.
 
@@ -734,7 +744,9 @@ class AttentionResidual(MegatronModule):
         """Aggregate depth sources (+ optional partial sum) into the sublayer input."""
         assert len(values) >= 1, "AttentionResidual requires at least one depth source"
         nvtx_range_push(msg=f"attn_res.aggregate_n{len(values)}")
-        if self.impl == 'fla':
+        if self.impl == 'torch':
+            out = _native_attn_res(self.pseudo_query, self.key_norm_weight, self.eps, values)
+        elif self.impl == 'fla':
             assert self._fla_fused_attnres is not None
             out = self._fla_fused_attnres(
                 self.pseudo_query,
