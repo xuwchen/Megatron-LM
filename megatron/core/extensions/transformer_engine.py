@@ -998,7 +998,8 @@ class TELinear(te.pytorch.Linear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = symmetric_ar_type
         if parallel_mode == "duplicated":
-            assert tp_group is None, "duplicated linear should not have tp_group set"
+            # The supplied TP group identifies replicated checkpoint coordinates.
+            # Duplicated TE compute itself always uses tp_size=1 and tp_group=None.
             tp_size = 1
         else:
             tp_size = get_pg_size(tp_group)
