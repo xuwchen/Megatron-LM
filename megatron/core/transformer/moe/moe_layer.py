@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
 
@@ -347,7 +347,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
-                **(linear_gtp_kwargs if fc2_linear_cls is not TERMSNormDuplicatedLinear else {}),
+                **linear_gtp_kwargs,
                 **fc2_extra_kwargs,
             )
             if linear_cls is TELinear:
