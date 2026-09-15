@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -27,6 +27,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
 )
+from megatron.core.transformer.attention_residual import AttentionResidual
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
@@ -40,6 +41,8 @@ from megatron.core.utils import (
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 if TYPE_CHECKING:
@@ -1892,10 +1895,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
         mamba_submodules: Optional[HybridStackSubmodules] = None,
+        hash_moe_layer_threshold: int | None = None,
         name: str | None = None,
     ):
         """
         Args:
+            hash_moe_layer_threshold (int, optional): Global Hybrid layer-number threshold used
+                to select hash-routed MoE layers in the nested HybridStack.
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
@@ -2035,6 +2041,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
                 mtp_layer_number=self.layer_number,
+                hash_moe_layer_threshold=hash_moe_layer_threshold,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
@@ -2069,6 +2076,15 @@ class MultiTokenPredictionLayer(MegatronModule):
                 setattr(self.hc_head_fn, 'sequence_parallel', True)
                 setattr(self.hc_head_base, 'sequence_parallel', True)
                 setattr(self.hc_head_scale, 'sequence_parallel', True)
+
+        self.attn_res_enabled = self.config.enable_attention_residuals
+        if self.attn_res_enabled:
+            assert (
+                mtp_layer_pattern is None
+            ), "Attention residuals support the GPT MTP path only (no hybrid MTP pattern)."
+            # Per-depth AttnRes output head: aggregates the trunk depth history
+            # plus this MTP depth's partial sum before its final layernorm.
+            self.final_attn_res = AttentionResidual(self.config)
 
         self.offload_context = nullcontext()
 
@@ -2227,6 +2243,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[torch.Tensor] = None,
+        attn_res_sources: Optional[tuple] = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
@@ -2266,6 +2283,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                     )
                 else:
                     # GPT path: single TransformerLayer
+                    attn_res_kwargs = (
+                        {"attn_res_sources": attn_res_sources} if self.attn_res_enabled else {}
+                    )
                     hidden_states, _ = self.mtp_model_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
@@ -2280,17 +2300,28 @@ class MultiTokenPredictionLayer(MegatronModule):
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,
                         input_ids=input_ids,
+                        **attn_res_kwargs,
                     )
 
         if not self.mhc_enabled:
-            hidden_states = self._postprocess(hidden_states)
+            hidden_states = self._postprocess(hidden_states, attn_res_sources=attn_res_sources)
 
         return hidden_states
 
-    def _postprocess(self, hidden_states: torch.Tensor):
+    def _postprocess(self, hidden_states: torch.Tensor, attn_res_sources: Optional[tuple] = None):
         """
         Postprocesses the output of the transformer layers.
         """
+
+        if self.attn_res_enabled:
+            assert (
+                attn_res_sources is not None
+            ), "AttnRes MTP postprocess requires the trunk depth-source tuple."
+            # Per-depth output head: this depth's partial sum joins the trunk
+            # depth history for the final aggregation.
+            nvtx_range_push(msg="attn_res.mtp_final_aggregate")
+            hidden_states = self.final_attn_res([*attn_res_sources, hidden_states])
+            nvtx_range_pop(msg="attn_res.mtp_final_aggregate")
 
         if self.mhc_enabled:
             hidden_states = learned_output_contract(
@@ -2374,8 +2405,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
     ):
-        """Forward through ``_proj_and_transformer_layer`` with activation
-        recomputation.
+        """Forward a legacy GPT MTP layer with activation recomputation.
 
         Mirrors ``transformer_block._checkpointed_forward``:
 
@@ -2394,6 +2424,9 @@ class MultiTokenPredictionLayer(MegatronModule):
           context entered before ``te_checkpoint``; see the
           ``outer_quantization_context`` block below.
         """
+        assert (
+            self.mtp_layer_pattern is None
+        ), "Hybrid MTP delegates full activation recomputation to its nested HybridStack."
 
         def custom_forward(
             hidden_states,
@@ -2492,9 +2525,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
 
         if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
+            # A legacy GPT MTP layer is already a single Transformer-layer recompute unit.
             assert (
                 self.config.recompute_num_layers == 1
             ), "recompute_num_layers must be 1 for MTP recompute"
@@ -2545,6 +2576,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         roll_depth: int = 0,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
+        attn_res_sources: Optional[tuple] = None,
     ):
         """
         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
@@ -2586,7 +2618,18 @@ class MultiTokenPredictionLayer(MegatronModule):
             roll_depth=roll_depth,
         )
 
-        if self.config.recompute_granularity == 'full' and self.training:
+        # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
+        # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
+        # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
+        use_outer_recompute = (
+            self.config.recompute_granularity == 'full'
+            and self.training
+            and self.mtp_layer_pattern is None
+        )
+        if use_outer_recompute:
+            assert (
+                not self.attn_res_enabled
+            ), "Attention residuals do not support full recompute (rejected in config)."
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
@@ -2619,6 +2662,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                attn_res_sources=attn_res_sources,
             )
 
         self.cp_group = _orig_cp_group
@@ -2733,10 +2777,13 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
+        hash_moe_layer_threshold: int | None = None,
         name: str | None = None,
     ):
         """
         Args:
+            hash_moe_layer_threshold (int, optional): Global Hybrid layer-number threshold passed
+                to each nested MTP HybridStack.
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
@@ -2758,6 +2805,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_num_depths = mtp_num_depths
         self.hybrid_submodules = hybrid_submodules
+        self.hash_moe_layer_threshold = hash_moe_layer_threshold
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
         self.name = name
 
@@ -2825,6 +2873,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
                     hybrid_submodules=hybrid_submodules,
+                    hash_moe_layer_threshold=self.hash_moe_layer_threshold,
                     name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
@@ -2896,6 +2945,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
         mhc_multistream: Optional[Tensor] = None,
+        attn_res_sources: Optional[tuple] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -2929,10 +2979,14 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
+            if attn_res_sources is not None:
+                # Keep the detach semantics: MTP depths must not backprop into
+                # the trunk through the depth-source history either.
+                attn_res_sources = tuple(source.detach() for source in attn_res_sources)
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-            (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
+            hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -2947,6 +3001,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 roll_depth=iteration,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
+                attn_res_sources=attn_res_sources,
                 **(extra_block_kwargs or {}),
             )
 
