@@ -1358,7 +1358,7 @@ def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
     GTP optimizer param and ``get_param_id_to_sharded_param_map`` drops it -> KeyError in
     ``Float16OptimizerWithFloat16Params.sharded_state_dict``. Unlike that test, this one drives the
     real production backfill (``_backfill_gtp_sharded_param_map``) rather than reproducing its
-    rebuild, so it also pins that GDP takes the per-shard rebuild branch, not the EP refusal.
+    rebuild, so it also pins that GDP reuses its semantic factory rather than an unsplit key.
     """
     from megatron.core.dist_checkpointing.optimizer import (
         get_param_id_to_sharded_param_map,
@@ -1389,41 +1389,20 @@ def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
         id_map = get_param_id_to_sharded_param_map(model_sd, [in_proj_w])
         assert 0 not in id_map, "expected in_proj to be MISSING from the id map (the KeyError gap)"
 
-        # The production backfill must fill it via the per-shard rebuild. An expert-parallel param
-        # would raise instead; in_proj is dense, so it must rebuild cleanly.
+        # The source backlink resolves the model's semantic factory even when
+        # its checkpoint prefix differs from the tagged module name.
         _backfill_gtp_sharded_param_map(id_map, [[in_proj_w]], model_sd)
-        assert 0 in id_map, "backfill did not restore in_proj"
         entry = id_map[0]
-        # A plain per-shard ShardedTensor keyed by the tagged name -- NOT the model's gathered+split
-        # factory (reusing that would hand the optimizer the wrong shape).
-        assert isinstance(entry, ShardedTensor), type(entry)
-        assert entry is not model_sd['mixer.in_proj.weight']
-        assert entry.key == in_proj_w._debug_name, (entry.key, in_proj_w._debug_name)
-        # The rebuilt entry describes this rank's slice of the LOGICAL global. Alignment padding
-        # is a local allocation detail: the trailing GTP rank's shard runs past the logical end,
-        # so its entry is shorter than the param. (This used to require entry.local_shape ==
-        # param.shape and a padded global, i.e. the layout in which every TP rank past 0 sat
-        # pad_length rows too far. tp_size is 1 here, so that shift was invisible.)
-        gtp_remat_rank = torch.distributed.get_rank(in_proj_w.group)
-        shard_rows = in_proj_w.shape[0]
-        start = min(gtp_remat_rank * shard_rows, in_proj_dim)
-        expected_rows = min(shard_rows, max(0, in_proj_dim - start))
-        assert tuple(entry.local_shape) == (expected_rows, in_proj_w.shape[1]), (
-            f"rebuilt local_shape {tuple(entry.local_shape)} != logical slice "
-            f"{(expected_rows, in_proj_w.shape[1])} (param shape {tuple(in_proj_w.shape)})"
-        )
-        assert entry.global_offset[0] == start, (entry.global_offset, gtp_remat_rank)
-        assert entry.global_shape[0] == in_proj_dim, (entry.global_shape, in_proj_dim)
-
-        # The optimizer state spans the full padded shard; make_sharded_optimizer_tensor must
-        # accept it and trim it to the same logical rows the model entry kept.
-        opt_state = torch.zeros_like(in_proj_w)
+        assert entry is model_sd['mixer.in_proj.weight']
+        assert isinstance(entry, ShardedTensorFactory)
+        opt_state = torch.zeros_like(in_proj_w, dtype=torch.float32)
         osh = make_sharded_optimizer_tensor(entry, opt_state, prefix='optimizer.state.exp_avg')
-        assert osh is not None
-        assert tuple(osh.local_shape) == (expected_rows, in_proj_w.shape[1]), (
-            f"optimizer state {tuple(osh.local_shape)} not trimmed to "
-            f"{(expected_rows, in_proj_w.shape[1])}"
-        )
+        parts = osh.build()
+        assert {part.key for part in parts} == {
+            'optimizer.state.exp_avg.' + part.key for part in entry.build()
+        }
+        restored = osh.merge_fn([part.data for part in parts])
+        torch.testing.assert_close(restored, opt_state, rtol=0, atol=0)
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
