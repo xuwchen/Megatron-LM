@@ -888,9 +888,8 @@ def test_qk_l2_norm_deterministic_mode(dtype, deterministic_mode, use_qk_l2norm)
             expected = expected * 2
     expected = expected.to(dtype)
     actual = torch.cat((out["q"], out["k"]), dim=2)
-    rtol = 1e-5 if dtype == torch.float32 else 1e-2
-    torch.testing.assert_close(actual, expected, rtol=rtol, atol=1e-6)
+    torch.testing.assert_close(actual, expected)
 
     actual.float().sum().backward()
     expected.float().sum().backward()
-    torch.testing.assert_close(qkv.grad, reference.grad.to(dtype), rtol=rtol, atol=1e-6)
+    torch.testing.assert_close(qkv.grad, reference.grad.to(dtype))
