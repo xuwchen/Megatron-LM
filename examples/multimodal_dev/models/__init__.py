@@ -49,6 +49,10 @@ MODEL_REGISTRY = {
         "post_language_config_fn": _qwen35_vl_post_language_config,
         "vision_flops_fn": _qwen35_vl_vision_flops,
         "dataset_providers": {
+            "nemotron": (
+                "examples.multimodal_dev.data.nemotron"
+                ".train_valid_test_datasets_provider"
+            ),
             "mock": (
                 "examples.multimodal_dev.data.mock"
                 ".train_valid_test_datasets_provider"
