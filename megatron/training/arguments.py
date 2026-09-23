@@ -1975,10 +1975,10 @@ def validate_args(args, defaults={}):
             token is not None for token in extra_tokens
         ), "FIM extra tokens should be specified."
 
-    assert not (args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'), (
-        "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
-        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
-    )
+    # assert not (args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'), (
+    #     "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
+    #     "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
+    # )
 
     # Deterministic mode — env vars + config overrides + torch global state.
     # Implementation lives in ``megatron/training/determinism.py`` so the

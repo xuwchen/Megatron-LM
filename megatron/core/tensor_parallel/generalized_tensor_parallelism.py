@@ -53,7 +53,10 @@ from megatron.core.utils import ensure_params_ready, log_single_rank
 
 logger = logging.getLogger(__name__)
 
-_GTP_TE_MIN_VERSION = Version("2.19.0.dev0")
+# te_pr3005 on oci-hsg provides TE ~2.17 (GTP AG/RS ops available).
+# TE 2.19 adds NVFP4/MXFP8 block quantization; those are imported separately
+# below so a 2.17 environment degrades gracefully for BF16 runs.
+_GTP_TE_MIN_VERSION = Version("2.17.0.dev0")
 
 try:
     import transformer_engine as te  # noqa: F401
@@ -66,20 +69,13 @@ try:
         )
 
     import transformer_engine_torch as tex
-    from transformer_engine.pytorch.constants import (
-        MXFP8_BLOCK_SCALING_SIZE,
-        NVFP4_BLOCK_SCALING_SIZE,
-    )
     from transformer_engine.pytorch.distributed import (
-        _NVFP4AllGatherAsyncHandle,
         gather_along_first_dim,
         in_fp8_activation_recompute_phase,
         reduce_scatter_along_first_dim,
     )
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
     from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
-    from transformer_engine.pytorch.tensor import MXFP8TensorStorage, NVFP4TensorStorage
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
     from transformer_engine.pytorch.utils import (
         nvtx_range_pop,
         nvtx_range_push,
@@ -87,6 +83,28 @@ try:
     )
 
     HAVE_TE = True
+
+    # FP4/MXFP8 block-quantization symbols — added in TE 2.18+.  Optional for
+    # BF16 GTP runs; all usage sites are guarded by isinstance checks that
+    # evaluate False when these are MagicMock placeholders.
+    try:
+        from transformer_engine.pytorch.constants import (
+            MXFP8_BLOCK_SCALING_SIZE,
+            NVFP4_BLOCK_SCALING_SIZE,
+        )
+        from transformer_engine.pytorch.distributed import (
+            _NVFP4AllGatherAsyncHandle,
+        )
+        from transformer_engine.pytorch.tensor import MXFP8TensorStorage, NVFP4TensorStorage
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+    except (ImportError, AttributeError):
+        from unittest.mock import MagicMock as _MM
+
+        MXFP8_BLOCK_SCALING_SIZE = NVFP4_BLOCK_SCALING_SIZE = None
+        _NVFP4AllGatherAsyncHandle = _MM()
+        MXFP8TensorStorage = NVFP4TensorStorage = _MM()
+        MXFP8Quantizer = _MM()
+
 except (ImportError, ModuleNotFoundError):
     # TE unavailable/too old -> stub the TE-backed names so this module still imports,
     # and flag GTP unusable via HAVE_TE (gtp_api.py surfaces this as HAVE_GTP=False). No
