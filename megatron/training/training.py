@@ -119,6 +119,7 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
 from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
@@ -4608,7 +4609,7 @@ def setup_model_and_optimizer(
     data_parallel_size = (
         mpu.get_data_parallel_world_size()
         if mpu.model_parallel_is_initialized()
-        else args.data_parallel_size
+        else get_batch_parallel_size(args)
     )
     assert num_microbatches is not None and num_microbatches >= 1, (
         f'current global batch size ({current_global_batch_size}) is too small for '
@@ -4754,12 +4755,8 @@ def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
     samples_seen_value = samples_seen.item()
     if samples_seen_value >= 0:
         return int(samples_seen_value)
-    return (
-        get_num_microbatches()
-        * args.micro_batch_size
-        * args.data_parallel_size
-        * args.gtp_weight_remat_size
-    )
+    # Count independent sequences; CP partitions within GTP share each sample.
+    return get_num_microbatches() * args.micro_batch_size * get_batch_parallel_size(args)
 
 
 def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
@@ -5366,15 +5363,8 @@ def training_log(
     if cfg.rl.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
-    # Calculate batch size. data_parallel_size excludes the GTP-remat axis (it's folded into
-    # total_model_size at arguments.py:446); each gtp-remat peer consumes a distinct microbatch,
-    # so multiply it back in for the global sample count.
-    batch_size = (
-        args.micro_batch_size
-        * args.data_parallel_size
-        * args.gtp_weight_remat_size
-        * get_num_microbatches()
-    )
+    # Count independent sequences; weight-sharding ranks may share a sequence through CP.
+    batch_size = args.micro_batch_size * get_batch_parallel_size(args) * get_num_microbatches()
 
     # Track app tag & app tag ID
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
@@ -6452,15 +6442,18 @@ def train(
     )
 
     def _dp_world_size():
-        # Full DP x gtp_remat degree (num_microbatches spans the full data-distribution axis).
-        gtp_remat = args.gtp_weight_remat_size
+        # Independent-sequence degree, which can differ from the weight-replica degree.
         if lang_pgc is not None:
-            return lang_pgc.dp.size() * gtp_remat
+            sample_group = getattr(lang_pgc, "dp_gtp_remat", None)
+            if sample_group is None:
+                if getattr(args, "gtp_remat_num_sequence_shards", 1) == 1:
+                    return lang_pgc.dp.size() * args.gtp_weight_remat_size
+                raise ValueError("Language process groups must include dp_gtp_remat")
+            return sample_group.size()
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
-        # args.data_parallel_size is the language (llm) dp on all ranks (set in validate_args) and
-        # excludes gtp_remat, so scale by gtp_remat to span the full data-distribution axis.
-        return args.data_parallel_size * gtp_remat
+        # Bootstrap fallback before process groups are initialized.
+        return get_batch_parallel_size(args)
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if cfg.rl.perform_rl_step:
@@ -7466,11 +7459,9 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
-    # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
-    # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so include it in the
-    # global sample breadth we divide out to recover the microbatch count.
+    # Divide by independently assigned sequences; CP ranks share the same sequence.
     eval_num_microbatches = eval_batch_size // (
-        eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
+        eval_micro_batch_size * get_batch_parallel_size(args)
     )
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
