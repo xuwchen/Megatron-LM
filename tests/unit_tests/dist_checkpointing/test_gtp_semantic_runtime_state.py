@@ -1,13 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Strict checkpoint interoperability for semantic GTP weights and optimizer state."""
+"""Strict checkpoint interoperability for semantic GTP weights and runtime state."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from megatron.core import dist_checkpointing, parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.core import CheckpointingException
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
     make_sharded_optimizer_tensor,
@@ -25,6 +26,7 @@ from megatron.core.tensor_parallel.gtp_ckpt import (
     _gtp_slice_rows_on_load,
 )
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.training.checkpointing import _stage_ignored_runtime_state
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -122,3 +124,41 @@ class TestGTPSemanticRuntimeState:
         torch.testing.assert_close(loaded["model"].cpu(), expected.bfloat16().cpu(), rtol=0, atol=0)
         torch.testing.assert_close(loaded["master"].cpu(), expected.cpu(), rtol=0, atol=0)
         torch.testing.assert_close(loaded["momentum"].cpu(), (expected * 3).cpu(), rtol=0, atol=0)
+
+    @pytest.mark.parametrize("extra_model_key", [False, True])
+    def test_ignored_runtime_objects_keep_model_validation_strict(
+        self, tmp_path_dist_ckpt, extra_model_key
+    ):
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        values = torch.arange(8, device="cuda")
+        saved = {
+            "model": ShardedTensor.from_rank_offsets("model.weight", values, replica_id=rank),
+            "rng": ShardedObject("rng_state", {"seed": 123}, (1,), (0,), replica_id=rank),
+            # Model six saved runtime ranks on the current four-rank test grid.
+            "rerun": {
+                i: ShardedObject("rerun_state_machine_state", {"old_rank": i}, (6,), (i,))
+                for i in range(rank, 6, world_size)
+            },
+        }
+        if extra_model_key:
+            saved["extra"] = ShardedTensor.from_rank_offsets(
+                "model.unexpected", values, replica_id=rank
+            )
+        target = {
+            "model": ShardedTensor.from_rank_offsets(
+                "model.weight", torch.zeros_like(values), replica_id=rank
+            )
+        }
+        with TempNamedDir(tmp_path_dist_ckpt / "ignored_runtime", sync=True) as directory:
+            dist_checkpointing.save(saved, directory)
+            _stage_ignored_runtime_state(
+                target, directory, {"rng_state", "rerun_state_machine_state"}
+            )
+            if extra_model_key:
+                with pytest.raises(CheckpointingException, match="model.unexpected"):
+                    dist_checkpointing.load(target, directory, strict="raise_all")
+            else:
+                loaded = dist_checkpointing.load(target, directory, strict="raise_all")
+                torch.testing.assert_close(loaded["model"], values, rtol=0, atol=0)
+                assert "rng_state" not in loaded and "rerun_state_machine" not in loaded
