@@ -1113,3 +1113,26 @@ The suite targets ≥ 4 GPUs and TransformerEngine >= 2.19.
 
 A green suite run (skips for unmet hardware/config are acceptable) is the minimum bar for any
 GTP_remat change.
+
+
+## Kimi-K3 integration on dev
+
+The Kimi-K3 preview combines KDA low-rank decay projections, gated MLA,
+attention residuals, and Stable LatentMoE. The fused latent up-projection
+`TERMSNormDuplicatedLinear` accepts explicit `gtp_remat_group` and
+`gtp_replica_group` arguments and participates in the common presharding
+context when `moe_latent_proj` is opted in. Its linear weight is sharded;
+RMSNorm scale and optional bias retain their complete logical shapes.
+The owning TP group remains checkpoint metadata only: the duplicated
+projection executes without TE tensor-parallel communication.
+
+For a numerical comparison with the preview's TP1 non-GTP Muon baseline,
+use `muon_tp_mode=duplicated` on both arms. The `blockwise` mode independently
+orthogonalizes each GTP shard and therefore changes the optimizer update
+when the GTP degree changes. Compare from one checkpoint and retain identical
+logical batch/data ordering and learned router settings.
+
+The four-rank regression `test_kimi_latent_rmsnorm_gtp.py` compares padded
+and unpadded fused projections against native PyTorch RMSNorm plus a full
+linear weight, checking output, input/scale/bias gradients and summed
+weight gradients, including replicated parameter shapes.
