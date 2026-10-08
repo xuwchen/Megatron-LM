@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
 
@@ -320,15 +320,6 @@ class MoELayer(BaseMoELayer):
                 if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
                 else None
             )
-            if (
-                self.config.moe_latent_up_projection_rmsnorm
-                and gtp_remat_group is not None
-                and gtp_remat_group.size() > 1
-            ):
-                raise ValueError(
-                    "GTP rematerialization of latent projections does not yet support "
-                    "moe_latent_up_projection_rmsnorm."
-                )
             linear_gtp_kwargs = {}
             if linear_cls is TELinear:
                 linear_gtp_kwargs = {
@@ -360,13 +351,11 @@ class MoELayer(BaseMoELayer):
                 else linear_cls
             )
             fc2_extra_kwargs = (
-                {"tp_group": pg_collection.tp}
+                {"tp_group": pg_collection.tp, **linear_gtp_kwargs}
                 if fc2_linear_cls is TERMSNormDuplicatedLinear
                 else linear_gtp_kwargs
             )
-            # TODO: When TERMSNormDuplicatedLinear accepts `gtp_remat_group`, carry it into this
-            # wrapper together with its owning TP group; TE tensor-parallel execution remains
-            # local with `tp_size=1`.
+            # Pass the owning TP group while TE execution remains local (`tp_size=1`).
             self.fc2_latent_proj = fc2_linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
