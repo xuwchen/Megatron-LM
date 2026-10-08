@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
 
@@ -361,10 +361,11 @@ class MoELayer(BaseMoELayer):
             # The TE GTP-remat kwargs only apply to the plain linear path; the duplicated
             # RMSNorm wrapper takes its TP group instead and rejects gtp_remat_group.
             fc2_extra_kwargs = (
-                {"tp_group": pg_collection.tp}
+                {"tp_group": pg_collection.tp, **linear_gtp_kwargs}
                 if fc2_linear_cls is TERMSNormDuplicatedLinear
                 else linear_gtp_kwargs
             )
+            # Pass the owning TP group while TE execution remains local (`tp_size=1`).
             self.fc2_latent_proj = fc2_linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
