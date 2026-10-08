@@ -1481,6 +1481,30 @@ def _worker_save_load_roundtrip_needs_gtp_inclusive_group(rank, world_size, ckpt
         ps.initialize_model_parallel()
 
 
+def _legacy_padded_gtp_checkpoint_entry(tensor, key, prepend_offsets=(), **kwargs):
+    """Build the pre-logical-layout TP1 format for backward-compatibility tests.
+
+    Current saves trim GTP padding. Construct the historical layout explicitly so
+    legacy-load tests still exercise a real on-disk shape mismatch.
+    """
+    entry = make_tp_sharded_tensor_for_checkpoint(
+        tensor, key, prepend_offsets=prepend_offsets, **kwargs
+    )
+    if not is_gtp_param(tensor):
+        return entry
+    assert dist.get_world_size(kwargs['tp_group']) == 1
+    legacy = ShardedTensor.from_rank_offsets(
+        key,
+        tensor,
+        *prepend_offsets,
+        (len(prepend_offsets), dist.get_rank(tensor.group), dist.get_world_size(tensor.group)),
+        replica_id=entry.replica_id,
+        prepend_axis_num=len(prepend_offsets),
+    )
+    legacy.gtp_pad_length = tensor.pad_length
+    return legacy
+
+
 def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
     """Regression: a checkpoint saved at one GTP degree must still load at a different one, even
     when only one side pads. Small-scale mirror of GTP64(pads 3072->4096)/GTP8(no pad) with
@@ -1515,7 +1539,7 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
 
     def _wrap(tensor, key, **extra):
         return {
-            key: make_tp_sharded_tensor_for_checkpoint(
+            key: _legacy_padded_gtp_checkpoint_entry(
                 tensor=tensor,
                 key=key,
                 tp_axis=0,
@@ -1582,7 +1606,7 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
 
     def _wrap(tensor, key, prepend_offsets=(), **extra):
         return {
-            key: make_tp_sharded_tensor_for_checkpoint(
+            key: _legacy_padded_gtp_checkpoint_entry(
                 tensor=tensor,
                 key=key,
                 tp_axis=0,
@@ -2333,8 +2357,8 @@ _PREFIX = "layer."  # arbitrary checkpoint key prefix; these tests do not depend
 def _sharded_weight(weight, rank, world_group, *, gtp, expect_global_shape):
     """Build ShardedTensors for one weight, with or without the GTP-aware builder.
 
-    The GTP builder records the PADDED global shape, the plain one the true shape; whether those
-    two agree is exactly what the three save/load-direction tests below turn on.
+    Both current builders describe the logical global shape. Legacy padded-format
+    tests construct their historical metadata explicitly.
     """
     build = (
         make_sharded_tensors_for_checkpoint_with_gtp_remat
@@ -2486,14 +2510,17 @@ def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_siz
         )
         assert gtp_weight.pad_length == 4, gtp_weight.pad_length  # (8 - 20%8) % 8
 
-        # Checkpoint declares the padded shape (24, 8), not the true (20, 8).
-        gtp_sharded = _sharded_weight(
-            gtp_weight,
-            rank,
-            world_group,
-            gtp=True,
-            expect_global_shape=(out_features + 4, in_features),
-        )
+        # Explicit historical format: new production saves have the logical shape.
+        gtp_sharded = {
+            _PREFIX
+            + "weight": _legacy_padded_gtp_checkpoint_entry(
+                gtp_weight,
+                _PREFIX + "weight",
+                tp_group=_cached_new_group([rank]),
+                dp_cp_group=world_group,
+            )
+        }
+        assert gtp_sharded[_PREFIX + "weight"].global_shape == (out_features + 4, in_features)
 
         with TempNamedDir(ckpt_base / 'gtp_padded_save', sync=True) as ckpt_dir:
             save(gtp_sharded, ckpt_dir)
