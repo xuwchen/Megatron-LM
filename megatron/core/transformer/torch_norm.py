@@ -112,3 +112,38 @@ class L2Norm(torch.nn.Module, LayerNormInterface):
             torch.Tensor: L2-normalized tensor with the same dtype as input.
         """
         return self._norm(x)
+
+
+def native_rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, zero_centered_gamma: bool = False
+) -> torch.Tensor:
+    """Normalize in FP32, round to input dtype, then apply the learned scale."""
+    xf = x.float()
+    normalized = (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)).to(x.dtype)
+    scale = weight + 1 if zero_centered_gamma else weight
+    return normalized * scale
+
+
+class NativeRMSNorm(torch.nn.Module):
+    """Autograd RMSNorm preserving native PyTorch cast and multiplication order."""
+
+    def __init__(self, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.zero_centered_gamma = config.layernorm_zero_centered_gamma
+        device = 'cpu' if config.use_cpu_initialization else torch.cuda.current_device()
+        self.weight = torch.nn.Parameter(
+            torch.full(
+                (hidden_size,),
+                0.0 if self.zero_centered_gamma else 1.0,
+                dtype=config.params_dtype,
+                device=device,
+            )
+        )
+        self.weight.sequence_parallel = config.sequence_parallel
+        self.weight.allreduce = True
+        self.weight.tensor_model_parallel = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply native normalization and scale with full autograd support."""
+        return native_rms_norm(x, self.weight, self.eps, self.zero_centered_gamma)

@@ -9,7 +9,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from megatron.core.activations import situlu
+from megatron.core.activations import native_situlu, situlu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
@@ -283,11 +283,9 @@ class SharedExpertMLP(MLP):
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
                 if self.activation_func is situlu:
-                    intermediate_parallel = situlu(
-                        intermediate_parallel,
-                        self.config.situ_glu_beta1,
-                        self.config.situ_glu_beta2,
-                    )
+                    intermediate_parallel = (
+                        native_situlu if self.config.native_situ_glu else situlu
+                    )(intermediate_parallel, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
                 else:
                     intermediate_parallel = self.activation_func(intermediate_parallel)
             elif self.config.bias_activation_fusion:
@@ -315,7 +313,9 @@ class SharedExpertMLP(MLP):
 
                     def glu(x):
                         if self.config.activation_func is situlu:
-                            return situlu(x, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
+                            return (native_situlu if self.config.native_situ_glu else situlu)(
+                                x, self.config.situ_glu_beta1, self.config.situ_glu_beta2
+                            )
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
