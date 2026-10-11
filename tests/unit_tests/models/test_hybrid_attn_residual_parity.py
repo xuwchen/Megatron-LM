@@ -12,12 +12,22 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import situlu
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
+    TELayerNormColumnParallelLinear,
+    TENorm,
+    TERMSNormDuplicatedLinear,
+    TERowParallelLinear,
+)
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.models.hybrid.hybrid_block import AttnResHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import build_module
 from tests.unit_tests.test_utilities import Utils
 
@@ -71,11 +81,15 @@ def _native_aggregate(values, query, norm_weight, eps):
     return (scores.softmax(-1).unsqueeze(-2) @ vf).squeeze(-2).to(values.dtype)
 
 
+@pytest.mark.parametrize("native_precision", [False, True])
 @pytest.mark.parametrize("layer_number", [1, 2])
 @pytest.mark.parametrize("fused_bda", [False, True])
 @pytest.mark.parametrize("training", [False, True])
-def test_hybrid_partial_matches_native(layer_number, fused_bda, training):
+def test_hybrid_partial_matches_native(layer_number, fused_bda, training, native_precision):
     config = _config(
+        rmsnorm_impl="torch" if native_precision else "te",
+        attn_res_impl="torch" if native_precision else "eager",
+        native_situ_glu=native_precision,
         enable_attention_residuals=True,
         attn_res_block_layers=24,
         activation_func=situlu,
@@ -183,3 +197,209 @@ def test_kda_gated_norm_matches_native(deterministic, zero_centered):
     expected.backward(upstream)
     for a, b in [(x.grad, rx.grad), (gate.grad, rg.grad), (layer.out_norm.weight.grad, rw.grad)]:
         _assert_similarity(a, b)
+
+
+@pytest.mark.parametrize("kind", ["norm", "column", "duplicated"])
+@pytest.mark.parametrize("zero_centered", [False, True])
+def test_native_rmsnorm_linear_parity(kind, zero_centered):
+    """Check native BF16 rounding, parameter keys, and input/parameter gradients."""
+    config = _config(
+        rmsnorm_impl="torch",
+        layernorm_zero_centered_gamma=zero_centered,
+        gradient_accumulation_fusion=False,
+    )
+    pgc = ProcessGroupCollection.use_mpu_process_groups()
+    if kind == "norm":
+        layer = TENorm(config, 1024, eps=config.layernorm_epsilon).cuda()
+        norm = layer.weight
+    else:
+        kwargs = dict(
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            tp_group=pgc.tp,
+        )
+        if kind == "column":
+            layer = TELayerNormColumnParallelLinear(
+                1024, 2048, gather_output=False, is_expert=False, pg_collection=pgc, **kwargs
+            ).cuda()
+        else:
+            layer = TERMSNormDuplicatedLinear(
+                1024, 2048, parallel_mode="duplicated", **kwargs
+            ).cuda()
+        norm = layer.layer_norm_weight
+        assert "layer_norm_weight" in layer.state_dict()
+        assert "weight" in layer.state_dict()
+    assert norm.tensor_model_parallel is False
+    with torch.no_grad():
+        norm.add_(torch.randn_like(norm) * 0.05)
+    ref_norm = norm.detach().clone().requires_grad_()
+    x = torch.randn(128, 1, 1024, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_()
+    xf = ref_x.float()
+    normalized = (
+        xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + config.layernorm_epsilon)
+    ).to(ref_x.dtype)
+    expected = normalized * (ref_norm + 1 if zero_centered else ref_norm)
+    if kind != "norm":
+        ref_weight = layer.weight.detach().clone().requires_grad_()
+        expected = F.linear(expected, ref_weight)
+        actual, _ = layer(x)
+    else:
+        actual = layer(x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    dy = torch.randn_like(actual)
+    actual.backward(dy)
+    expected.backward(dy)
+    _assert_similarity(x.grad, ref_x.grad)
+    _assert_similarity(norm.grad, ref_norm.grad)
+    if kind != "norm":
+        _assert_similarity(layer.weight.grad, ref_weight.grad)
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+def test_native_latent_moe_forward_and_gradients(recompute):
+    """HF KimiSparseMoeBlock/MoEGate formulas with autograd through all parameters.
+
+    Use the published slim H1024/latent512/FFN512/32-expert/top2 dimensions.
+    HF's inference method disables grad; this independent formulation retains
+    the same forward operations and differentiates them for the training check.
+    """
+    config = _config(
+        rmsnorm_impl="torch",
+        native_situ_glu=True,
+        activation_func=situlu,
+        gated_linear_unit=True,
+        bias_activation_fusion=False,
+        gradient_accumulation_fusion=False,
+        num_moe_experts=32,
+        moe_grouped_gemm=True,
+        moe_ffn_hidden_size=512,
+        moe_latent_size=512,
+        moe_latent_up_projection_rmsnorm=True,
+        moe_shared_expert_intermediate_size=512,
+        moe_router_dtype="fp32",
+        moe_router_use_torch_linear=True,
+        moe_router_score_function="sigmoid",
+        moe_router_load_balancing_type="none",
+        moe_router_topk=2,
+        moe_router_topk_scaling_factor=1.0,
+        moe_token_dispatcher_type="alltoall",
+        moe_apply_probs_on_output=True,
+        recompute_granularity="selective" if recompute else None,
+        recompute_modules=["moe"] if recompute else None,
+    )
+    layer = (
+        get_moe_module_spec(num_experts=32, moe_grouped_gemm=True)(
+            config=config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        )
+        .cuda()
+        .train()
+    )
+    params = dict(layer.named_parameters())
+    names = {
+        "router.weight",
+        "fc1_latent_proj.weight",
+        "fc2_latent_proj.weight",
+        "fc2_latent_proj.layer_norm_weight",
+        "shared_experts.linear_fc1.weight",
+        "shared_experts.linear_fc2.weight",
+    }
+    names.update(f"experts.linear_fc{fc}.weight{i}" for fc in (1, 2) for i in range(32))
+    assert set(params) == names
+    with torch.no_grad():
+        for name, value in params.items():
+            value.normal_(mean=1.0 if name.endswith('layer_norm_weight') else 0.0, std=0.02)
+    ref = {name: value.detach().clone().requires_grad_() for name, value in params.items()}
+    x = torch.randn(128, 1, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    rx = x.detach().clone().requires_grad_()
+    flat = rx.reshape(-1, 1024)
+    scores = F.linear(flat.float(), ref["router.weight"].float()).sigmoid()
+    indices = scores.topk(2, dim=-1, sorted=False).indices
+    selected = scores.gather(1, indices)
+    probabilities = selected / (selected.sum(-1, keepdim=True) + 1e-20)
+    latent = F.linear(flat, ref["fc1_latent_proj.weight"])
+
+    def reference_mlp(inputs, w1, w2):
+        gate, up = F.linear(inputs, w1).float().chunk(2, -1)
+        activation = (4 * torch.tanh(gate / 4) * gate.sigmoid() * (25 * torch.tanh(up / 25))).to(
+            inputs.dtype
+        )
+        return F.linear(activation, w2)
+
+    # Put expert outputs back in token/top-k order before the FP32 weighted sum.
+    routed = torch.zeros(128, 2, 512, device="cuda", dtype=torch.bfloat16)
+    for i in range(32):
+        token, slot = (indices == i).nonzero(as_tuple=True)
+        output = reference_mlp(
+            latent[token],
+            ref[f"experts.linear_fc1.weight{i}"],
+            ref[f"experts.linear_fc2.weight{i}"],
+        )
+        routed = routed.index_put((token, slot), output)
+    combined = (routed.float() * probabilities.unsqueeze(-1)).sum(1).to(x.dtype)
+    cf = combined.float()
+    normalized = (cf * torch.rsqrt(cf.square().mean(-1, keepdim=True) + 1e-5)).to(x.dtype)
+    normalized = normalized * ref["fc2_latent_proj.layer_norm_weight"]
+    expected = F.linear(normalized, ref["fc2_latent_proj.weight"])
+    expected = expected + reference_mlp(
+        flat, ref["shared_experts.linear_fc1.weight"], ref["shared_experts.linear_fc2.weight"]
+    )
+    expected = expected.view_as(x)
+    actual, bias = layer(x)
+    assert bias is None
+    _assert_similarity(actual, expected, relative_l2=0.001)
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream)
+    _assert_similarity(x.grad, rx.grad)
+    for name in sorted(names):
+        assert params[name].grad is not None and ref[name].grad is not None, name
+        try:
+            _assert_similarity(params[name].grad, ref[name].grad)
+        except AssertionError as error:
+            raise AssertionError(f"parameter gradient: {name}") from error
+
+
+def test_native_situ_shared_overlap_gradients():
+    """The stream-scheduled shared expert uses the same HF SiTU order."""
+    config = _config(
+        native_situ_glu=True,
+        activation_func=situlu,
+        gated_linear_unit=True,
+        bias_activation_fusion=False,
+        gradient_accumulation_fusion=False,
+        moe_shared_expert_intermediate_size=512,
+        moe_shared_expert_overlap=True,
+        moe_token_dispatcher_type="alltoall",
+    )
+    layer = SharedExpertMLP(
+        config,
+        MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
+        gate=False,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    ).cuda()
+    params = dict(layer.named_parameters())
+    assert set(params) == {"linear_fc1.weight", "linear_fc2.weight"}
+    ref = {n: p.detach().clone().requires_grad_() for n, p in params.items()}
+    x = torch.randn(128, 1, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    rx = x.detach().clone().requires_grad_()
+    gate, up = F.linear(rx, ref["linear_fc1.weight"]).float().chunk(2, -1)
+    activation = (4 * torch.tanh(gate / 4) * gate.sigmoid() * (25 * torch.tanh(up / 25))).to(
+        x.dtype
+    )
+    expected = F.linear(activation, ref["linear_fc2.weight"])
+    layer.pre_forward_comm(x)
+    layer.linear_fc1_forward_and_act()
+    layer.linear_fc2_forward()
+    layer.post_forward_comm()
+    actual = layer.get_output()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    dy = torch.randn_like(actual)
+    actual.backward(dy)
+    expected.backward(dy)
+    _assert_similarity(x.grad, rx.grad)
+    for name, param in params.items():
+        _assert_similarity(param.grad, ref[name].grad)
