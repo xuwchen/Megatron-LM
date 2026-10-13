@@ -1,5 +1,8 @@
 # Kimi-K3 + GTP quick start
 
+For the full Kimi-K3 text backbone and Qwen3.5-VL examples, see
+[the GTP launch guide](../gtp/README.md).
+
 Run from this Megatron checkout inside a GPU container with four H100 80GB GPUs:
 
 ```bash
