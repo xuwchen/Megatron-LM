@@ -232,6 +232,23 @@ class KimiDeltaAttention(_GDNBase):
         # Pass raw g to FLA and let the KDA kernel apply A_log and dt_bias.
         self.use_gate_in_kernel = True
 
+    def set_for_recompute_input_layernorm(self) -> None:
+        """Keep original norm outputs for output-discarding FP8 recomputation."""
+        from megatron.core.extensions.transformer_engine import set_save_original_input
+
+        # Every direct consumer must retain the same original tensor so the
+        # input-layernorm checkpoint can discard and restore its output storage.
+        # LoRA up projections consume a separate latent tensor and do not need it.
+        set_save_original_input(self.in_proj)
+        set_save_original_input(self.beta_proj)
+        if not self.use_legacy_fused_projections:
+            set_save_original_input(
+                self.f_proj if self.config.kda_f_lora_rank is None else self.f_a_proj
+            )
+            set_save_original_input(
+                self.g_proj if self.config.kda_gate_lora_rank is None else self.g_a_proj
+            )
+
     def _setup_variant_attrs(self) -> None:
         """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
 

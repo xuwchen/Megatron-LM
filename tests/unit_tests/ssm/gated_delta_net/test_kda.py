@@ -112,6 +112,27 @@ def _build_kda(config: TransformerConfig) -> KimiDeltaAttention:
     ).cuda()
 
 
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA KDA is required")
+@pytest.mark.parametrize("f_rank,gate_rank", [(None, None), (32, None), (None, 32), (32, 32)])
+def test_kda_input_layernorm_recompute_preserves_direct_projection_inputs(f_rank, gate_rank):
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        config = _make_config(f_lora_rank=f_rank, gate_lora_rank=gate_rank)
+        model_parallel_cuda_manual_seed(123)
+        module = _build_kda(config)
+        module.set_for_recompute_input_layernorm()
+        consumers = [module.in_proj, module.beta_proj]
+        if f_rank is not None or gate_rank is not None:
+            consumers.append(module.f_proj if f_rank is None else module.f_a_proj)
+            consumers.append(module.g_proj if gate_rank is None else module.g_a_proj)
+        assert all(proj.save_original_input for proj in consumers)
+        for name in ("f_b_proj", "g_b_proj"):
+            if hasattr(module, name):
+                assert not getattr(module, name).save_original_input
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_kda_config_rejects_unsupported_head_layouts():
     with pytest.raises(ValueError, match="equal key and value head counts"):
         replace(_make_config(), linear_num_value_heads=8)
