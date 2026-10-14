@@ -554,6 +554,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         mock.patch.object(training_mod, "get_args", return_value=args),
         mock.patch.object(training_mod, "get_timers", return_value=mock.Mock()),
         mock.patch.object(training_mod, "get_one_logger", return_value=None),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
         mock.patch.object(training_mod, "unwrap_model", return_value=[unwrapped_model]),
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "get_current_global_batch_size", return_value=1),
