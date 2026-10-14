@@ -95,6 +95,19 @@ updates, and the offloader's own load conversions. It does not bound the full se
 window or all temporary memory internal to a distributed checkpoint strategy. The legacy torch
 checkpoint path can reconstruct the full state on CUDA and is not supported.
 
+### Restore timing and gradient-finalization memory
+
+By default, master/state H2D prefetch starts before gradient finalization to overlap the
+transfer with gradient reductions. Large coalesced replicated-gradient buffers can therefore
+be live together with the full master-weight window.
+
+Use `--optimizer-state-offload-defer-prefetch` to start that prefetch only after gradient
+finalization returns. The existing H2D stream dependency orders the transfer after the
+reductions; no extra CUDA synchronization is introduced. Reduction collectives, gradient
+precision, global clipping, and optimizer math are unchanged. This can reduce peak memory
+at the cost of transfer overlap. It does not reduce the master window itself or optimizer
+workspace, and has no effect when chunked offload is disabled or its fraction is zero.
+
 The deprecated `--offload-optimizer-states` argument remains as a parser compatibility spelling.
 Configuration validation emits a visible `FutureWarning`, enables the new mode, and consumes the
 legacy field so copying the normalized configuration does not warn again. Its default-equivalent

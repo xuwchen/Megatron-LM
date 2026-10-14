@@ -3822,8 +3822,9 @@ def train_step(
         and args.overlap_param_gather
     )
     if chunked_optimizer_state_offload:
-        # Prefetch masters and the first state chunk as late as possible so H2D overlaps
-        # gradient finalization. Preserve custom hooks and avoid wrapping more than once.
+        # Restore masters and the first state chunk at the gradient-finalization boundary.
+        # By default H2D overlaps finalization; the low-memory option defers it until after
+        # reduction scratch is released. Preserve custom hooks and avoid wrapper nesting.
         finalize_model_grads_func = getattr(config, 'finalize_model_grads_func', None)
         if (
             getattr(
@@ -3842,8 +3843,18 @@ def train_step(
                 base_finalize_model_grads_func = finalize_model_grads_func or finalize_model_grads
 
             def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
-                optimizer.prefetch_optimizer_state_for_gradient_finalization()
-                return base_finalize_model_grads_func(*fmg_args, **fmg_kwargs)
+                defer_prefetch = getattr(
+                    optimizer.config, 'optimizer_state_offload_defer_prefetch', False
+                )
+                if not defer_prefetch:
+                    optimizer.prefetch_optimizer_state_for_gradient_finalization()
+                result = base_finalize_model_grads_func(*fmg_args, **fmg_kwargs)
+                if defer_prefetch:
+                    # Gradient coalescing scratch is no longer live. The offloader orders
+                    # H2D after the current stream, preserving reduction/copy dependencies
+                    # without an explicit CUDA synchronization or changing the reductions.
+                    optimizer.prefetch_optimizer_state_for_gradient_finalization()
+                return result
 
             setattr(
                 finalize_model_grads_with_state_reload,

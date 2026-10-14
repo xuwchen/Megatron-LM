@@ -4094,6 +4094,13 @@ def _add_training_args(parser):
         'mutually exclusive. Zero disables optimizer state offload even when its flag is set.',
     )
     group.add_argument(
+        '--optimizer-state-offload-defer-prefetch',
+        action='store_true',
+        help='With chunked optimizer state offload, restore masters and state after gradient '
+        'finalization instead of overlapping gradient reductions. Reduces peak memory when '
+        'gradient coalescing requires large temporary buffers; optimizer math is unchanged.',
+    )
+    group.add_argument(
         '--offload-optimizer-states',
         action='store_true',
         dest='offload_optimizer_states',

@@ -3,6 +3,7 @@
 """Training-loop plumbing regression tests."""
 
 import inspect
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -74,12 +75,20 @@ def test_train_step_defaults_to_none():
     assert captured["p2p_communicator"] is None and captured["pg_collection"] is None
 
 
-def test_train_step_drives_chunked_optimizer_state_offload_lifecycle():
-    """MXFP8 staging must offload state first, then masters, through one API."""
+@pytest.mark.parametrize("defer_prefetch", [False, True])
+@pytest.mark.parametrize("finalize_raises", [False, True])
+def test_train_step_drives_chunked_optimizer_state_offload_lifecycle(
+    defer_prefetch, finalize_raises
+):
+    """Keep MXFP8 staging and requested restore ordering, including finalize failures."""
     events = []
+    finalized = object()
 
     class FakeOptimizer:
-        config = SimpleNamespace(chunked_optimizer_state_offload=True)
+        config = SimpleNamespace(
+            chunked_optimizer_state_offload=True,
+            optimizer_state_offload_defer_prefetch=defer_prefetch,
+        )
 
         def offload_optimizer_state_for_forward(self, offload_master=True):
             events.append(f"offload:{offload_master}")
@@ -115,14 +124,19 @@ def test_train_step_drives_chunked_optimizer_state_offload_lifecycle():
             remove_forward_pre_hook_handles=[],
         )
     ]
-    config = SimpleNamespace(
-        sequence_packing_scheduler=None,
-        finalize_model_grads_func=lambda *args, **kwargs: events.append("finalize"),
-    )
+
+    def finalize(model_arg, *, token_arg):
+        assert model_arg == "model" and token_arg == "tokens"
+        events.append("finalize")
+        if finalize_raises:
+            raise RuntimeError("gradient finalization failed")
+        return finalized
+
+    config = SimpleNamespace(sequence_packing_scheduler=None, finalize_model_grads_func=finalize)
 
     def forward_backward(**kwargs):
         events.append("forward_backward")
-        config.finalize_model_grads_func()
+        assert config.finalize_model_grads_func("model", token_arg="tokens") is finalized
         return []
 
     with (
@@ -132,6 +146,11 @@ def test_train_step_drives_chunked_optimizer_state_offload_lifecycle():
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "has_nvidia_modelopt", False),
         mock.patch.object(training_mod, "get_moe_router_tracer", return_value=None),
+        (
+            pytest.raises(RuntimeError, match="gradient finalization failed")
+            if finalize_raises
+            else nullcontext()
+        ),
     ):
         training_mod.train_step(
             forward_step_func=lambda *args, **kwargs: None,
@@ -150,9 +169,11 @@ def test_train_step_drives_chunked_optimizer_state_offload_lifecycle():
         "zero_grad",
         "offload:True",
         "forward_backward",
-        "prefetch",
-        "finalize",
-    ]
+    ] + (
+        (["finalize"] if finalize_raises else ["finalize", "prefetch"])
+        if defer_prefetch
+        else ["prefetch", "finalize"]
+    )
 
 
 def test_train_step_rebinds_finalize_prefetch_without_nesting_optimizers():

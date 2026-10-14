@@ -414,6 +414,14 @@ class OptimizerConfig:
     optimizer_state_offload_fraction: float = 1.0
     """Fraction of optimizer parameter bundles whose state and master weights are offloaded."""
 
+    optimizer_state_offload_defer_prefetch: bool = False
+    """Restore offloaded masters/state after gradient finalization instead of overlapping it.
+
+    Avoids overlapping the full master window with temporary gradient-reduction buffers.
+    This changes transfer scheduling only; optimizer math and gradient reductions are unchanged.
+    Has no effect when chunked optimizer state offload is disabled or its fraction is zero.
+    """
+
     offload_optimizer_states: bool = False
     """Deprecated alias for :attr:`chunked_optimizer_state_offload`."""
 
