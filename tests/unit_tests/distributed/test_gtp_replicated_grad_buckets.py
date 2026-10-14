@@ -50,7 +50,7 @@ def test_replicated_grad_buckets_match_individual_reductions(
             assert not grad.is_contiguous()
         param.main_grad = grad
         model.register_parameter(f'p{index}', param)
-        reference = grad.clone()
+        reference = grad.clone(memory_format=torch.contiguous_format)
         dist.all_reduce(reference, op=op, group=dense_group if param.allreduce else expert_group)
         expected[f'p{index}'] = reference
         pointers[f'p{index}'] = grad.data_ptr()
