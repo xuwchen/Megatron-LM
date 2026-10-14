@@ -4440,14 +4440,6 @@ def _add_distributed_args(parser):
         'with the standard ring implementation) but performs accumulation locally in FP32.',
     )
     group.add_argument(
-        '--gtp-replicated-grad-bucket-size-mb',
-        type=int,
-        default=None,
-        help='Coalescing target in MiB for replicated GTP gradient all-reduces. '
-        'An individual gradient larger than the target is reduced alone. '
-        'Default: one collective per dense/expert group.',
-    )
-    group.add_argument(
         '--gtp-remat-reduce-scatter-with-fp32-accumulation',
         action='store_true',
         default=False,

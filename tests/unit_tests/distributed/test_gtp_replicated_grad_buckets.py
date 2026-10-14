@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import argparse
 import weakref
 
 import pytest
@@ -12,6 +13,7 @@ from megatron.core.distributed.finalize_model_grads import (
     _allreduce_replicated_grads_over_gtp_remat_group,
 )
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.training.arguments import add_megatron_arguments
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -119,3 +121,10 @@ def test_bucketed_reduction_preserves_dtensor_placement(groups, per_token_loss):
 def test_invalid_replicated_grad_bucket_size(bucket_mb):
     with pytest.raises(ValueError, match='gtp_replicated_grad_bucket_size_mb must be positive'):
         ModelParallelConfig(gtp_replicated_grad_bucket_size_mb=bucket_mb)
+
+
+def test_replicated_grad_bucket_cli_registration():
+    parser = add_megatron_arguments(argparse.ArgumentParser())
+    assert parser.parse_args([]).gtp_replicated_grad_bucket_size_mb is None
+    args = parser.parse_args(['--gtp-replicated-grad-bucket-size-mb', '64'])
+    assert args.gtp_replicated_grad_bucket_size_mb == 64
