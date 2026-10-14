@@ -525,6 +525,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         load=None,
         pretrained_checkpoint=None,
         data_parallel_size=1,
+        batch_parallel_size=1,
         micro_batch_size=1,
         fp16=False,
         ckpt_convert_format=None,
