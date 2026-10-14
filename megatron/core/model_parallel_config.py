@@ -85,6 +85,14 @@ class ModelParallelConfig:
        (resolved in ``__post_init__``).
     """
 
+    gtp_replicated_grad_bucket_size_mb: Optional[int] = None
+    """Optional coalescing target in MiB for replicated GTP gradient reductions.
+
+    None retains one collective per dense/expert group. A gradient larger than
+    the target is reduced alone, so scratch is bounded by the larger of the
+    target and the largest individual gradient. NCCL settings are unchanged.
+    """
+
     gtp_weight_remat_size: int = 1
     """Generalized tensor parallelism with weight rematerialization. Shards model weights
        across GPU ranks along ``out_features``; each weight is rematerialized independently
@@ -650,6 +658,12 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if (
+            self.gtp_replicated_grad_bucket_size_mb is not None
+            and self.gtp_replicated_grad_bucket_size_mb <= 0
+        ):
+            raise ValueError("gtp_replicated_grad_bucket_size_mb must be positive")
+
         if self.hybrid_context_parallel:
             warnings.warn(
                 "hybrid_context_parallel is deprecated and will be removed in a future release. "

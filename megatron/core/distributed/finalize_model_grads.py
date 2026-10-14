@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -497,11 +497,42 @@ maintain for legacy tests. We can remove this proxy in mcore 0.14.
 _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
+def _iter_replicated_grad_buckets(
+    params: List[torch.nn.Parameter], grads: List[torch.Tensor], bucket_size_bytes: Optional[int]
+) -> Iterator[tuple[List[torch.nn.Parameter], List[torch.Tensor]]]:
+    """Keep parameter order and separate dtype/device buckets without splitting a gradient."""
+    if bucket_size_bytes is None:
+        if grads:
+            yield params, grads
+        return
+    if bucket_size_bytes <= 0:
+        raise ValueError("bucket_size_bytes must be positive")
+
+    bucket_params, bucket_grads = [], []
+    bucket_bytes = 0
+    for param, grad in zip(params, grads):
+        grad_bytes = grad.numel() * grad.element_size()
+        if bucket_grads and (
+            bucket_bytes + grad_bytes > bucket_size_bytes
+            or grad.dtype != bucket_grads[0].dtype
+            or grad.device != bucket_grads[0].device
+        ):
+            yield bucket_params, bucket_grads
+            bucket_params, bucket_grads = [], []
+            bucket_bytes = 0
+        bucket_params.append(param)
+        bucket_grads.append(grad)
+        bucket_bytes += grad_bytes
+    if bucket_grads:
+        yield bucket_params, bucket_grads
+
+
 def _allreduce_replicated_grads_over_gtp_remat_group(
     model: List[torch.nn.Module],
     gtp_remat_group: Optional[torch.distributed.ProcessGroup],
     egtp_remat_group: Optional[torch.distributed.ProcessGroup],
     calculate_per_token_loss: bool = False,
+    bucket_size_bytes: Optional[int] = None,
 ):
     """Complete the gtp_remat / egtp_remat axis reduction for replicated parameters.
 
@@ -548,19 +579,27 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
     ):
         if not grads or group is None or group.size() <= 1:
             continue
-        coalesced = _flatten_dense_tensors(grads)
         # SUM vs AVG per the loss-normalization regime documented above.
         op = (
             torch.distributed.ReduceOp.SUM
             if calculate_per_token_loss
             else torch.distributed.ReduceOp.AVG
         )
-        torch.distributed.all_reduce(coalesced, op=op, group=group)
-        for param, buf, synced in zip(params, grads, _unflatten_dense_tensors(coalesced, grads)):
-            buf.copy_(synced)
-            grad_attr = _get_main_grad_attr(param)
-            orig_grad = getattr(param, grad_attr)
-            setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
+        for bucket_params, bucket_grads in _iter_replicated_grad_buckets(
+            params, grads, bucket_size_bytes
+        ):
+            coalesced = _flatten_dense_tensors(bucket_grads)
+            torch.distributed.all_reduce(coalesced, op=op, group=group)
+            for param, buf, synced in zip(
+                bucket_params, bucket_grads, _unflatten_dense_tensors(coalesced, bucket_grads)
+            ):
+                buf.copy_(synced)
+                grad_attr = _get_main_grad_attr(param)
+                orig_grad = getattr(param, grad_attr)
+                setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
+            # The last unflattened view also retains the coalesced storage. Release
+            # both before allocating the next bucket to avoid overlapping scratch.
+            del synced, coalesced
 
 
 def finalize_model_grads(
@@ -668,11 +707,13 @@ def finalize_model_grads(
             barrier=config.barrier_with_L1_time
         )
     _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
+    gtp_bucket_size_mb = getattr(config, 'gtp_replicated_grad_bucket_size_mb', None)
     _allreduce_replicated_grads_over_gtp_remat_group(
         model,
         gtp_remat_group,
         egtp_remat_group,
         calculate_per_token_loss=config.calculate_per_token_loss,
+        bucket_size_bytes=gtp_bucket_size_mb * 1024**2 if gtp_bucket_size_mb is not None else None,
     )
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()
