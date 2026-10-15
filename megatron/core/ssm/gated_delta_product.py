@@ -14,11 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import (
-    LocalNonpersistentObject,
-    ReplicaId,
-    ShardedTensorFactory,
-)
+from megatron.core.dist_checkpointing.gtp import _gtp_split_tensor_factory
+from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_get_slice_after,
@@ -1177,98 +1174,4 @@ def _split_tensor_factory(
 
     return ShardedTensorFactory(
         orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
-    )
-
-
-def _gtp_split_tensor_factory(
-    orig_sh_ten: ShardedTensor,
-    split_sections: List[int],
-    split_names: List[str],
-    gtp_remat_rank: int,
-    tp_rank: int,
-    tp_size: int,
-) -> ShardedTensorFactory:
-    """Split a GTP shard of a TP-local tensor along dim 0 without gathering it.
-
-    Each rank saves views of the split sections covered by its local rows. The keys and global
-    shapes match the non-GTP factory, while DCP stores the uneven shard boundaries as-is.
-    Trailing alignment padding is omitted from the checkpoint and restored as zeros on load.
-    """
-    assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
-    orig_sh_ten_no_data = orig_sh_ten.without_data()
-    prepend_axis_num = orig_sh_ten_no_data.prepend_axis_num
-    prepend_shape = orig_sh_ten_no_data.global_shape[:prepend_axis_num]
-    prepend_offset = orig_sh_ten_no_data.global_offset[:prepend_axis_num]
-    local_rows, *trailing_shape = orig_sh_ten_no_data.local_shape
-    trailing_shape = tuple(trailing_shape)
-    shard_start = gtp_remat_rank * local_rows
-    shard_end = min(shard_start + local_rows, sum(split_sections))
-    valid_rows = max(0, shard_end - shard_start)
-    assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
-
-    # (name, rows of this shard, offset in the section's global dim 0, section's global dim 0).
-    pieces = []
-    section_start = 0
-    for section_size, section_name in zip(split_sections, split_names):
-        piece_start = max(section_start, shard_start)
-        piece_end = min(section_start + section_size, shard_end)
-        if piece_start < piece_end:
-            pieces.append(
-                (
-                    section_name,
-                    slice(piece_start - shard_start, piece_end - shard_start),
-                    tp_rank * section_size + piece_start - section_start,
-                    tp_size * section_size,
-                )
-            )
-        section_start += section_size
-
-    @torch.no_grad()
-    def sh_ten_build_fn(
-        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
-    ):
-        assert flattened_range is None, "flattened_range is not supported"
-        if not pieces:
-            # An empty list is dropped by checkpoint preprocessing, leaving the factory
-            # without a value to merge on load. Keep a local-only, zero-element tensor
-            # so the key and device survive without saving padding or retaining shard data.
-            return [LocalNonpersistentObject(t.new_empty((0,) + trailing_shape))]
-        chunk_sh_tens = []
-        for section_name, rows, section_offset, section_global_rows in pieces:
-            chunk = t[rows]
-            chunk_sh_tens.append(
-                ShardedTensor(
-                    key=f"{key}.{section_name}",
-                    data=chunk,
-                    dtype=chunk.dtype,
-                    local_shape=tuple(chunk.shape),
-                    global_shape=prepend_shape + (section_global_rows,) + trailing_shape,
-                    global_offset=prepend_offset + (section_offset,) + (0,) * len(trailing_shape),
-                    axis_fragmentations=None,
-                    replica_id=replica_id,
-                    prepend_axis_num=prepend_axis_num,
-                )
-            )
-        return chunk_sh_tens
-
-    @torch.no_grad()
-    def sh_ten_merge_fn(sub_state_dict):
-        # Rebuild the live shard: the loaded pieces, then zeros for the pad rows, as at init.
-        # Pad rows share MXFP8 scaling blocks with real rows, so they must not hold garbage.
-        merged = torch.empty(
-            (local_rows,) + trailing_shape,
-            dtype=orig_sh_ten_no_data.dtype,
-            device=sub_state_dict[0].device,
-        )
-        if valid_rows:
-            merged[:valid_rows] = torch.cat(sub_state_dict)
-        merged[valid_rows:].zero_()
-        return merged
-
-    # A fresh view prevents optimizer identity matching against the live param or its
-    # dequantized copy's _gtp_dequant_src backlink. The optimizer keeps the per-shard
-    # GTP state layout reconstructed by _backfill_gtp_sharded_param_map.
-    data = orig_sh_ten.data.view_as(orig_sh_ten.data)
-    return ShardedTensorFactory(
-        orig_sh_ten.key, data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
     )

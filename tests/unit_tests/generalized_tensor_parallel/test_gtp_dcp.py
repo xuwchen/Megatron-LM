@@ -422,7 +422,7 @@ def _worker_helper_padded_inproj_no_pad_case(rank, world_size, port):
 def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
     """in_proj with a dim-0 size needing GTP_remat padding (dim0=1160, gtp_remat_size=4,
     pad_for_alignment=16 -> 56 pad rows -> padded 1216, per-rank shard 304). Pins that the
-    padded global shape round-trips when save_gtp_remat_size == load_gtp_remat_size.
+    logical global shape excludes alignment padding.
     """
     update_gtp_config(pad_for_alignment=16)
     dim0_unpadded = 1160  # z(512) + x(512) + B(64) + C(64) + dt(8)
@@ -455,13 +455,10 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
         dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     st = sharded["weight"]
-    # Helper saves the padded global. Cross-topology portability (allow_shape_mismatch) is
-    # decided later, at load time, by grant_shape_mismatch_for_gtp_padding -- it's a save-time
-    # no-op regardless, so it's not baked in here.
-    assert (
-        st.global_shape[0] == dim0_padded
-    ), f"rank={rank} pad case: global_shape[0] {st.global_shape[0]} != {dim0_padded}"
-    assert st.global_offset[0] == rank * per_shard
+    assert st.global_shape[0] == dim0_unpadded
+    assert st.global_offset[0] == min(rank * per_shard, dim0_unpadded)
+    assert st.local_shape[0] == max(0, min(per_shard, dim0_unpadded - rank * per_shard))
+    assert not st.allow_shape_mismatch
 
 
 def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
@@ -495,14 +492,14 @@ def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
     )
     st = sharded["weight"]
     # 1. The saved global covers >= unpadded original size.
-    assert st.global_shape[0] >= dim0_unpadded, (
+    assert st.global_shape[0] == dim0_unpadded, (
         f"rank={rank} saved global_shape ({st.global_shape[0]}) < unpadded ({dim0_unpadded}); "
         f"would lose valid data on cross-topology reshard."
     )
     # 2. Each rank's offset+local_shape covers a contiguous slice of the
     #    padded global; together the ranks cover [0, padded_global).
     assert st.global_offset[0] + st.local_shape[0] <= st.global_shape[0]
-    assert st.global_offset[0] + st.local_shape[0] == (rank + 1) * per_shard
+    assert st.global_offset[0] + st.local_shape[0] == min((rank + 1) * per_shard, dim0_unpadded)
 
 
 def _worker_save_then_load_offsets_symmetric(rank, world_size, port):
@@ -1544,27 +1541,30 @@ def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
         assert isinstance(entry, ShardedTensor), type(entry)
         assert entry is not model_sd['mixer.in_proj.weight']
         assert entry.key == in_proj_w._debug_name, (entry.key, in_proj_w._debug_name)
-        assert tuple(entry.local_shape) == tuple(in_proj_w.shape), (
-            f"rebuilt local_shape {tuple(entry.local_shape)} != param shape "
-            f"{tuple(in_proj_w.shape)}"
+        valid = _gdp_valid_rows(
+            in_proj_w, in_proj_w.shape[0] * in_proj_w.gtp_remat_size - in_proj_w.pad_length
         )
-        # The rebuilt entry must describe this rank's GTP slice of the PADDED global (what the
-        # optimizer shard actually is), not the pad-stripped split chunks the model entry uses.
-        gtp_remat_rank = torch.distributed.get_rank(in_proj_w.group)
-        assert entry.global_offset[0] == gtp_remat_rank * in_proj_w.shape[0], (
-            entry.global_offset,
-            gtp_remat_rank,
+        assert tuple(entry.local_shape) == (valid,) + tuple(in_proj_w.shape[1:])
+        gtp_rank = in_proj_w.group.rank()
+        assert entry.global_offset[0] == gtp_rank * in_proj_w.shape[0]
+        assert (
+            entry.global_shape[0]
+            == in_proj_w.shape[0] * in_proj_w.gtp_remat_size - in_proj_w.pad_length
         )
-        assert entry.global_shape[0] == in_proj_w.shape[0] * in_proj_w.gtp_remat_size, (
-            entry.global_shape,
-            in_proj_w.shape,
-        )
-
-        # make_sharded_optimizer_tensor must accept it for a same-shape optimizer state tensor.
-        opt_state = torch.zeros_like(in_proj_w)
+        opt_state = torch.ones_like(in_proj_w)
         osh = make_sharded_optimizer_tensor(entry, opt_state, prefix='optimizer.state.exp_avg')
-        assert osh is not None
-        assert tuple(osh.local_shape) == tuple(in_proj_w.shape)
+        if isinstance(osh, ShardedTensorFactory):
+            from megatron.core.dist_checkpointing.dict_utils import dict_list_map_outplace
+
+            payload = dict_list_map_outplace(
+                lambda value: value.data if isinstance(value, ShardedTensor) else value.unwrap(),
+                osh.build(),
+            )
+            merged = osh.merge_fn(payload)
+            assert tuple(merged.shape) == tuple(in_proj_w.shape)
+            assert torch.count_nonzero(merged[valid:]) == 0
+        else:
+            assert tuple(osh.local_shape) == tuple(in_proj_w.shape)
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
@@ -1637,17 +1637,8 @@ def _worker_save_load_roundtrip_needs_gtp_inclusive_group(rank, world_size, ckpt
 
 
 def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
-    """Regression: a checkpoint saved at one GTP degree must still load at a different one, even
-    when only one side pads. Small-scale mirror of GTP64(pads 3072->4096)/GTP8(no pad) with
-    pad_for_alignment=32, dim0=192: saves at gtp_remat_size=4 (pads 192->256), loads at
-    gtp_remat_size=2 (no pad needed). grant_shape_mismatch_for_gtp_padding, called right before
-    load() (as production does), recognizes 256 as padding of true dim0=192 and sets
-    allow_shape_mismatch=True, so DCP's overlap-copy completes the load with correct data -- even
-    though the load-side shard grid doesn't line up with the save-side one (GTP2 rank 0 spans real
-    data written by both GTP4 rank 0 and rank 1).
-    """
+    """Save with padded GTP4, load GTP2 using exact logical shapes without a waiver."""
     from megatron.core.dist_checkpointing import load, save
-    from megatron.core.utils import grant_shape_mismatch_for_gtp_padding
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
     update_gtp_config(pad_for_alignment=32)  # mxfp8-like alignment
@@ -1688,7 +1679,7 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
         )  # save_gtp_group covers the whole world -- no replication, trivial replica group
         assert getattr(weight_save, "pad_length", 0) == 64, weight_save.pad_length
         sharded_save = _wrap(weight_save, "weight")
-        assert sharded_save["weight"].global_shape[0] == 256, sharded_save["weight"].global_shape
+        assert sharded_save["weight"].global_shape[0] == 192, sharded_save["weight"].global_shape
 
         weight_load = _make_gtp_shard(
             dim0, in_features, load_gtp_group, replica_group=load_replica_group
@@ -1701,11 +1692,7 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
 
         with TempNamedDir(ckpt_base / 'gtp_cross_degree_roundtrip', sync=True) as ckpt_dir:
             save(sharded_save, ckpt_dir)
-            # THE FIX: without this, allow_shape_mismatch stays False (pad_length==0 here) and
-            # strict validation raises comparing the checkpoint's 256 against the expected 192.
-            grant_shape_mismatch_for_gtp_padding(sharded_load, ckpt_dir, pad_for_alignment=32)
-            assert sharded_load["weight"].allow_shape_mismatch is True
-            # Pre-fix: raises CheckpointingException("Global shape mismatch ... (256) vs (192)").
+            assert sharded_load['weight'].allow_shape_mismatch is False
             loaded = load(sharded_load, ckpt_dir)
 
         load_gtp_rank = torch.distributed.get_rank(load_gtp_group)
@@ -1754,7 +1741,11 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
         weight_save = _make_gtp_shard(
             dim0, in_features, world_group, replica_group=trivial_replica_group
         )
-        sharded_save = _wrap(weight_save, "weight")
+        sharded_save = {
+            "weight": ShardedTensor.from_rank_offsets(
+                "weight", weight_save, (0, rank, world_size), replica_id=(0, 0, 0)
+            )
+        }
         assert sharded_save["weight"].global_shape[0] == 256, sharded_save["weight"].global_shape
 
         with TempNamedDir(ckpt_base / 'gtp_restrict_bound', sync=True) as ckpt_dir:
@@ -1824,12 +1815,9 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
             )
             assert getattr(weight_gtp_load, "pad_length", 0) == 28, weight_gtp_load.pad_length
             sharded_gtp_load = _wrap(weight_gtp_load, "weight_unaligned")
-            assert sharded_gtp_load["weight_unaligned"].global_shape[0] == 128
+            assert sharded_gtp_load["weight_unaligned"].global_shape[0] == 100
             grant_shape_mismatch_for_gtp_padding(sharded_gtp_load, ckpt_dir2, pad_for_alignment)
-            assert sharded_gtp_load["weight_unaligned"].allow_shape_mismatch is True, (
-                "declared0 (100) == dim0_unpadded (100) must always count as valid padding, even "
-                "though 100 is not itself a multiple of pad_for_alignment"
-            )
+            assert sharded_gtp_load['weight_unaligned'].allow_shape_mismatch is False
 
         # Pre-set: a tensor whose allow_shape_mismatch=True was already granted for a reason
         # unrelated to GTP (e.g. VocabParallelEmbedding's own vocab-padding logic) -- declared=50
@@ -2042,15 +2030,8 @@ def _worker_save_with_gtp_load_without_gtp_aligned(rank, world_size, ckpt_base):
         GTPShardedParam._chain_state.clear()
 
 
-def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_size, ckpt_base):
-    """Same reverse direction, but out_features needs alignment padding at save time
-    (pad_length > 0). The checkpoint then declares the PADDED global_shape; a load with GTP
-    disabled has no signal that padding is involved, so it requests the true (unpadded)
-    global_shape and must hard-fail with a global-shape-mismatch CheckpointingException rather
-    than silently truncating or corrupting data.
-    """
-    import traceback
-
+def _worker_save_with_gtp_padded_load_without_gtp(rank, world_size, ckpt_base):
+    """Save padded physical GTP shards and restore the exact unpadded model."""
     from megatron.core.dist_checkpointing import load, save
     from tests.unit_tests.dist_checkpointing import TempNamedDir
 
@@ -2066,13 +2047,9 @@ def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_siz
         )
         assert gtp_weight.pad_length == 4, gtp_weight.pad_length  # (8 - 20%8) % 8
 
-        # Checkpoint declares the padded shape (24, 8), not the true (20, 8).
+        # Checkpoint declares the logical shape; physical padding is omitted.
         gtp_sharded = _sharded_weight(
-            gtp_weight,
-            rank,
-            world_group,
-            gtp=True,
-            expect_global_shape=(out_features + 4, in_features),
+            gtp_weight, rank, world_group, gtp=True, expect_global_shape=(out_features, in_features)
         )
 
         with TempNamedDir(ckpt_base / 'gtp_padded_save', sync=True) as ckpt_dir:
@@ -2090,20 +2067,11 @@ def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_siz
                 expect_global_shape=(out_features, in_features),
             )
 
-            # load()'s real failure surfaces as torch's own collective-wrapping
-            # CheckpointException, which subclasses BaseException directly (not Exception!), so
-            # match on the underlying message rather than the wrapper type -- and run this
-            # identically (no rank-asymmetric branching) on every rank to avoid desyncing NCCL.
-            raised = False
-            try:
-                load(no_gtp_sharded, ckpt_dir)
-            except BaseException as e:  # noqa: BLE001
-                raised = True
-                full_msg = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-                assert "Global shape mismatch" in full_msg, full_msg
-            assert (
-                raised
-            ), "load() unexpectedly succeeded despite the padded/unpadded global_shape mismatch"
+            loaded = load(no_gtp_sharded, ckpt_dir)
+            expected = torch.arange(
+                out_features * in_features, dtype=torch.bfloat16, device='cuda'
+            ).reshape(out_features, in_features)
+            torch.testing.assert_close(loaded[_PREFIX + 'weight'], expected, rtol=0, atol=0)
     finally:
         update_gtp_config(pad_for_alignment=orig_pad)
         ps.initialize_model_parallel()
@@ -2228,8 +2196,6 @@ class TestGtpDcpHelper:
         _require_world_size(4)
         _worker_save_with_gtp_load_without_gtp_aligned(dist.get_rank(), 4, tmp_path_dist_ckpt)
 
-    def test_save_with_gtp_padded_load_without_gtp_shape_mismatch(self, tmp_path_dist_ckpt):
+    def test_save_with_gtp_padded_load_without_gtp(self, tmp_path_dist_ckpt):
         _require_world_size(4)
-        _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(
-            dist.get_rank(), 4, tmp_path_dist_ckpt
-        )
+        _worker_save_with_gtp_padded_load_without_gtp(dist.get_rank(), 4, tmp_path_dist_ckpt)

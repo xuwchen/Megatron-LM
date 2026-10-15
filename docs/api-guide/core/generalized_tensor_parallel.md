@@ -686,20 +686,40 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 
 **`_extra_state`.** This is TransformerEngine's per-module **FP8 calibration state** — for delayed-scaling recipes it holds the `recipe`, the forward/backward `scale` tensors and `amax_history` buffers, plus picklable `extra_fp8_variables`; for BF16 (non-FP8) runs it is an empty tensor. Because it is a pickled byte blob rather than a tensor with a meaningful shape, it is emitted as a `ShardedObject` (via `make_sharded_object_for_checkpoint`), not a `ShardedTensor`. Its amax/scale statistics are *per-tensor globals* for the **full** weight (amax is reduced across the FP8 group), so every GTP_remat peer carries an identical copy — which is exactly why it takes the replicated path above, with `gtp_rank` folded into its `replica_id`.
 
-**Alignment padding & cross-topology reshard.** When `_gtp_slice_one_param` pads `out_features` to a multiple of `gtp_remat_size · pad_for_alignment`, the saved global describes the *padded* shape, so the helper sets `allow_shape_mismatch=True`. DCP then tolerates a load-side topology whose alignment yields a different padded size — the unpadded data overlaps and the tail pad rows are zeros GTP_remat recomputes (§3.7 covers how that padding is laid out per rank).
+**Alignment padding & cross-topology reshard.** Padding is physical storage, not part of
+checkpoint coordinates. Column-parallel offsets use the unpadded TP-local row count;
+row-parallel tensors retain their TP column offsets. Entries omit pad rows, and loading
+restores the full physical buffer with a zero tail. Native-FP8 entries keep separate
+references for live-parameter identity and the dequantized checkpoint buffer. This avoids
+returning stale FP8 storage instead of the BF16 values loaded into that buffer. Existing
+shape-mismatch compatibility handling remains for older padded checkpoints; newly written
+checkpoints do not need that waiver for GTP alignment.
 
-> **SSM packed input projections.** Mamba still gathers its GTP shards before splitting
-> the TP-local projection. GDP instead uses `_gtp_split_tensor_factory` to save only the
-> intersections of each rank's rows with the householder-major `z|V*|K*|Q|b*|a` sections.
-> These pieces are views, so saving does not allocate a full TP-local projection or perform
-> an all-gather. Their keys and global shapes match non-GTP and earlier gather-based GDP
-> checkpoints; DCP handles the uneven fragment boundaries. Alignment padding is not saved.
->
-> On load, GDP concatenates only the local pieces and zeroes the trailing padding, including
-> padding that shares MXFP8 scaling blocks with real rows. An all-padding rank retains a
-> zero-element `LocalNonpersistentObject` through DCP preprocessing so its factory can still
-> reconstruct the local shard. The factory exposes a distinct view to preserve the optimizer's
-> existing per-shard state layout via `_backfill_gtp_sharded_param_map`.
+**Kimi-K3 fused projections.** KDA inherits the checkpoint path in `_GDNBase`.
+Its packed input projection, dense/shared-expert GLU `fc1`, and routed-expert EGTP `fc1`
+use the local-fragment helper in `dist_checkpointing/gtp.py`. This extends GDP's
+`_gtp_split_tensor_factory`: each rank saves views of the intersections between its own
+physical rows and the logical sections. There is no GTP-group model-weight all-gather.
+SSM section keys and GLU gate-major/up-major coordinates match ordinary TP checkpoints;
+expert axes and replica ownership are preserved. Source-bound optimizer companions use
+these same logical fragments for FP32 masters and moments, including flat DP slices that
+start or end within a row. They do not gather optimizer tensors across GTP either. Ordinary
+DP exchanges of the selected distributed-optimizer format remain unchanged.
+
+The model factory reconstructs only the local shard and zeroes unsaved padding. Entirely
+padded ranks retain local nonpersistent metadata so DCP preprocessing cannot drop the key
+needed on load. Physical shard sizes come from the untrimmed buffer, never from a shortened
+checkpoint entry. Optimizer factory metadata requires stable group/parameter indices for
+master weights; the Float16 and LayerWise wrappers preserve those indices and accept older
+list-based master layouts on load.
+
+GDP continues to use the same local model fragments introduced by its standalone fix, with
+its existing unsplit optimizer-key fallback. Mamba's existing gather path is retained; it
+reads the untrimmed checkpoint buffer to keep collective sizes equal. Neither is converted
+to the Kimi-K3 optimizer companion path by this change. Forward/backward arithmetic and
+training collectives are unchanged. Previously written physical GTP optimizer layouts are
+not automatically migrated into the new semantic fused-projection layouts; resume must use
+a checkpoint with matching optimizer keys.
 
 **Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP_remat/EGTP_remat each peer owns a *different* master shard (the optimizer shards over the gtp_remat/egtp_remat-**excluded** replicate group), so the index is taken from the gtp_remat/egtp_remat-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_remat_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
 
@@ -930,7 +950,7 @@ Case A is what §1.3's "tail slice" framing describes for the reassembled tensor
 
 - **Uniform shard sizes without runtime coordination.** `pad_length` is a pure function of `dim0`, `pad_for_alignment`, and `gtp_remat_size` — computed once, locally, at shard-construction time. No cross-rank negotiation is needed to agree on a shard size before the first AG/RS.
 - **Equal-sized AG/RS shards fall out for free.** For MXFP8/NVFP4, `pad_for_alignment` is set to the precision format's tile size, so the same pass that satisfies tiling also leaves every rank with an equal-sized shard. For BF16, `pad_for_alignment=1` rounds `dim0` up to the next multiple of `gtp_remat_size` directly — no tile size to satisfy, so padding is only the minimum AG/RS itself requires.
-- **A contiguous tail keeps stripping (and resharding) cheap.** Padding is always appended as a suffix *before* slicing, never interleaved with real data, so recovering the logical tensor is a single trailing slice (`tensor[:-pad_length]`) — simple enough to stay correct even when a checkpoint reload changes `gtp_remat_size` and thus the padded size (§3.3's `allow_shape_mismatch`).
+- **A contiguous tail keeps stripping (and resharding) cheap.** Padding is always appended as a suffix *before* slicing, never interleaved with real data, so recovering the logical tensor is a single trailing slice (`tensor[:-pad_length]`) — simple enough to stay correct even when a checkpoint reload changes `gtp_remat_size` and thus the padded size (§3.3's logical checkpoint coordinates).
 - **A predictable invariant other systems can build on.** "Padding is always an exact structural zero, never written" is safe for any consumer that needs to distinguish real elements from padding — DCP's cross-topology reshard tolerance (§3.3) and the wgrad-ring's fixed-address buffers (§3.6) both lean on it, and it's what lets `count_zeros_fp32` exclude these permanent zeros from `num_zeros` instead of miscounting them as converged-to-zero gradients.
 
 #### Trade-off
@@ -974,6 +994,7 @@ done
 | `test_gtp_cudagraph_grad.py` | Capture-step grad-norm guard (§1.2): `_backup_grads_before_capture`/`_restore_grads_after_capture` keep a graph capture from clobbering finalized `main_grad` (own params + cross-graph `next_w`, incl. routed-expert `weight_list`). |
 | `test_gtp_partial_cg.py` | Four-layer partial-CG loss and eager-vs-replay grad-norm parity with two-slot ring reuse across independently replayed graphs (§3.5). |
 | `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. Also GDP local-fragment save/load: coverage and storage aliasing, padding-only ranks, a full mixer roundtrip, and GTP/non-GTP cross-load compatibility. |
+| `test_gtp_local_checkpoint.py` | Kimi-K3 local projection fragments; partial/all-padding ranks; flat Adam fragments; model/master/momentum cross-layout DCP loads and a continued update; real KDA, dense/shared MLP and EP2×EGTP2 wiring; stable mixed master indices. |
 | `test_gtp_muon.py` | Newton–Schulz per-shard parity for all three GTP_remat modes (§1.6): blockwise/duplicated/distributed at TP1, plus row- and column-parallel cases at `tp_size != gtp_remat_size` in both directions. |
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
 | `test_gtp_muon_qkv.py` | Layout-invariant split-QKV (§1.6): the decision uses the across-shards row count (with the production shape that a shard-local test rejected), the split runs after the all-gather so the GTP_remat shard equals TP1's result restricted to this rank's rows, and `blockwise`/`distributed` fall back to whole-matrix Newton–Schulz bitwise, warning once. |
