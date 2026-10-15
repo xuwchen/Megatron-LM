@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Input/output checkpointing."""
 
@@ -33,6 +33,7 @@ from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
+from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
@@ -2217,6 +2218,30 @@ def _load_global_dist_base_checkpoint(
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 
+def _ignored_runtime_state_template(checkpoint_name, keys):
+    """Read explicitly unused runtime objects without weakening strict model loading.
+
+    A steady-state rerun sentinel is persisted for constant checkpoint structure,
+    even though it must not resume a rerun. RNG state can likewise be deliberately
+    unused after a topology change. Include their saved object layouts in the load
+    request, then discard the values rather than applying incompatible runtime state.
+    All model and optimizer keys remain subject to the original strictness policy.
+    """
+    if not keys:
+        return {}
+    metadata = load_sharded_metadata(checkpoint_name)
+    objects = [
+        (name, value)
+        for name, value in sorted(metadata.items())
+        if isinstance(value, ShardedObject) and value.key in keys
+    ]
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    return {
+        name: value for index, (name, value) in enumerate(objects) if index % world_size == rank
+    }
+
+
 def _get_checkpoint_format(checkpoint_name, args):
     """Get the format of an existing checkpoint."""
     checkpoint_dir = maybe_msc.Path(checkpoint_name)
@@ -3129,6 +3154,18 @@ def load_checkpoint(
             for model_key in ('model', *(f'model{i}' for i in range(len(model)))):
                 if model_key in load_kwargs['sharded_state_dict']:
                     model_sharded_state_dict_modifier(load_kwargs['sharded_state_dict'][model_key])
+        # Loading a saved runtime object and applying it are distinct decisions.
+        # In particular, validate_state_dict rejects a normal rerun sentinel;
+        # omitting its ShardedObject would make raise_all reject a healthy resume.
+        ignored_runtime_keys = set()
+        if ignore_rng_state:
+            ignored_runtime_keys.add(f'{rng_state_key_prefix}rng_state')
+        if gen_sd_rerun_state is None and state_dict.get('rerun_state_machine') is not None:
+            ignored_runtime_keys.add('rerun_state_machine_state')
+        if ckpt_type == CheckpointType.GLOBAL and ignored_runtime_keys:
+            load_kwargs['sharded_state_dict']['_ignored_runtime_state'] = (
+                _ignored_runtime_state_template(checkpoint_name, ignored_runtime_keys)
+            )
     elif args.ckpt_format == 'torch_dcp':
         model_sd = model[0].state_dict()
         if tp_group is None and pp_group is None:
@@ -3237,6 +3274,9 @@ def load_checkpoint(
         gtp_pad_for_alignment=gtp_pad_for_alignment,
         **load_kwargs,
     )
+
+    if state_dict is not None:
+        state_dict.pop('_ignored_runtime_state', None)
 
     # Checkpoint not loaded.
     if state_dict is None:
