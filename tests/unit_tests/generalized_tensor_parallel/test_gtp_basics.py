@@ -1750,6 +1750,7 @@ class TestGTPCaptureParamReadiness:
             (),
             {
                 "_already_ag_drained": True,
+                "_prefetch_handle": None,
                 "_weights": (),
                 "ag_event": FakeEvent(),
                 "_wait_param_gather": lambda self: calls.append("handle_wait"),
@@ -1779,6 +1780,7 @@ class TestGTPCaptureParamReadiness:
             (),
             {
                 "_recompute_already_drained": True,
+                "_recompute_prefetch_handle": None,
                 "_weights": (),
                 "_recompute_ag_event": FakeEvent(),
                 "_wait_recompute_param_gather": lambda self: calls.append("handle_wait"),
@@ -1790,6 +1792,53 @@ class TestGTPCaptureParamReadiness:
 
         assert calls == ["event_wait"]
         assert param._recompute_already_drained is False
+
+    @pytest.mark.parametrize("mode", ["forward", "backward", "recompute"])
+    def test_pending_prefetch_supersedes_previous_drain(self, monkeypatch, mode):
+        """A stale handoff marker must not let a consumer bypass a newer gather."""
+        calls = []
+
+        class ExpectedEventWait(Exception):
+            pass
+
+        class FakeEvent:
+            def wait(self):
+                calls.append("event_wait")
+                raise ExpectedEventWait
+
+        recompute = mode == "recompute"
+        handle_attr = "_recompute_prefetch_handle" if recompute else "_prefetch_handle"
+        marker_attr = "_recompute_already_drained" if recompute else "_already_ag_drained"
+        wait_method = "_wait_recompute_param_gather" if recompute else "_wait_param_gather"
+        event_attr = "_recompute_ag_event" if recompute else "ag_event"
+
+        def wait_for_current_gather(param):
+            assert getattr(param, handle_attr) is not None
+            calls.append("handle_wait")
+            setattr(param, handle_attr, None)
+
+        param = type(
+            "Param",
+            (),
+            {
+                marker_attr: True,
+                handle_attr: object(),
+                "_weights": (),
+                event_attr: FakeEvent(),
+                wait_method: wait_for_current_gather,
+            },
+        )()
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", False)
+
+        with pytest.raises(ExpectedEventWait):
+            if recompute:
+                GTPShardedParam._get_recompute_prefetched_weight(param)
+            else:
+                GTPShardedParam._get_prefetched_weight(param, fwd=mode == "forward")
+
+        assert calls == ["handle_wait", "event_wait"]
+        assert getattr(param, handle_attr) is None
+        assert getattr(param, marker_attr) is False
 
     def test_warmup_exception_is_not_masked_by_leaked_handle(self):
         class WarmupError(Exception):
