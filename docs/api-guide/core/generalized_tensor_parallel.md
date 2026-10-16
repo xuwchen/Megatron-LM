@@ -571,7 +571,7 @@ A future MR will add an opt-in wgrad-before-dgrad schedule on `_Linear` / `_Laye
 
 When a GTP_remat-sharded module is in `--recompute-modules` (e.g. `shared_experts`), its forward is **re-run during backward** to regenerate activations. That recompute-forward must all-gather each weight **rowwise** again — a *third* gather lifecycle, concurrent with the in-flight **columnwise** dgrad gather of the *same* weight. Since both share one `GTPShardedParam`, the recompute path gets its **own** prefetch slot (`_recompute_prefetch_handle` / `_recompute_ag_event`) so it never clobbers the dgrad lifecycle's `state` / `_prefetch_handle` / `ag_event`, and its **own** buffer ticket (`_ag_ticket_recompute`) with a parity of its own. Reusing `_ag_ticket_fwd` is unsafe twice over: a fwd prefetch may still be in flight in that buffer, and the fwd parity is decided against `prev_w` — a different neighbour. Without its own parity, consecutive recompute nodes share one buffer and the one-ahead prefetch overwrites the weight still being read: silent wrong activations, then NaN.
 
-The recompute weights form a **separate** linked list (`_recompute_next`), **self-populated** on the first backward from the weights actually re-gathered while `in_fp8_activation_recompute_phase()` is true — membership is *observed*, not configured (no tagging, so it tracks exactly what each checkpointed module re-gathers). Each recompute-forward consume prefetches the next recompute weight, so every gather **except the global-first** overlaps preceding recompute / dgrad / wgrad compute:
+The recompute weights form a **separate** linked list (`_recompute_next`), **self-populated** on the first backward from the weights actually re-gathered while `in_activation_recompute_phase()` is true — membership is *observed*, not configured (no tagging, so it tracks exactly what each checkpointed module re-gathers). Each recompute-forward consume prefetches the next recompute weight, so every gather **except the global-first** overlaps preceding recompute / dgrad / wgrad compute:
 
 ```
 recompute-fwd of shared_experts  (per layer: GEMM fc1 → SReLU → GEMM fc2, then dgrad+wgrad)
@@ -584,6 +584,13 @@ recompute-fwd of shared_experts  (per layer: GEMM fc1 → SReLU → GEMM fc2, th
 ```
 
 `AG(fc2)` is issued at `fc1`'s consume (overlaps GEMM fc1 + SReLU); `AG(fc1')` for the next layer is issued at `fc2`'s consume, so it overlaps the **whole** layer's `dgrad + wgrad` window. The cross-layer link is what hides every region head except the very first.
+
+Native MCore `checkpoint` and `CheckpointWithoutOutput` mark their recomputed forward with a
+context-local flag. GTP combines this marker with TE's recompute-phase flag. In particular, a
+BF16 native checkpoint does not enter TE's FP8 metadata bookkeeping: without its own marker,
+GTP would treat the replay as ordinary forward and could read a buffer reused by backward
+prefetch. The native marker covers only the recomputed callable and is restored on exit,
+including nested recomputation and exceptions.
 
 Under **full-iteration CUDA graphs** the recompute-forward is captured; `wait_async_comms(GRAPHED)` drains the recompute handle too (sets `_recompute_already_drained`) so the captured consumer skips its cross-graph wait — the same producer-drain pattern as the fwd/bwd chains.
 

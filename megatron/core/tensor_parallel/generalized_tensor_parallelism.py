@@ -106,9 +106,13 @@ except (ImportError, ModuleNotFoundError):
     nvtx_range_pop = nvtx_range_push = round_up_to_nearest_multiple = MagicMock()
     HAVE_TE = False
 
-# TE's name says fp8, but the flag it returns is set for BF16 activation recompute too (the
-# FP8-gated helper is `is_fp8_activation_recompute_enabled`). Alias it so call sites read right.
-in_activation_recompute_phase = in_fp8_activation_recompute_phase
+
+def in_activation_recompute_phase() -> bool:
+    """Recognize both native MCore and TE activation recomputation, including BF16."""
+    from megatron.core.tensor_parallel.random import is_activation_recomputing
+
+    # Native BF16 checkpoints do not set TE's marker or manage its FP8 metadata queue.
+    return is_activation_recomputing() or in_fp8_activation_recompute_phase()
 
 
 class GTPChain(str, Enum):
