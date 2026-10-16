@@ -449,7 +449,7 @@ def apply_gtp_swiglu_sharded_factory(
             ['w', 'v'],
             tp_group,
             glu=True,
-            singleton=singleton_local_shards,
+            singleton_local_shards=singleton_local_shards,
         )
     return attach_optimizer_factory(
         apply_swiglu_sharded_factory(entry, sharded_offsets, singleton_local_shards), weight

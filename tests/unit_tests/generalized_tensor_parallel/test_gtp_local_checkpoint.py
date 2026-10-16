@@ -326,9 +326,9 @@ def test_real_kimi_module_uses_local_fragments(kind):
         GTPShardedParam._chain_state = {}
 
 
-@pytest.mark.parametrize("legacy_lists", [False, True, "indexed_lists"])
+@pytest.mark.parametrize("master_layout", ["factories", "legacy_lists", "indexed_lists"])
 @pytest.mark.parametrize("layerwise", [False, True])
-def test_mixed_master_factories_preserve_parameter_indices_through_load(legacy_lists, layerwise):
+def test_mixed_master_factories_preserve_parameter_indices_through_load(master_layout, layerwise):
     """Only the middle master has local factory metadata; neighbors must not shift."""
     from types import SimpleNamespace
 
@@ -371,7 +371,7 @@ def test_mixed_master_factories_preserve_parameter_indices_through_load(legacy_l
         owner.chained_optimizers = [wrapper]
         owner.pg_collection = SimpleNamespace()
         owner.model_chunks = []
-    if legacy_lists:
+    if master_layout != "factories":
         restored = wrapper.state_dict()
         restored["fp32_from_fp16_params"] = [[param.detach().clone() for param in masters]]
     else:
@@ -388,7 +388,7 @@ def test_mixed_master_factories_preserve_parameter_indices_through_load(legacy_l
         merge(nonpersistent, loaded)
         apply_factory_merges(nonpersistent, factories)
         restored = nonpersistent
-    if legacy_lists == "indexed_lists":
+    if master_layout == "indexed_lists":
         restored["fp32_from_fp16_params"] = dict(enumerate(restored["fp32_from_fp16_params"]))
     for param in masters:
         param.data.fill_(-999)

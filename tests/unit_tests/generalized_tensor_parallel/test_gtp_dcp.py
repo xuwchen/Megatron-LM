@@ -491,13 +491,12 @@ def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
         dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     st = sharded["weight"]
-    # 1. The saved global covers >= unpadded original size.
-    assert st.global_shape[0] == dim0_unpadded, (
-        f"rank={rank} saved global_shape ({st.global_shape[0]}) < unpadded ({dim0_unpadded}); "
-        f"would lose valid data on cross-topology reshard."
-    )
-    # 2. Each rank's offset+local_shape covers a contiguous slice of the
-    #    padded global; together the ranks cover [0, padded_global).
+    # 1. Checkpoint coordinates describe exactly the unpadded tensor.
+    assert (
+        st.global_shape[0] == dim0_unpadded
+    ), f"rank={rank} saved global_shape ({st.global_shape[0]}) != unpadded ({dim0_unpadded})"
+    # 2. Each shard ends at its physical boundary or the logical tensor end.
+    #    Together the ranks cover the unpadded tensor without saving padding.
     assert st.global_offset[0] + st.local_shape[0] <= st.global_shape[0]
     assert st.global_offset[0] + st.local_shape[0] == min((rank + 1) * per_shard, dim0_unpadded)
 
@@ -1217,13 +1216,11 @@ def test_gdp_gtp_padding_save_load_preprocessing(device, dtype, gtp_rank, valid_
         merge,
         nested_values,
     )
+    from megatron.core.dist_checkpointing.gtp import _gtp_split_tensor_factory
     from megatron.core.dist_checkpointing.mapping import apply_factory_merges
     from megatron.core.dist_checkpointing.state_dict_utils import load_preprocess, save_preprocess
     from megatron.core.dist_checkpointing.utils import extract_sharded_base
-    from megatron.core.ssm.gated_delta_product import (
-        _get_in_proj_checkpoint_split_layout,
-        _gtp_split_tensor_factory,
-    )
+    from megatron.core.ssm.gated_delta_product import _get_in_proj_checkpoint_split_layout
 
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
@@ -1497,7 +1494,7 @@ def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
     """GDP ``in_proj`` must survive the optimizer id->ShardedTensor match (Muon path, §1.6).
 
     Same gap as the Mamba case (``_worker_mamba_inproj_optim_param_map``): the model entry for a
-    split ``in_proj`` exposes the a distinct tensor view, so it never id-matches the per-shard
+    split ``in_proj`` exposes a distinct tensor view, so it never id-matches the per-shard
     GTP optimizer param and ``get_param_id_to_sharded_param_map`` drops it -> KeyError in
     ``Float16OptimizerWithFloat16Params.sharded_state_dict``. Unlike that test, this one drives the
     real production backfill (``_backfill_gtp_sharded_param_map``) rather than reproducing its

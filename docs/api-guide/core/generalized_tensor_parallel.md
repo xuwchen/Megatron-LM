@@ -715,12 +715,13 @@ use the local-fragment helper in `dist_checkpointing/gtp.py`. This extends GDP's
 `_gtp_split_tensor_factory`: each rank saves views of the intersections between its own
 physical rows and the logical sections. There is no GTP-group model-weight all-gather.
 SSM section keys and GLU gate-major/up-major coordinates match ordinary TP checkpoints;
-expert axes and replica ownership are preserved. Source-bound optimizer companions use
+expert axes and replica ownership are preserved. The `singleton_local_shards` option keeps
+GLU gate/up keys separate when required by the checkpoint backend; all helper layers use
+the same option name. Source-bound optimizer companions use
 these same logical fragments for FP32 masters and moments, including flat DP slices that
 start or end within a row. Slice ranges index the already-local fragment concatenation
 directly; no second shard offset is needed. They do not gather optimizer tensors across GTP
-either. Ordinary
-DP exchanges of the selected distributed-optimizer format remain unchanged.
+either. Ordinary DP exchanges of the selected distributed-optimizer format remain unchanged.
 
 Both checkpointable and legacy PyTorch shard loaders restore plain padded weights through
 the same local-buffer helper, using the loaded tensor even when it no longer aliases the
@@ -1003,7 +1004,7 @@ done
 
 | Test file | What it guards |
 |-----------|----------------|
-| `test_gtp_basics.py` | Core GTP_remat shard/gather, cache ownership, wgrad ring, DDP bucket alignment, the `num_zeros` padding correction (§3.7), and TE's recompute-phase flag (dtype-agnostic, relied on by the readiness gate in §3.2). |
+| `test_gtp_basics.py` | Core GTP_remat shard/gather, cache ownership, wgrad ring, DDP bucket alignment, the `num_zeros` padding correction (§3.7), and the TE/native recompute-phase flags (including both native checkpoint APIs under BF16, §3.2). |
 | `test_attention_gtp.py` | GTP_remat on attention linears, loss parity vs no-GTP_remat. |
 | `test_mamba_gtp.py` | GTP_remat on Mamba projection weights. |
 | `test_tp_gtp.py` | GTP_remat composed with tensor parallelism (`tp_group × gtp_remat_group`). |

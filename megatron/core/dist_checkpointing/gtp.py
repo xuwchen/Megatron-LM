@@ -135,7 +135,7 @@ def split_gtp_projection(
     tp_group: torch.distributed.ProcessGroup | None,
     *,
     glu: bool = False,
-    singleton: bool = False,
+    singleton_local_shards: bool = False,
 ) -> ShardedTensorFactory | None:
     """Return a local GTP split factory, or None for ordinary TP parameters."""
     from megatron.core.tensor_parallel import gtp_api
@@ -156,5 +156,5 @@ def split_gtp_projection(
         get_pg_size(tp_group),
         weight=weight,
         glu=glu,
-        singleton_local_shards=singleton,
+        singleton_local_shards=singleton_local_shards,
     )
