@@ -700,6 +700,14 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 
 **`_extra_state`.** This is TransformerEngine's per-module **FP8 calibration state** — for delayed-scaling recipes it holds the `recipe`, the forward/backward `scale` tensors and `amax_history` buffers, plus picklable `extra_fp8_variables`; for BF16 (non-FP8) runs it is an empty tensor. Because it is a pickled byte blob rather than a tensor with a meaningful shape, it is emitted as a `ShardedObject` (via `make_sharded_object_for_checkpoint`), not a `ShardedTensor`. Its amax/scale statistics are *per-tensor globals* for the **full** weight (amax is reduced across the FP8 group), so every GTP_remat peer carries an identical copy — which is exactly why it takes the replicated path above, with `gtp_rank` folded into its `replica_id`.
 
+**Activation extra-state writers.** Dense/shared MLPs pass their TP group to the
+fallback checkpoint wrapper for activation modules. A grouped-expert activation has
+one shared key, without the per-expert axis used by its linear layers, so its writer
+election uses dense TP together with the dense DP group in checkpoint metadata.
+Using expert TP for this shared key can elect multiple writers when ETP is smaller
+than TP. This changes checkpoint replica ownership only; tensor payloads and training
+arithmetic are unchanged.
+
 **Alignment padding & cross-topology reshard.** Padding is physical storage, not part of
 checkpoint coordinates. Column-parallel offsets use the unpadded TP-local row count;
 row-parallel tensors retain their TP column offsets. Entries omit pad rows, and loading

@@ -218,6 +218,7 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+        self.dense_tp_group = pg_collection.tp
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -1099,8 +1100,12 @@ class TEGroupedMLP(MegatronModule):
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
+            # The activation has one checkpoint key, not one key per expert. Its
+            # extra state is replicated over dense TP and the metadata's dense DP.
+            # Expert TP alone leaves duplicate writers when ETP is smaller than TP.
+            tp_group = self.dense_tp_group if name == 'activation_func' else self.tp_group
             sub_sd = sharded_state_dict_default(
-                module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
+                module, f'{name}.', sharded_offsets, metadata, tp_group=tp_group
             )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
