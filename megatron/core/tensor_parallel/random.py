@@ -9,6 +9,7 @@ import enum
 import logging
 import weakref
 from collections.abc import Callable
+from contextvars import ContextVar
 from typing import Any, Optional, TypeVar, Union
 
 import torch
@@ -673,6 +674,25 @@ def _fork_rng():
         _set_all_rng_states(*current_states)
 
 
+# Native checkpoints do not enter TE's FP8 recompute contexts. Track their
+# recomputed forward independently so GTP can use its separate gather lifecycle.
+_ACTIVATION_RECOMPUTE_PHASE = ContextVar("mcore_activation_recompute_phase", default=False)
+
+
+def is_activation_recomputing() -> bool:
+    """Whether the current callable is a native checkpoint's recomputed forward."""
+    return _ACTIVATION_RECOMPUTE_PHASE.get()
+
+
+@contextlib.contextmanager
+def _activation_recompute_context():
+    token = _ACTIVATION_RECOMPUTE_PHASE.set(True)
+    try:
+        yield
+    finally:
+        _ACTIVATION_RECOMPUTE_PHASE.reset(token)
+
+
 # Global flag that's toggled whenever inside a checkpointing context
 IS_CHECKPOINTING = False
 
@@ -776,7 +796,12 @@ class CheckpointFunction(torch.autograd.Function):
                 enabled=ctx.autocast_enabled,
                 cache_enabled=ctx.autocast_cache_enabled,
             )
-            with torch.enable_grad(), autocast_context, suspend_tensor_observations():
+            with (
+                torch.enable_grad(),
+                autocast_context,
+                suspend_tensor_observations(),
+                _activation_recompute_context(),
+            ):
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -993,7 +1018,12 @@ class _RecomputeRegion:
         leaves = self._unstash_inputs()
         with _fork_rng():
             _set_all_rng_states(*self._rng_states)
-            with torch.enable_grad(), self._te_context.second_pass(), suspend_tensor_observations():
+            with (
+                torch.enable_grad(),
+                self._te_context.second_pass(),
+                suspend_tensor_observations(),
+                _activation_recompute_context(),
+            ):
                 outputs = _as_tuple(self._function(*self._layout.rebuild(leaves)))
 
         self._share_rebuilt_storages(outputs)
