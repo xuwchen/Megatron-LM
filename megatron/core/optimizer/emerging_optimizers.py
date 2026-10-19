@@ -38,13 +38,22 @@ try:
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
-    from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
     AdaptiveMuon = object
+
+
+if HAVE_EMERGING_OPTIMIZERS:
+    # SOAP is optional in some Emerging Optimizers distributions. Its absence
+    # must not disable Muon; other SOAP import failures still need to surface.
+    try:
+        from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
+    except ModuleNotFoundError as exc:
+        if exc.name != "emerging_optimizers.soap":
+            raise
 
 
 logger = logging.getLogger(__name__)
