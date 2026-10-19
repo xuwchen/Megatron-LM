@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -417,11 +417,12 @@ class MLP(MegatronModule):
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
-                        sub_sd[k] = apply_swiglu_sharded_factory(
+                        sub_sd[k] = apply_gtp_swiglu_sharded_factory(
                             v,
+                            getattr(module, k.rsplit(".", 1)[-1]),
                             sharded_offsets,
                             singleton_local_shards,
-                            tp_group=self.tp_group,
+                            self.tp_group,
                             dp_group=metadata['dp_cp_group'],
                         )
             sharded_state_dict.update(sub_sd)
@@ -472,6 +473,44 @@ class MLP(MegatronModule):
 
 
 # pylint: disable=missing-function-docstring
+def apply_gtp_swiglu_sharded_factory(
+    entry: ShardedTensor,
+    weight: torch.Tensor | None,
+    sharded_offsets: tuple,
+    singleton_local_shards: bool,
+    tp_group: torch.distributed.ProcessGroup | None,
+    dp_group: torch.distributed.ProcessGroup | None = None,
+) -> ShardedTensorFactory:
+    """Checkpoint a GLU projection in logical gate/up order using only local storage."""
+    from megatron.core.dist_checkpointing.gtp import attach_optimizer_factory, split_gtp_projection
+    from megatron.core.tensor_parallel import gtp_api
+
+    if weight is None:
+        # TE's non-GTP GroupedTensor representation has no per-GEMM weight{i} parameter.
+        # Preserve its existing factory; it is not a source-bound GTP row shard.
+        return apply_swiglu_sharded_factory(
+            entry, sharded_offsets, singleton_local_shards, tp_group=tp_group, dp_group=dp_group
+        )
+    if gtp_api.HAVE_GTP and gtp_api.is_gtp_param(weight):
+        rows = weight.shape[0] * weight.group.size() - int(getattr(weight, 'pad_length', 0))
+        assert rows % 2 == 0, rows
+        return split_gtp_projection(
+            entry,
+            weight,
+            [rows // 2, rows // 2],
+            ['w', 'v'],
+            tp_group,
+            glu=True,
+            singleton_local_shards=singleton_local_shards,
+        )
+    return attach_optimizer_factory(
+        apply_swiglu_sharded_factory(
+            entry, sharded_offsets, singleton_local_shards, tp_group=tp_group, dp_group=dp_group
+        ),
+        weight,
+    )
+
+
 def apply_swiglu_sharded_factory(
     original_sh_ten,
     sharded_offsets,
