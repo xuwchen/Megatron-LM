@@ -18,6 +18,7 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.context_parallel import convert_module_input_tensors_cp_partition_mode
+from megatron.core.dist_checkpointing.gtp import untrimmed_gtp_shard
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
@@ -1439,7 +1440,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
             # (make_tp_sharded_tensor_for_checkpoint). Gather those (BF16) shards back to the
             # full TP-local size so the [z|x|B|C|dt] split below matches a non-GTP run.
-            local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
+            local = untrimmed_gtp_shard(sharded_state_dict[f"{prefix}in_proj.weight"]).contiguous()
             gathered = torch.empty(
                 (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
                 dtype=local.dtype,

@@ -42,7 +42,7 @@ from megatron.core.transformer.mlp import (
     MLP,
     MLPSubmodules,
     TEActivationFunctionBuilder,
-    apply_swiglu_sharded_factory,
+    apply_gtp_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -1366,11 +1366,12 @@ class TEGroupedMLP(MegatronModule):
                         )
                     for k in (f'{name}.weight{i}', f'{name}.bias{i}'):
                         if k in sub_sd:
-                            sub_sd[k] = apply_swiglu_sharded_factory(
+                            sub_sd[k] = apply_gtp_swiglu_sharded_factory(
                                 sub_sd[k],
+                                getattr(module, k.rsplit(".", 1)[-1], None),
                                 new_sharded_offsets,
                                 singleton_local_shards,
-                                tp_group=self.tp_group,
+                                self.tp_group,
                                 dp_group=metadata['dp_cp_group'],
                             )
             if singleton_local_shards:
