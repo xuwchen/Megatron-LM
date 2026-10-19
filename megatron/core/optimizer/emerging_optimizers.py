@@ -39,21 +39,27 @@ try:
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
 
-    try:
-        from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
-    except ModuleNotFoundError as error:
-        # Emerging-Optimizers >= 0.5.0a0 moved SOAP to ``legacy_soap`` (same registry
-        # name). Without this fallback the import error disables every optimizer of
-        # the package, including Muon.
-        if error.name != 'emerging_optimizers.soap':
-            raise
-        from emerging_optimizers.legacy_soap import SOAP  # pylint: disable=unused-import
-
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
     OrthogonalizedOptimizer = object
     AdaptiveMuon = object
+
+
+if HAVE_EMERGING_OPTIMIZERS:
+    # SOAP is optional in some Emerging Optimizers distributions. Its absence
+    # must not disable Muon; other SOAP import failures still need to surface.
+    try:
+        from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
+    except ModuleNotFoundError as exc:
+        if exc.name != "emerging_optimizers.soap":
+            raise
+        # Emerging-Optimizers >= 0.5.0a0 moved SOAP to ``legacy_soap`` (same registry name).
+        try:
+            from emerging_optimizers.legacy_soap import SOAP  # pylint: disable=unused-import
+        except ModuleNotFoundError as legacy_exc:
+            if legacy_exc.name != "emerging_optimizers.legacy_soap":
+                raise
 
 
 logger = logging.getLogger(__name__)
