@@ -1696,6 +1696,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         name: str | None = None,
         eps: float | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        gtp_remat_opt_out: bool = False,
     ):
         """
         Args:
@@ -1704,6 +1705,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 ``config.layernorm_epsilon`` when ``None``.
             pg_collection (ProcessGroupCollection | None): process groups used by this layer.
                 Falls back to the MPU global process groups when not given.
+            gtp_remat_opt_out (bool): Keep the weight whole along the GTP_remat axis (still TP
+                partitioned). Its gradient is then all-reduced across GTP_remat like any other
+                replicated param. For small weights whose gather/scatter costs more than the
+                memory it saves.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1795,7 +1800,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
+        gtp_remat_group = (
+            None if gtp_remat_opt_out else resolve_gtp_remat_group(pg_collection, is_expert)
+        )
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -1965,12 +1972,17 @@ class TEColumnParallelLinear(TELinear):
         stride: int = 1,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        gtp_remat_opt_out: bool = False,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
             pg_collection (ProcessGroupCollection | None): process groups used by this layer.
                 Falls back to the MPU global process groups when not given.
+            gtp_remat_opt_out (bool): Keep the weight whole along the GTP_remat axis (still TP
+                partitioned). Its gradient is then all-reduced across GTP_remat like any other
+                replicated param. For small weights whose gather/scatter costs more than the
+                memory it saves.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1985,7 +1997,9 @@ class TEColumnParallelLinear(TELinear):
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
         self.stride = stride
-        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
+        gtp_remat_group = (
+            None if gtp_remat_opt_out else resolve_gtp_remat_group(pg_collection, is_expert)
+        )
 
         super().__init__(
             input_size=input_size,

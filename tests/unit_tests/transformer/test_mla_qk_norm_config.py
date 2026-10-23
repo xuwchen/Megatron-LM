@@ -116,6 +116,24 @@ def test_fused_norm_projections_carry_attention_latent_epsilon(q_lora_rank, q_pr
     assert submodules.linear_kv_up_proj.params == {"custom": True}
 
 
+def test_fused_norm_upgrade_keeps_linear_spec_params():
+    """Upgrading a plain-linear spec to the fused norm+linear keeps its params (GTP opt-out)."""
+    config = _make_config()
+    linear_spec = ModuleSpec(module=_Linear, params={"gtp_remat_opt_out": True})
+    submodules = _make_submodules(linear_q_up_proj=linear_spec, linear_kv_up_proj=linear_spec)
+
+    resolved = QKNormConfigResolver(config, submodules).resolve()
+
+    for projection in ("linear_q_up_proj", "linear_kv_up_proj"):
+        spec = resolved[projection]
+        assert spec.module is _FusedNormLinear
+        assert spec.params == {
+            "gtp_remat_opt_out": True,
+            "eps": config.attention_latent_norm_epsilon,
+        }
+    assert linear_spec.params == {"gtp_remat_opt_out": True}
+
+
 @pytest.mark.launch_on_gb200
 def test_dsa_attention_latent_norm_epsilon_matches_native():
     """Exercise distinct global, attention latent, and indexer norm epsilons in DSA."""
