@@ -1740,7 +1740,22 @@ class TransformerConfig(ModelParallelConfig):
                 "interleaved VPP together with account_for_embedding/loss_in_pipeline_split"
             )
         if self.cuda_graph_impl != "none":
-            unsupported.append(f"cuda_graph_impl={self.cuda_graph_impl!r}")
+            # With PP1, eager AttnRes builds a fresh source list for each forward.
+            # Whole-schedule capture records its complete tensor dataflow and
+            # backward, so replay needs no Python-side source-cache updates.
+            # Per-layer graphs and pipeline source-cache hand-offs are not covered.
+            full_iteration_supported = (
+                self.cuda_graph_impl == "full_iteration"
+                and self.pipeline_model_parallel_size == 1
+                and self.virtual_pipeline_model_parallel_size is None
+                and self.attn_res_impl == "eager"
+            )
+            if not full_iteration_supported:
+                unsupported.append(
+                    f"cuda_graph_impl={self.cuda_graph_impl!r} "
+                    "(Attention Residuals graphs require full_iteration, PP1, no VPP, "
+                    "and attn_res_impl='eager')"
+                )
         if self.recompute_granularity == "full":
             unsupported.append("recompute_granularity='full'")
         if self.overlap_moe_expert_parallel_comm:
