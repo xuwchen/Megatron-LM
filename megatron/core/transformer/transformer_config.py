@@ -2818,6 +2818,22 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
                 )
 
+        if (
+            self.cuda_graph_impl == "full_iteration"
+            and self.moe_token_dispatcher_type == "flex"
+            and self.moe_flex_dispatcher_backend == "hybridep"
+        ):
+            if not (self.moe_use_grouped_tensor or self.use_transformer_engine_op_fuser):
+                raise ValueError(
+                    "Full-iteration HybridEP graphs require GPU-resident expert counts: "
+                    "enable moe_use_grouped_tensor or use_transformer_engine_op_fuser."
+                )
+            if self.moe_hybridep_pad_variable_tokens:
+                raise ValueError(
+                    "Full-iteration HybridEP graphs require fixed token counts; "
+                    "moe_hybridep_pad_variable_tokens performs a host synchronization."
+                )
+
         if self.moe_expert_rank_capacity_factor is not None:
             if self.moe_flex_dispatcher_backend not in ("hybridep", "ncclep"):
                 raise ValueError(
