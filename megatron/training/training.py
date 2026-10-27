@@ -3494,6 +3494,9 @@ def setup_model_and_optimizer(
             reduce_scatter_with_fp32_accumulation=getattr(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
+            # Edge overlap assumes forward and backward alternate, which pipelining breaks.
+            grouped_edge_overlap=getattr(args, 'gtp_grouped_edge_overlap', True)
+            and args.pipeline_model_parallel_size == 1,
         )
 
         if getattr(args, 'gtp_remat_nccl_ub', False):

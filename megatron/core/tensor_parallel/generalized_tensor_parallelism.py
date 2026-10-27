@@ -317,6 +317,48 @@ _wgrad_buf_pool: Dict[tuple, list] = {}
 # reset_gtp_state so a rebuilt model restarts numbering.
 _GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
 
+# Edge overlap for the grouped chains (GTP_CONFIG.grouped_edge_overlap, docs §3.4 "Chain edges").
+# A chain head has no predecessor to prefetch its fwd AG and a tail no successor to prefetch its
+# bwd AG, so both used to gather on demand, on the compute stream:
+#   - a head is armed by its own bwd consume (the last grouped gather of the backward), and the
+#     next forward's first dense consume issues its fwd AG -> overlaps the dense layers ahead of
+#     the first MoE block;
+#   - a tail is queued by its own fwd consume, and the next dense fwd consume (e.g. output_layer)
+#     or else the first bwd consume issues its bwd AG -> overlaps the rest of forward and the loss.
+# Issuing a tail from its own consume would start its bwd gather before its fwd GEMM is launched.
+_GROUPED_HEADS_ARMED: list = []
+_GROUPED_TAILS_PENDING: list = []
+# Set on the first backward gather: only then are the chains complete, so "no next_w" means tail.
+_GROUPED_CHAINS_COMPLETE: bool = False
+
+
+def _grouped_edge_overlap_applies(param) -> bool:
+    """True when ``param`` sits on an eager grouped chain with edge overlap enabled."""
+    chain_id = param.chain_id
+    return (
+        GTP_CONFIG.grouped_edge_overlap
+        and GTP_CONFIG.weight_prefetch
+        and _chain_is_grouped(chain_id)
+        and not _chain_is_graphed(chain_id)
+    )
+
+
+def _issue_grouped_edge_prefetches(edges: list, fwd: bool) -> None:
+    """Issue the async AG of every armed head (``fwd``) or pending tail (not ``fwd``).
+
+    fc1 and fc2 share one AG stream, so issue in consume order: fc1 first in forward, fc2 first
+    in backward (chain ids sort fc1 before fc2).
+    """
+    if not edges:
+        return
+    weights = sorted(edges, key=lambda w: w.chain_id, reverse=not fwd)
+    edges.clear()
+    for weight in weights:
+        label = f"{weight._debug_name}.{'fwd' if fwd else 'bwd'}.edge_prefetch"
+        _, handle = weight._all_gather_weight(async_op=True, fwd=fwd, nvtx_label=label)
+        weight._prefetch_handle = handle
+        weight._edge_prefetched = True
+
 
 def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
     """Padded send buffer from the registered recycling pool, pad tail zeroed (the RS
@@ -482,6 +524,11 @@ class GTPRematConfig:
     # (handle.wait + main_grad.add_) in a later bwd's cascade walk, overlapping RS with
     # compute. False: every wgrad RS is synchronous + inline (no overlap).
     async_reduction: bool = True
+    # True (default): hide the collectives at the two ends of each eager grouped-expert chain
+    # (docs §3.4 "Chain edges"): the head's fwd AG is prefetched during the dense layers before
+    # the first MoE block, the tail's bwd AG is prefetched at the end of forward, and the head's
+    # wgrad RS leaves the compute stream. Assumes forward and backward alternate (no pipelining).
+    grouped_edge_overlap: bool = True
     # Mirrors config.calculate_per_token_loss. When True, DDP applies NO 1/dp pre-scaling
     # (gradient_scaling_factor=1.0) and finalize_model_grads normalizes every gradient by
     # 1/total_global_tokens instead. In that mode the gtp_remat axis must be SUM-reduced (plain
@@ -545,6 +592,7 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
+    grouped_edge_overlap=True,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction) from the training recipe.
@@ -557,6 +605,7 @@ def configure_gtp_remat_from_recipe(
         calculate_per_token_loss=calculate_per_token_loss,
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
+        grouped_edge_overlap=grouped_edge_overlap,
         pad_for_alignment=resolve_gtp_pad_for_alignment(fp4=fp4, fp8_recipe=fp8_recipe, fp8=fp8),
     )
 
@@ -1022,6 +1071,8 @@ def _init_gtp_runtime_attrs(obj):
     obj._ag_ticket_fwd = None
     obj._ag_ticket_bwd = None
     obj._prefetch_handle = None
+    # True while _prefetch_handle holds a chain-edge gather (see _GROUPED_HEADS_ARMED).
+    obj._edge_prefetched = False
     obj._need_weight_prefetch = True
     # Per-direction prefetch opt-outs (default True). The embedding weight needs no bwd AG
     # (wgrad is a token-indexed scatter-add, input non-differentiable). classify_gtp_chains()
@@ -1745,10 +1796,32 @@ class GTPShardedParam(torch.nn.Parameter):
         if not type(self)._link_tables_flushed:
             type(self).flush_link_tables()
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None and self._prefetch_available():
+        global _GROUPED_CHAINS_COMPLETE
+        _GROUPED_CHAINS_COMPLETE = True
+        # Fallback issue point for a tail queued with no later fwd consume to issue it. Only from
+        # an eager consume: a graphed one may be under capture, and the edge gathers are eager.
+        if not _chain_is_graphed(self.chain_id):
+            _issue_grouped_edge_prefetches(_GROUPED_TAILS_PENDING, fwd=False)
+
+        edge_prefetched = self._edge_prefetched
+        self._edge_prefetched = False
+        if (
+            GTP_CONFIG.weight_prefetch
+            and (self.next_w is not None or edge_prefetched)
+            and self._prefetch_available()
+        ):
             result = self._get_prefetched_weight(False)
         else:
             result = self._all_gather_weight_on_demand(False)
+
+        # Last grouped gather of this backward: arm the head's gather for the next forward.
+        # Identity, not `in`: tensor == tensor is elementwise.
+        if (
+            self.prev_w is None
+            and _grouped_edge_overlap_applies(self)
+            and not any(w is self for w in _GROUPED_HEADS_ARMED)
+        ):
+            _GROUPED_HEADS_ARMED.append(self)
 
         if (
             GTP_CONFIG.weight_prefetch
@@ -1797,13 +1870,22 @@ class GTPShardedParam(torch.nn.Parameter):
         if not in_recompute and not type(self)._recompute_link_tables_flushed:
             type(self).flush_recompute_link_tables()
 
+        edge_prefetched = False
+        if not in_recompute:
+            # Issue from an eager dense consume only (graphed consumes may be under capture).
+            if not _chain_is_grouped(self.chain_id) and not _chain_is_graphed(self.chain_id):
+                _issue_grouped_edge_prefetches(_GROUPED_HEADS_ARMED, fwd=True)
+                _issue_grouped_edge_prefetches(_GROUPED_TAILS_PENDING, fwd=False)
+            edge_prefetched = self._edge_prefetched
+            self._edge_prefetched = False
+
         # Consume current weight.
         if use_recompute_chain and self._recompute_prev is not None:
             result = self._get_recompute_prefetched_weight()
         elif (
             not in_recompute
             and GTP_CONFIG.weight_prefetch
-            and self.prev_w is not None
+            and (self.prev_w is not None or edge_prefetched)
             and self._prefetch_available()
         ):
             result = self._get_prefetched_weight(True)
@@ -1842,6 +1924,15 @@ class GTPShardedParam(torch.nn.Parameter):
                 async_op=True, fwd=fwd, nvtx_label=nvtx_label
             )
             self.next_w._prefetch_handle = handle
+        elif (
+            not in_recompute
+            and self.next_w is None
+            and _GROUPED_CHAINS_COMPLETE
+            and _grouped_edge_overlap_applies(self)
+            and not any(w is self for w in _GROUPED_TAILS_PENDING)
+        ):
+            # Chain tail: queue its bwd AG (issued once this weight's fwd GEMM is launched).
+            _GROUPED_TAILS_PENDING.append(self)
 
         # Unsharded tensor returned, no pending work → reset state to NONE. Skip during recompute:
         # a bwd-chain prefetch may hold an in-flight AG state this weight's later dgrad needs.
@@ -2343,8 +2434,19 @@ class GTPShardedParam(torch.nn.Parameter):
             # Accounted for here, so the cascade below must not skip the next one.
             self._already_finalized = False
 
+        # A grouped chain head still has the dense layers below the first MoE block to run in
+        # backward, so its RS goes async too; with no predecessor to finalize it, it finalizes
+        # itself on rs_stream below, which keeps the compute stream moving.
+        finalize_own_rs = False
         if async_op is None:
             async_op = GTP_CONFIG.async_reduction and self.prev_w is not None
+            if (
+                not async_op
+                and GTP_CONFIG.async_reduction
+                and _grouped_edge_overlap_applies(self)
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                async_op = finalize_own_rs = True
         if async_op:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
@@ -2378,6 +2480,12 @@ class GTPShardedParam(torch.nn.Parameter):
         # Currently only support reduce scattering in reverse order
         if GTP_CONFIG.async_reduction:
             self._drain_next_w_reduce_scatter()
+
+        if finalize_own_rs:
+            # Wait + main_grad.add_ + grad-ready all land on rs_stream, so the end-of-backward
+            # fence (wait_for_gtp_grad_reduction_on_current_stream) is the only compute-side join.
+            self._wait_reduce_scatter(finalize_grad=True)
+            self._already_finalized = False
 
         return ret
 
@@ -2880,6 +2988,10 @@ def reset_gtp_state():
     GTPShardedParam._link_tables_flushed = False
     GTPShardedParam._recompute_link_tables_flushed = False
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
+    global _GROUPED_CHAINS_COMPLETE
+    _GROUPED_CHAINS_COMPLETE = False
+    _GROUPED_HEADS_ARMED.clear()
+    _GROUPED_TAILS_PENDING.clear()
     # A backward that never reached the fence leaves entries pointing at a torn-down model, and
     # a surviving _buf would make the next iteration's first backward ADD onto a stale sum.
     for param in _GTP_PENDING_WGRAD_ACCUM:
