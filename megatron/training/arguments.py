@@ -3389,6 +3389,13 @@ def _add_distributed_args(parser):
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set. '
                        'Cannot be combined with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub, which require symmetric windows.')
+    group.add_argument('--no-gtp-grouped-edge-overlap', action='store_false',
+                       dest='gtp_grouped_edge_overlap',
+                       help='Disable hiding the expert GTP weight-remat collectives at the two ends of '
+                       'each routed-expert prefetch chain: the first MoE block\'s forward all-gather, '
+                       'the last MoE block\'s backward all-gather, and the first MoE block\'s wgrad '
+                       'reduce-scatter then run on demand on the compute stream. Always disabled '
+                       'with pipeline parallelism.')
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
