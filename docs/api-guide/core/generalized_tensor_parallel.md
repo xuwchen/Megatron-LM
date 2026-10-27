@@ -65,6 +65,7 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
     - [3.3 Distributed checkpointing (DCP)](#33-distributed-checkpointing-dcp)
     - [3.4 Prefetch-chain construction and its design assumptions](#34-prefetch-chain-construction-and-its-design-assumptions)
       - [Grouped-expert chains (one-block-ahead)](#grouped-expert-chains-one-block-ahead)
+      - [Chain edges](#chain-edges)
     - [3.5 GTP\_remat + Multi-Token Prediction (MTP)](#35-gtp_remat--multi-token-prediction-mtp)
       - [What MTP does to the chain](#what-mtp-does-to-the-chain)
       - [How the chain supports it](#how-the-chain-supports-it)
@@ -87,7 +88,7 @@ Each weight is sharded 1/N across a GTP_remat group along `out_features`, stored
 
 - **Independent state per param**: each has its own AG state (`state`) and RS state (`rs_state`) machines, both cycling `NONE → ASYNC_WAIT → DATA_READY → NONE` and tracked separately so fwd and bwd async ops don't interfere.
 - **Prefetch chain for AG** (doubly-linked `prev_w` / `next_w`): during fwd, each weight's `all_gather_and_prefetch` issues async AG for `next_w`; during bwd, `all_gather_and_prefetch_bwd` issues async AG for `prev_w`. Layer *i*'s AG overlaps with layer *i−1*'s GEMM. For an L-layer model, L−1 all-gathers are fully hidden behind compute. When activation recompute is enabled, a **third** chain prefetches the recompute-forward gathers during backward — see §3.1 *Recompute-forward prefetch chain*. One GEMM of runway covers a gather that stays inside the NVLink domain, but **not one that leaves it** — the case for MoE routed-expert weights, which also dominate the bytes gathered per block; those get their own *one-block-ahead* chains — see §3.4 *Grouped-expert chains*.
-- **Deferred RS finalize for wgrad**: `wgrad_reduce_scatter` on param *i* launches an **async** reduce-scatter (handle stashed in `_wgrad_rs_handle`) and returns `None` to autograd — the wgrad is NOT finalized into `main_grad` yet. Finalization is **deferred one step**: the next bwd step (param *i−1*'s `wgrad_reduce_scatter`) calls `self.next_w._wait_reduce_scatter()` + `_finalize_wgrad()`, which waits on the stashed handle, accumulates the reduced wgrad into `main_grad`, and fires the DDP `register_grad_ready` hook. The chain's head (first-in-fwd, last-in-bwd) uses a synchronous RS since nothing follows it. This one-step deferral is what lets layer *i*'s RS overlap with layer *i−1*'s bwd GEMMs.
+- **Deferred RS finalize for wgrad**: `wgrad_reduce_scatter` on param *i* launches an **async** reduce-scatter (handle stashed in `_wgrad_rs_handle`) and returns `None` to autograd — the wgrad is NOT finalized into `main_grad` yet. Finalization is **deferred one step**: the next bwd step (param *i−1*'s `wgrad_reduce_scatter`) calls `self.next_w._wait_reduce_scatter()` + `_finalize_wgrad()`, which waits on the stashed handle, accumulates the reduced wgrad into `main_grad`, and fires the DDP `register_grad_ready` hook. The chain's head (first-in-fwd, last-in-bwd) uses a synchronous RS since nothing follows it — except on the eager grouped-expert chains, whose head is followed by the dense layers below the first MoE block (§3.4 *Chain edges*). This one-step deferral is what lets layer *i*'s RS overlap with layer *i−1*'s bwd GEMMs.
 - **Cold start only**: every weight's very first AG is synchronous (`DATA_READY_SYNC`, no prefetch has run yet); the async prefetch chain kicks in from the second forward onward.
 
 Contrast with FSDP: FSDP gathers at module-group granularity in full precision with PyTorch-managed lifecycle. GTP_remat works at individual-weight granularity, in quantized form, with its own explicit ticket-based buffer pool and a one-step-deferred RS finalizer.
@@ -246,6 +247,7 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 | `--gtp-remat-reduce-scatter-with-fp32-accumulation` | **Optional** | BF16 wgrads **and** GTP_remat axis ≥ 4 | off | Replaces the ring RS with an all-to-all + local FP32 sum to eliminate per-hop rounding error. Auto-bypassed at axis size ≤ 2. [§2.6](#26-fp32-accumulation-wgrad-reduce-scatter-optional) |
 | `--gtp-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the dense gtp_remat wgrad reduce-scatter path. Takes precedence over fp32-accum on its group; incompatible with `--disable-symmetric-registration`. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
 | `--gtp-expert-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the routed-expert egtp_remat wgrad reduce-scatter path. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
+| `--no-gtp-grouped-edge-overlap` | **Optional** | Debugging / A-B timing | edge overlap on | Turns off the overlap of the expert collectives at both ends of the grouped-expert chains. Always off with pipeline parallelism. [§3.4 → Chain edges](#chain-edges) |
 | `--gtp-remat-opt-in-modules` | **Optional** | MoE models with large `--moe-latent-size` | `[]` | Space-separated list of module tokens to opt in to GTP_remat sharding. Currently supported: `moe_latent_proj` (shards `fc1_latent_proj` / `fc2_latent_proj`; only beneficial when the latent size is large enough to amortize the all-gather). [§1.5](#15-opt-in-minimally-invasive-integration) |
 | `--fp8-param-gather` | **Required** | GTP + `--fp8-recipe mxfp8` | off | Gathers native MXFP8 shard directly; without it the grad-buffer reuse path is unavailable and `arguments.py` asserts. Always paired with `--reuse-grad-buf-for-mxfp8-param-ag`. [§1.3](#13-low-precision-gather-native-fp8--nvfp4-param) |
 | `--reuse-grad-buf-for-mxfp8-param-ag` | **Required** | GTP + `--fp8-recipe mxfp8` | off | Reuses the grad buffer for the MXFP8 all-gather (MXFP8 cannot map into the contiguous param buffer). Must accompany `--fp8-param-gather`. [§1.3](#13-low-precision-gather-native-fp8--nvfp4-param) |
@@ -259,6 +261,7 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 | `pad_for_alignment` | auto (16 NVFP4, 32 MXFP8, 1 BF16) | Shard alignment; auto-set by `training.py` based on quantization recipe. BF16 has no tile-size requirement, so it pads only to `gtp_remat_size` — the minimum needed for equal-sized AG/RS shards. |
 | `weight_prefetch` | `True` | Disable only to debug the synchronous cold-start path. |
 | `async_reduction` | `True` | Async wgrad reduce-scatter; disable for easier debugging. |
+| `grouped_edge_overlap` | `True` | Overlap the grouped-expert chains' edge collectives (§3.4 *Chain edges*); set by `training.py` from `--no-gtp-grouped-edge-overlap` and pipeline parallelism. |
 | `calculate_per_token_loss` | `False` | Must mirror `config.calculate_per_token_loss` (SUM vs MEAN RS). |
 | `graph_wgrad_ring_size` | `2` | Persistent wgrad ring slots per scheduling domain (§3.6). Increase if capture rejects same-key writers. |
 
@@ -559,7 +562,7 @@ Chain 3 exists only when activation recompute is on. It mirrors chain 1 (rowwise
 
 At bwd step *i* the step is launching *RS of wgrad_i* while finalizing the *previous* iter's wgrad (`wgrad_{i+1}` in bwd order = the next-one-over in fwd order). That one-step deferral is what makes the RS run concurrent with the next layer's dgrad/wgrad GEMMs instead of blocking after every layer.
 
-Communication never blocks compute except at the very first layer of each direction (cold start) and at enforced serialization points (CG/eager drains, finalize-grads barrier).
+Communication never blocks compute except at the very first layer of each direction (cold start) and at enforced serialization points (CG/eager drains, finalize-grads barrier). The eager grouped-expert chains hide their first layer too, because dense layers sit before the first MoE block and after the last (§3.4 *Chain edges*).
 
 ##### wgrad-before-dgrad schedule  *(deferred to a follow-up MR)*
 
@@ -817,6 +820,22 @@ Three consequences:
   - so with `--cuda-graph-impl full_iteration` **every** param is `GRAPHED` — expert weights included — and they keep the ordinary one-step-ahead prefetch;
   - why it must: `cuda_graphs.py` drains with `wait_async_comms(GTPChain.GRAPHED.value)`, matching the id **literally**, so a weight in `GTP_remat_grouped_fc1_ungraphed` would never be joined at the graph boundary — a **correctness** hazard, not just a lost overlap;
   - lifting it would mean draining by chain-id *prefix* (`_chain_is_grouped`) or registering the grouped streams before capture — neither is done today.
+
+#### Chain edges
+
+*Problem.* Each chain has two edges that nobody prefetches: the **head** (first in forward) has no predecessor to issue its fwd AG, and the **tail** (last in forward) has no successor to issue its bwd AG, so both gather on demand on the compute stream. The head's wgrad RS is also synchronous, on the rule that nothing follows it in backward. For the general chains that costs little: the head is the embedding, which really is last in backward. A grouped chain's edges are the **first and last MoE blocks**, and their transfers are the large, cross-NVLink expert gathers. Measured on a 12-block Kimi-K3 proxy (GTP8/EP8/EGTP4, 32 GB300), these edges left about 90 ms per step fully exposed: the first block's fwd AGs (15 ms), the last block's bwd AGs (15 ms), and the first block's two wgrad RSs (46 ms), although the dense layers below that block still had about 260 ms of backward to run.
+
+*Design* (`GTP_CONFIG.grouped_edge_overlap`, eager grouped chains only):
+
+| edge | old schedule | issued by | overlaps |
+|---|---|---|---|
+| head fwd AG | on demand at the head's consume | the first dense fwd consume of the next forward; the head is *armed* by its own bwd consume, the last grouped gather of a backward | the dense layers before the first MoE block |
+| tail bwd AG | on demand at the tail's bwd consume | the next dense fwd consume after the tail's fwd consume (normally `output_layer`), else the first bwd consume | the rest of the forward, the loss, the head of the backward |
+| head wgrad RS | synchronous on the compute stream | async on `rs_stream`; the head finalizes itself on `rs_stream` right away (wait + `main_grad.add_` + grad-ready), joined by the end-of-backward fence | the dense layers' backward |
+
+The gathers keep their own buffers and handles. An edge gather sets `_prefetch_handle` and `_edge_prefetched`, and the consume takes the prefetched path when the flag is set even without a chain neighbour. Buffers are safe for the reasons that already apply to one-block-ahead: the head's fwd buffer is used by no other grouped weight between the start of forward and the head, and the tail's bwd gather is issued only after the tail's fwd GEMM is launched. A tail gather is never issued from the tail's own consume, because that would start the bwd gather before the fwd GEMM. Tails are queued only once a backward has completed the chains (`_GROUPED_CHAINS_COMPLETE`), because during the first forward every weight still lacks `next_w`.
+
+*Assumption.* Forward and backward alternate. Pipeline schedules interleave the forwards and backwards of different microbatches, which would let a fwd prefetch overwrite a pending tail's handle, so `training.py` disables the feature whenever `pipeline_model_parallel_size > 1`. `--no-gtp-grouped-edge-overlap` restores the on-demand edges for A/B timing.
 
 ### 3.5 GTP_remat + Multi-Token Prediction (MTP)
 

@@ -4393,6 +4393,15 @@ def _add_distributed_args(parser):
         'memory on the GTP group, independent of --use-nccl-ub (which covers the DP group).',
     )
     group.add_argument(
+        '--no-gtp-grouped-edge-overlap',
+        action='store_false',
+        dest='gtp_grouped_edge_overlap',
+        help='Disable hiding the expert GTP weight-remat collectives at the two ends of each '
+        'routed-expert prefetch chain: the first MoE block\'s forward all-gather, the last MoE '
+        'block\'s backward all-gather, and the first MoE block\'s wgrad reduce-scatter then run '
+        'on demand on the compute stream. Always disabled with pipeline parallelism.',
+    )
+    group.add_argument(
         '--gtp-expert-remat-nccl-ub',
         action='store_true',
         dest='gtp_expert_remat_nccl_ub',
