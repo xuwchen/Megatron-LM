@@ -1130,6 +1130,14 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens: Optional[int] = None
         self._padded_num_tokens: Optional[int] = None
 
+    @property
+    def _static_dropless(self):
+        return (
+            getattr(self.config, "cuda_graph_impl", "none") == "full_iteration"
+            and self.moe_expert_rank_capacity_factor is None
+            and not self.drop_and_pad
+        )
+
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
@@ -1217,8 +1225,17 @@ class _HybridEPManager(_DispatchManager):
             # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
             budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
-        # else: num_permuted_tokens stays None; HybridEP sizes buffers dynamically (CPU sync
-        # in dispatch) and does not drop tokens or report overflow.
+        elif self._static_dropless:
+            # Capture cannot use HybridEP's host-synchronized output sizing. Reserve
+            # enough for EVERY input token to visit EVERY local expert, including
+            # per-source padding. This bound is independent of routing, top-k and
+            # load balance, unlike the optional (potentially dropping) rank budget.
+            alignment = max(1, get_align_size_for_quantization(self.config))
+            aligned_tokens = padded_num_tokens + (-padded_num_tokens % alignment)
+            self.num_permuted_tokens = (
+                aligned_tokens * self.group.size() * self.num_local_experts
+            )
+        # Otherwise use HybridEP's dynamic, dropless sizing in eager execution.
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
             num_out_tokens = padded_num_tokens * self.config.moe_router_topk
@@ -1280,14 +1297,18 @@ class _HybridEPManager(_DispatchManager):
             # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
             over_budget = self.handle[-1] != 0
             self.over_budget |= over_budget
-        # When capacity factor is None, skip overflow tracking (no token drops). Actual
-        # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
+        elif self._static_dropless:
+            # A future backend contract change must fail visibly rather than drop
+            # tokens. This device-side check is captured and executes on replay.
+            torch._assert_async(
+                (self.handle[-1] == 0).all(), "HybridEP exceeded its dropless static bound"
+            )
 
         if self.num_permuted_tokens is None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # num_permuted_tokens is necessary to allocate the output tensor for combine.
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-        if self.moe_expert_rank_capacity_factor is not None:
+        if self.moe_expert_rank_capacity_factor is not None or self._static_dropless:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
@@ -1315,7 +1336,11 @@ class _HybridEPManager(_DispatchManager):
         # setup_metadata(), so clearing a static budget would make a replayed dispatch fall
         # back to HybridEP's host-synchronized dynamic-size path.
         self.handle = None
-        if not self.drop_and_pad and self.moe_expert_rank_capacity_factor is None:
+        if (
+            not self.drop_and_pad
+            and self.moe_expert_rank_capacity_factor is None
+            and not self._static_dropless
+        ):
             self.num_permuted_tokens = None
         self._original_num_tokens = None
         self._padded_num_tokens = None

@@ -94,6 +94,39 @@ def test_set_cudagraph_attr_supports_nested_paths():
     assert dispatcher._comm_manager.routing_map is routing_map
 
 
+@pytest.mark.parametrize("num_tokens", [1, 65, 257, 1024])
+def test_hybridep_full_graph_capacity_covers_dense_routing(num_tokens):
+    """Even routing every token to every expert fits, including source padding."""
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        cuda_graph_impl="full_iteration",
+        moe_hybridep_pad_variable_tokens=False,
+        moe_hybridep_routing_map_mode="bool",
+        use_transformer_engine_op_fuser=False,
+        moe_use_grouped_tensor=True,
+    )
+    manager.group = SimpleNamespace(size=lambda: 4)
+    manager.num_local_experts = 2
+    manager.num_experts = 8
+    manager.router_topk = 2
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+    routing = torch.ones(num_tokens, 8, dtype=torch.bool)
+    manager.setup_metadata(routing, torch.ones(num_tokens, 8))
+    # Count each source's padded contributions independently, as a dispatcher
+    # may do before concatenation. Dense routing is the worst possible map.
+    per_source = routing[:, :2].sum(0)
+    padded = per_source + (-per_source % 256)
+    required = sum(padded.sum().item() for _ in range(4))
+    assert manager.num_permuted_tokens >= required
+    assert manager.num_permuted_tokens % 256 == 0
+    # Eager dropless execution retains its dynamic allocation contract.
+    manager.config.cuda_graph_impl = "none"
+    manager.num_permuted_tokens = None
+    manager.setup_metadata(routing, torch.ones(num_tokens, 8))
+    assert manager.num_permuted_tokens is None
+
+
 def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     manager = object.__new__(_HybridEPManager)
     manager.config = SimpleNamespace(
