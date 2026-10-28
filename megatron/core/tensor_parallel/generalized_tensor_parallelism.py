@@ -326,8 +326,15 @@ _GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
 #   - a tail is queued by its own fwd consume, and the next dense fwd consume (e.g. output_layer)
 #     or else the first bwd consume issues its bwd AG -> overlaps the rest of forward and the loss.
 # Issuing a tail from its own consume would start its bwd gather before its fwd GEMM is launched.
+#
+# With activation recompute the recompute-forward chain has a head too (the first recomputed
+# block, i.e. the last MoE block). It is armed by its own recompute consume, promoted by the next
+# forward consume (so the gather reads weights the optimizer has already updated), and issued
+# into its recompute slot by the next backward's first eager dense consume (e.g. output_layer).
 _GROUPED_HEADS_ARMED: list = []
 _GROUPED_TAILS_PENDING: list = []
+_GROUPED_RECOMPUTE_HEADS_ARMED: list = []
+_GROUPED_RECOMPUTE_HEADS_READY: list = []
 # Set on the first backward gather: only then are the chains complete, so "no next_w" means tail.
 _GROUPED_CHAINS_COMPLETE: bool = False
 
@@ -358,6 +365,21 @@ def _issue_grouped_edge_prefetches(edges: list, fwd: bool) -> None:
         _, handle = weight._all_gather_weight(async_op=True, fwd=fwd, nvtx_label=label)
         weight._prefetch_handle = handle
         weight._edge_prefetched = True
+
+
+def _issue_grouped_recompute_head_prefetches() -> None:
+    """Issue the async recompute-slot AG of every ready recompute head, fc1 first."""
+    if not _GROUPED_RECOMPUTE_HEADS_READY:
+        return
+    weights = sorted(_GROUPED_RECOMPUTE_HEADS_READY, key=lambda w: w.chain_id)
+    _GROUPED_RECOMPUTE_HEADS_READY.clear()
+    for weight in weights:
+        label = f"{weight._debug_name}.recompute.edge_prefetch"
+        _, handle = weight._all_gather_weight(
+            async_op=True, fwd=True, nvtx_label=label, recompute=True
+        )
+        weight._recompute_prefetch_handle = handle
+        weight._recompute_edge_prefetched = True
 
 
 def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
@@ -1103,6 +1125,8 @@ def _init_gtp_runtime_attrs(obj):
     obj._recompute_prefetch_handle = None
     obj._recompute_ag_event = torch.cuda.Event(external=True)
     obj._recompute_already_drained = False
+    # True while _recompute_prefetch_handle holds a recompute-head edge gather.
+    obj._recompute_edge_prefetched = False
     # Own AG buffer for the recompute chain, with its own parity so a one-ahead prefetch cannot
     # land in the buffer the previous recompute node is still reading. See
     # _ensure_no_shared_buffer_with.
@@ -1519,15 +1543,17 @@ class GTPShardedParam(torch.nn.Parameter):
         #    the shard can still hold last iteration's values.
         #
         #    Forward only: backward re-reads what forward published, and recompute runs inside
-        #    backward where a dispatch could gather into the grad-aliased buffer.
-        if fwd and not in_activation_recompute_phase():
+        #    backward where a dispatch could gather into the grad-aliased buffer. A recompute-slot
+        #    gather counts as recompute even when issued early from a backward consume.
+        recompute_gather = recompute or in_activation_recompute_phase()
+        if fwd and not recompute_gather:
             register_capture_params_to_ensure_ready(weights)
             ensure_params_ready(weights)
 
         # 1. Transition state for async gathers. Skip during recompute-forward: it gathers
         #    rowwise (_ag_ticket_fwd) while a bwd-chain prefetch may hold an in-flight columnwise
         #    AG state (_ag_ticket_bwd) on the same weight — clobbering breaks the dgrad consume.
-        if GTP_CONFIG.check_param_states and not in_activation_recompute_phase():
+        if GTP_CONFIG.check_param_states and not recompute_gather:
             new_state = GTPWeightState.ASYNC_WAIT if async_op else GTPWeightState.DATA_READY_SYNC
             for w in weights:
                 w._set_state(new_state)
@@ -1802,6 +1828,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # an eager consume: a graphed one may be under capture, and the edge gathers are eager.
         if not _chain_is_graphed(self.chain_id):
             _issue_grouped_edge_prefetches(_GROUPED_TAILS_PENDING, fwd=False)
+            _issue_grouped_recompute_head_prefetches()
 
         edge_prefetched = self._edge_prefetched
         self._edge_prefetched = False
@@ -1871,16 +1898,30 @@ class GTPShardedParam(torch.nn.Parameter):
             type(self).flush_recompute_link_tables()
 
         edge_prefetched = False
+        recompute_edge_prefetched = False
         if not in_recompute:
             # Issue from an eager dense consume only (graphed consumes may be under capture).
             if not _chain_is_grouped(self.chain_id) and not _chain_is_graphed(self.chain_id):
                 _issue_grouped_edge_prefetches(_GROUPED_HEADS_ARMED, fwd=True)
                 _issue_grouped_edge_prefetches(_GROUPED_TAILS_PENDING, fwd=False)
+            # A forward runs after the optimizer step, so recompute heads armed by an earlier
+            # backward may now gather; the next backward issues them.
+            if _GROUPED_RECOMPUTE_HEADS_ARMED:
+                _GROUPED_RECOMPUTE_HEADS_READY.extend(_GROUPED_RECOMPUTE_HEADS_ARMED)
+                _GROUPED_RECOMPUTE_HEADS_ARMED.clear()
             edge_prefetched = self._edge_prefetched
             self._edge_prefetched = False
+        else:
+            recompute_edge_prefetched = self._recompute_edge_prefetched
+            self._recompute_edge_prefetched = False
+            # Not issued before its own consume (no eager backward consume ran first): drop it,
+            # a later issue would gather for a consume that may follow the optimizer step.
+            _GROUPED_RECOMPUTE_HEADS_READY[:] = [
+                w for w in _GROUPED_RECOMPUTE_HEADS_READY if w is not self
+            ]
 
         # Consume current weight.
-        if use_recompute_chain and self._recompute_prev is not None:
+        if use_recompute_chain and (self._recompute_prev is not None or recompute_edge_prefetched):
             result = self._get_recompute_prefetched_weight()
         elif (
             not in_recompute
@@ -1955,6 +1996,16 @@ class GTPShardedParam(torch.nn.Parameter):
                 cls._recompute_link_table_row(last_r, self, rchain)
             self._recompute_initialized = True
             rchain["last_weight"] = self
+
+        # Recompute chain head: arm its gather for the next backward (see
+        # _GROUPED_RECOMPUTE_HEADS_ARMED).
+        if (
+            in_recompute
+            and self._recompute_prev is None
+            and _grouped_edge_overlap_applies(self)
+            and not any(w is self for w in _GROUPED_RECOMPUTE_HEADS_ARMED)
+        ):
+            _GROUPED_RECOMPUTE_HEADS_ARMED.append(self)
 
         # Lazy population of the fwd/bwd linked list: link previous weight to current.
         # Uses per-chain state so dense and expert chains never cross-link.
@@ -2992,6 +3043,8 @@ def reset_gtp_state():
     _GROUPED_CHAINS_COMPLETE = False
     _GROUPED_HEADS_ARMED.clear()
     _GROUPED_TAILS_PENDING.clear()
+    _GROUPED_RECOMPUTE_HEADS_ARMED.clear()
+    _GROUPED_RECOMPUTE_HEADS_READY.clear()
     # A backward that never reached the fence leaves entries pointing at a torn-down model, and
     # a surviving _buf would make the next iteration's first backward ADD onto a stale sum.
     for param in _GTP_PENDING_WGRAD_ACCUM:
