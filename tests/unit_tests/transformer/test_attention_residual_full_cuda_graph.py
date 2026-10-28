@@ -17,13 +17,14 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class DepthStack(nn.Module):
-    def __init__(self, dtype):
+    def __init__(self, dtype, impl):
         super().__init__()
         self.config = TransformerConfig(
             num_layers=7,
             hidden_size=1024,
             num_attention_heads=16,
             enable_attention_residuals=True,
+            attn_res_impl=impl,
             attn_res_block_layers=2,
             is_hybrid_model=True,
             params_dtype=dtype,
@@ -63,9 +64,12 @@ class DepthStack(nn.Module):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_attn_res_full_schedule_capture_replay(dtype):
+@pytest.mark.parametrize("impl", ["eager", "fla"])
+def test_attn_res_full_schedule_capture_replay(dtype, impl):
+    if impl == "fla":
+        pytest.importorskip("fla.ops.attnres")
     torch.manual_seed(123)
-    model = DepthStack(dtype).cuda()
+    model = DepthStack(dtype, impl).cuda()
     reference = copy.deepcopy(model)
     inputs = [
         torch.randn(128, 1, 1024, device='cuda', dtype=dtype, requires_grad=True) for _ in range(2)
@@ -131,7 +135,8 @@ def test_attn_res_full_schedule_capture_replay(dtype):
         {"cuda_graph_impl": "local"},
         {"pipeline_model_parallel_size": 2},
         {"attn_res_impl": "compile"},
-        {"attn_res_impl": "fla"},
+        {"attn_res_impl": "fla", "cuda_graph_impl": "local"},
+        {"attn_res_impl": "fla", "pipeline_model_parallel_size": 2},
     ],
 )
 def test_unverified_attn_res_graph_modes_remain_rejected(overrides):
