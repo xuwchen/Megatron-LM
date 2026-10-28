@@ -4,15 +4,18 @@
 
 A grouped chain's head has no predecessor to prefetch its forward gather and its tail no
 successor to prefetch its backward gather; the head's wgrad reduce-scatter also used to run
-synchronously on the compute stream. Edge overlap prefetches both gathers from the dense
+synchronously on the compute stream. With MoE recompute the recompute-forward chain's head (the
+last MoE block) gathered on demand too. Edge overlap prefetches these gathers from the dense
 consumes around the MoE blocks and moves the head's reduce-scatter onto rs_stream.
 
 The model mirrors the production layout: a dense GTP linear, then MoE blocks of a grouped fc1
-and a grouped fc2 (one chain per role), then a dense "output" GTP linear.
+and a grouped fc2 (one chain per role), then a dense "output" GTP linear. The recompute variant
+checkpoints each MoE block like --recompute-modules moe.
 
 Test groups
 -----------
-TestGroupedEdgeOverlapSchedule    - steady state: no grouped on-demand gather, no grouped sync RS
+TestGroupedEdgeOverlapSchedule    - steady state: no grouped on-demand gather, no grouped sync RS,
+                                    with and without MoE recompute
 TestGroupedEdgeOverlapNumerics    - input grad and every main_grad match the overlap-off run
 """
 
@@ -21,6 +24,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
@@ -76,13 +80,25 @@ def _gtp_params(dense_in, blocks, dense_out):
     return params
 
 
-def _forward_backward(model, x):
+def _forward_backward(model, x, recompute=False):
     dense_in, blocks, dense_out = model
     m_splits = [x.shape[0] // NUM_GEMMS] * NUM_GEMMS
+
+    def moe(inp, fc1, fc2):
+        y = torch.nn.functional.gelu(fc1(inp, m_splits=m_splits, is_first_microbatch=True))
+        return fc2(y, m_splits=m_splits, is_first_microbatch=True)
+
     h = torch.nn.functional.gelu(dense_in(x))
     for fc1, fc2 in blocks:
-        y = torch.nn.functional.gelu(fc1(h, m_splits=m_splits, is_first_microbatch=True))
-        h = h + fc2(y, m_splits=m_splits, is_first_microbatch=True)
+        if recompute:
+            # gelu saves the block output, so discarding it forces the recompute in backward.
+            checkpoint = CheckpointWithoutOutput()
+            out = checkpoint.checkpoint(lambda inp, a=fc1, b=fc2: moe(inp, a, b), h)
+            out = torch.nn.functional.gelu(out)
+            checkpoint.discard_output_and_register_recompute(out)
+        else:
+            out = moe(h, fc1, fc2)
+        h = h + out
     dense_out(h).float().sum().backward()
     # The end-of-backward fence production runs in finalize_model_grads.
     gtp_module.wait_for_gtp_grad_reduction_on_current_stream()
@@ -101,7 +117,8 @@ class _Recorder:
 
         def on_demand(param, fwd, *args, **kwargs):
             if gtp_module._chain_is_grouped(param.chain_id):
-                rec.on_demand.append((param.chain_id, fwd))
+                kind = "recompute" if kwargs.get("recompute") else ("fwd" if fwd else "bwd")
+                rec.on_demand.append((param.chain_id, kind))
             return orig_on_demand(param, fwd, *args, **kwargs)
 
         def reduce_scatter(param, wgrads, async_op, *args, **kwargs):
@@ -113,7 +130,7 @@ class _Recorder:
         monkeypatch.setattr(cls, "_reduce_scatter", reduce_scatter)
 
 
-def _worker_schedule(rank, world_size, port, monkeypatch, edge_overlap):
+def _worker_schedule(rank, world_size, port, monkeypatch, edge_overlap, recompute):
     gtp_module.update_gtp_config(grouped_edge_overlap=edge_overlap)
     try:
         gtp_module.reset_gtp_state()
@@ -123,9 +140,9 @@ def _worker_schedule(rank, world_size, port, monkeypatch, edge_overlap):
         # Step 1 builds the chains (every gather on demand); step 2 arms the heads; step 3 is
         # the first that starts with armed heads, i.e. steady state.
         for _ in range(2):
-            _forward_backward(model, x)
+            _forward_backward(model, x, recompute)
         rec = _Recorder(monkeypatch)
-        _forward_backward(model, x)
+        _forward_backward(model, x, recompute)
     finally:
         gtp_module.update_gtp_config(grouped_edge_overlap=True)
 
@@ -134,14 +151,15 @@ def _worker_schedule(rank, world_size, port, monkeypatch, edge_overlap):
         assert not rec.on_demand, f"grouped chain edges still gather on demand: {rec.on_demand}"
         assert not sync_rs, f"grouped chain head still reduce-scatters synchronously: {sync_rs}"
     else:
-        # Guards the test itself: without the feature both edges of both chains are exposed.
-        assert sorted(rec.on_demand) == sorted(
-            [(FC1_CHAIN, True), (FC2_CHAIN, True), (FC1_CHAIN, False), (FC2_CHAIN, False)]
-        ), rec.on_demand
+        # Guards the test itself: without the feature both edges of both chains are exposed,
+        # and with recompute so is the head of each recompute chain.
+        kinds = ["fwd", "bwd"] + (["recompute"] if recompute else [])
+        expected = [(chain, kind) for chain in (FC1_CHAIN, FC2_CHAIN) for kind in kinds]
+        assert sorted(rec.on_demand) == sorted(expected), rec.on_demand
         assert sorted(sync_rs) == [FC1_CHAIN, FC2_CHAIN], sync_rs
 
 
-def _worker_numerics(rank, world_size, port):
+def _worker_numerics(rank, world_size, port, recompute):
     """Edge overlap only moves work between streams; the gradients must not change."""
     results = {}
     for edge_overlap in (False, True):
@@ -156,7 +174,7 @@ def _worker_numerics(rank, world_size, port):
                 for p in _gtp_params(*model):
                     p.main_grad.zero_()
                 x.grad = None
-                _forward_backward(model, x)
+                _forward_backward(model, x, recompute)
             torch.cuda.synchronize()
             results[edge_overlap] = (
                 x.grad.clone(),
@@ -173,13 +191,15 @@ def _worker_numerics(rank, world_size, port):
 
 
 class TestGroupedEdgeOverlapSchedule:
+    @pytest.mark.parametrize("recompute", [False, True])
     @pytest.mark.parametrize("edge_overlap", [True, False])
-    def test_edges_are_prefetched(self, monkeypatch, edge_overlap):
+    def test_edges_are_prefetched(self, monkeypatch, edge_overlap, recompute):
         _requires_multi_gpu(4)
-        _run_distributed(_worker_schedule, 4, monkeypatch, edge_overlap)
+        _run_distributed(_worker_schedule, 4, monkeypatch, edge_overlap, recompute)
 
 
 class TestGroupedEdgeOverlapNumerics:
-    def test_grads_match_overlap_off(self):
+    @pytest.mark.parametrize("recompute", [False, True])
+    def test_grads_match_overlap_off(self, recompute):
         _requires_multi_gpu(4)
-        _run_distributed(_worker_numerics, 4)
+        _run_distributed(_worker_numerics, 4, recompute)
