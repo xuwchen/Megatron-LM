@@ -2711,7 +2711,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             if not fp8_checkpoint:
                 return [state] * self.num_gemms
 
+            serialized_state = state
             state = self._decode_extra_state(state)
+            if state is None:
+                # Stateless recipes (e.g. MXFP8) have no extra metadata even
+                # when FP8 is enabled. Keep TE's empty checkpoint marker.
+                return [serialized_state] * self.num_gemms
             extra_states = []
             extra_fp8_variables = state["extra_fp8_variables"]
             extra_fp8_variables["num_gemms"] = 1
