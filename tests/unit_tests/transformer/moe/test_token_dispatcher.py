@@ -134,8 +134,11 @@ def test_hybridep_full_graph_capacity_covers_dense_routing(num_tokens):
     manager.num_local_experts = 2
     manager.num_experts = 8
     manager.router_topk = 2
+    manager.capacity_factor = None
     manager.moe_expert_rank_capacity_factor = None
     manager.drop_and_pad = False
+    manager.dense_routing_supported = False
+    manager.use_dense_routing_for_bool_map = False
     routing = torch.ones(num_tokens, 8, dtype=torch.bool)
     manager.setup_metadata(routing, torch.ones(num_tokens, 8))
     # Count each source's padded contributions independently, as a dispatcher
