@@ -76,51 +76,39 @@ def apply_attention_output_gate(
     return output
 
 
-class _ElementwiseGateBeforeCast(torch.autograd.Function):
-    """``core_attn_out * sigmoid(gate.float()).to(core_attn_out.dtype)`` saving only its inputs.
-
-    Run eagerly, that composition keeps the FP32 sigmoid output (SigmoidBackward) and the
-    cast scale plus ``core_attn_out`` (MulBackward) alive until backward: three gate-sized
-    tensors per layer, pinned on the device by the autograd graph of every in-flight
-    pipeline microbatch. This function saves the two BF16 inputs and recomputes the scale
-    in backward, which halves that footprint. It runs the same ATen ops in the same order
-    and dtypes as autograd does for the eager composition, so outputs and gradients are
-    bit-identical.
-    """
-
-    @staticmethod
-    def forward(ctx, core_attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        """Multiply by the sigmoid gate cast to the output dtype."""
-        ctx.save_for_backward(core_attn_out, gate)
-        scale = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
-        return core_attn_out * scale
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        """Replay MulBackward, the cast's backward, and SigmoidBackward."""
-        core_attn_out, gate = ctx.saved_tensors
-        sigmoid_out = torch.sigmoid(gate.float())
-        grad_core_attn_out = None
-        grad_gate = None
-        if ctx.needs_input_grad[0]:
-            grad_core_attn_out = grad_output * sigmoid_out.to(core_attn_out.dtype)
-        if ctx.needs_input_grad[1]:
-            grad_scale = (grad_output * core_attn_out).to(sigmoid_out.dtype)
-            grad_gate = torch.ops.aten.sigmoid_backward(grad_scale, sigmoid_out).to(gate.dtype)
-        return grad_core_attn_out, grad_gate
-
-
 def apply_elementwise_attention_output_gate_before_cast(
-    core_attn_out: torch.Tensor, gate: torch.Tensor
+    core_attn_out: torch.Tensor, gate: torch.Tensor, *, fusion: bool = False
 ) -> torch.Tensor:
-    """Elementwise ``apply_attention_output_gate(..., cast_mode='before')`` for training.
+    """Elementwise ``apply_attention_output_gate(..., cast_mode='before')`` with an optional fusion.
 
-    Same forward and backward values as the eager helper, but the autograd graph keeps only
-    ``core_attn_out`` and ``gate`` (see ``_ElementwiseGateBeforeCast``). Use it on paths that
-    must keep the eager rounding and VJP and whose activations stay live across pipeline
-    microbatches, such as the MLA output gate.
+    ``fusion=False`` runs the eager composition (FP32 sigmoid, cast to the activation dtype,
+    multiply); autograd then keeps the FP32 sigmoid output and the cast scale alive until
+    backward. ``fusion=True`` (``TransformerConfig.attention_output_gate_fusion``) runs the
+    forward and the backward as one Triton kernel each
+    (``megatron.core.fusions.fused_attention_output_gate``) with the same values and gradients
+    and only the two inputs saved. Contiguous CUDA inputs then require Triton; non-contiguous
+    views and CPU inputs fall back to the eager composition.
     """
     validate_attention_output_gate_shapes(core_attn_out, gate, 'elementwise')
-    if not torch.is_grad_enabled() or not (core_attn_out.requires_grad or gate.requires_grad):
-        return apply_attention_output_gate(core_attn_out, gate, 'elementwise', cast_mode='before')
-    return _ElementwiseGateBeforeCast.apply(core_attn_out, gate)
+    if fusion and core_attn_out.is_cuda:
+        from megatron.core.fusions.fused_attention_output_gate import (
+            HAVE_TRITON,
+            SUPPORTED_DTYPES,
+            can_use_fused_elementwise_attention_output_gate,
+            fused_elementwise_attention_output_gate_before_cast,
+        )
+
+        if can_use_fused_elementwise_attention_output_gate(core_attn_out, gate):
+            return fused_elementwise_attention_output_gate_before_cast(core_attn_out, gate)
+        if (
+            not HAVE_TRITON
+            or core_attn_out.dtype not in SUPPORTED_DTYPES
+            or gate.dtype not in SUPPORTED_DTYPES
+            or core_attn_out.device != gate.device
+        ):
+            raise RuntimeError(
+                "attention_output_gate_fusion requires Triton and BF16/FP16/FP32 CUDA tensors "
+                f"on one device, got {core_attn_out.dtype} / {gate.dtype} on "
+                f"{core_attn_out.device} / {gate.device}."
+            )
+    return apply_attention_output_gate(core_attn_out, gate, 'elementwise', cast_mode='before')

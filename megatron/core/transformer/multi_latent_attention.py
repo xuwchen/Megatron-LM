@@ -739,11 +739,14 @@ class MultiLatentAttention(Attention):
             return self._apply_mla_headwise_output_gate(core_attn_out, gate)
         # Keep the FP32 sigmoid followed by native-dtype multiplication used by the
         # released model. Do not jit-fuse this elementwise path: preserve its eager
-        # cast/multiply rounding and VJP. The plain eager composition would keep the
-        # FP32 sigmoid output and the cast scale alive until backward (384 MiB per MLA
-        # layer and microbatch at 32K tokens x 3072 local channels, pinned on the device
-        # for every in-flight pipeline microbatch); this variant saves only the inputs.
-        return apply_elementwise_attention_output_gate_before_cast(core_attn_out, gate)
+        # cast/multiply rounding and VJP. Eagerly, autograd keeps the FP32 sigmoid output
+        # and the cast scale alive until backward (384 MiB per MLA layer and microbatch at
+        # 32K tokens x 3072 local channels, for every in-flight pipeline microbatch);
+        # attention_output_gate_fusion runs the same math as one Triton kernel per
+        # direction and saves only the two inputs.
+        return apply_elementwise_attention_output_gate_before_cast(
+            core_attn_out, gate, fusion=self.config.attention_output_gate_fusion
+        )
 
     @staticmethod
     @jit_fuser
