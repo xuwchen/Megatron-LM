@@ -733,6 +733,56 @@ def test_chunked_exchange_matches_unchunked_bitwise(ns_batch):
         )
 
 
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("nesterov", [False, True], ids=["plain", "nesterov"])
+@pytest.mark.parametrize("chunk_bytes", [0, 1], ids=["one_round", "chunked"])
+def test_release_grads_after_use_is_bitwise_neutral(nesterov, chunk_bytes):
+    """Dropping each grad after its last read frees it before the exchange without
+    changing a result bit, on the replicated and the routed (chunked or not) paths."""
+    _require_four_ranks()
+    r = dist.get_rank()
+    t, g = r % 2, r // 2
+    ep_rank, egtp_rank = r // 2, r % 2
+    tp_group, gtp_remat_group = _get_2d_groups()
+    egtp_group = _get_expert_group()
+
+    def _run(release):
+        dense, _, _, expert, _, _, homes = _dense_and_expert_params(
+            t, g, ep_rank, egtp_rank, n_same_experts=3
+        )
+        torch.manual_seed(_SEED + 80)  # same on every rank: whole, so replicated
+        replicated = torch.nn.Parameter(torch.randn(6, 6))
+        replicated.grad = torch.randn(6, 6)
+        params = dense + [replicated] + expert
+        grads = [p.grad.clone() for p in params]
+        opt = _muon(
+            [{"params": dense + [replicated]}, {"params": expert}],
+            nesterov=nesterov,
+            gtp_remat_group=gtp_remat_group,
+            tp_group=tp_group,
+        )
+        opt.exchange_chunk_bytes = chunk_bytes  # below 1 MiB: set directly
+        opt.release_grads_after_use = release
+        opt.set_group_process_groups({0: (gtp_remat_group, tp_group), 1: (egtp_group, None)})
+        opt.set_param_ns_homes(homes)
+        for step in range(2):  # the second step reads momentum the first one wrote
+            for p, grad in zip(params, grads):
+                p.grad = (grad * (step + 1)).clone()
+            opt.step()
+            released = [p.grad is None for p in params]
+            assert all(released) if release else not any(released), released
+        assert opt._plans[0].replicated, "the replicated path was not exercised"
+        return [p.data.clone() for p in params]
+
+    reference = _run(release=False)
+    released = _run(release=True)
+    for i, (a, b) in enumerate(zip(reference, released)):
+        assert torch.equal(a, b), (
+            f"param {i} differs with grads released after use on rank {r}: "
+            f"max |diff| = {(a - b).abs().max().item():.3e}"
+        )
+
+
 def test_chunk_partition_keeps_newton_schulz_batches_whole():
     """Every routed param lands in exactly one round, and every home's same-shape
     matrices are cut into rounds only at ``ns_batch_size`` boundaries, in order."""

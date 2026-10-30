@@ -328,6 +328,8 @@ class LayerShardedMuon(TensorParallelMuon):
 
     With ``exchange_chunk_mb`` set, steps 2-5 run in rounds over subsets of the routed
     params, bounding their transient memory; step 1 still covers every param up front.
+    With ``release_grads_after_use`` set, each param's ``.grad`` is dropped right after
+    its last read, so the grads are not held under the exchange rounds.
 
     Args:
         params: Parameters to optimize. Every rank in the domain must pass the same
@@ -480,6 +482,10 @@ class LayerShardedMuon(TensorParallelMuon):
         self.extra_scale_factor = extra_scale_factor
         self.concurrent_groups = concurrent_groups
         self.exchange_chunk_bytes = exchange_chunk_mb * 2**20
+        # Drop each param's .grad as soon as step() has consumed it (see _release_grad).
+        # Off by default, since a torch optimizer leaves grads in place; the LayerWise
+        # wrapper turns it on because its prepare_grads rebuilds them every step.
+        self.release_grads_after_use = False
         self._group_streams: list | None = None
         # id(param) -> (g_home, t_home). Set via set_param_ns_homes(); until then step()
         # delegates to the parent.
@@ -851,6 +857,8 @@ class LayerShardedMuon(TensorParallelMuon):
                     grad = p.grad
                     self._apply_weight_decay_inplace(p, grad, lr, group["weight_decay"])
                     self.state[p]["momentum_buffer"].lerp_(grad, 1 - beta)
+                    if not self.nesterov:
+                        self._release_grad(p)
 
             # 2. Replicated params (whole on every rank of the domain, which is every param
             #    of a single-rank domain): local Newton-Schulz on each rank's own copy,
@@ -858,15 +866,37 @@ class LayerShardedMuon(TensorParallelMuon):
             #    broadcasting the result back.
             if plan.replicated:
                 with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
-                    replicated_ns_outputs = self._run_ns(
-                        {i: self._local_ns_input(params[i], beta) for i in plan.replicated}
-                    )
+                    replicated_ns_inputs = {
+                        i: self._local_ns_input(params[i], beta) for i in plan.replicated
+                    }
+                    if self.nesterov:
+                        for i in plan.replicated:
+                            self._release_grad(params[i])
+                    replicated_ns_outputs = self._run_ns(replicated_ns_inputs)
+                    del replicated_ns_inputs
                     for i, ns_output in replicated_ns_outputs.items():
                         self._apply_update(params[i], ns_output, lr)
 
             # 3-8. The routed params, one bounded-memory round at a time.
             for chunk in plan.chunks:
                 self._step_chunk(chunk, params, beta, lr, gtp_remat_group, tp_group)
+
+    def _release_grad(self, p: torch.Tensor) -> None:
+        """Drop ``p.grad`` once this step has consumed it, if ``release_grads_after_use``.
+
+        Its last reader is the momentum update, or with Nesterov the Newton-Schulz input
+        built from it. Under the Float16 wrapper ``p.grad`` is an fp32 copy of the bf16
+        main grad, as large as the momentum; held to the end of the step it sits under
+        every exchange round (tens of GiB per rank for the experts of a large MoE model).
+        Recording the current stream keeps the caching allocator from reusing the block
+        before kernels queued on a group stream have read it.
+        """
+        if not self.release_grads_after_use:
+            return
+        grad = p.grad
+        if grad.is_cuda:
+            grad.record_stream(torch.cuda.current_stream())
+        p.grad = None
 
     def _local_ns_input(self, p: torch.Tensor, beta: float) -> torch.Tensor:
         """This rank's local Newton-Schulz input for ``p`` after the momentum update.
@@ -892,6 +922,9 @@ class LayerShardedMuon(TensorParallelMuon):
         # The rank-local shards that enter the GTP_remat / TP routing path.
         local_param_shards = [params[i] for i in chunk.routed]
         local_ns_input_shards = [self._local_ns_input(p, beta) for p in local_param_shards]
+        if self.nesterov:
+            for p in local_param_shards:
+                self._release_grad(p)
         stage1_routed_indices = chunk.stage1_routed_indices
         route_plans = chunk.route_plans
 

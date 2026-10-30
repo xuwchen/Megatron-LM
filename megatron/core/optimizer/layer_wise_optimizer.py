@@ -926,6 +926,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 )
             inner.set_group_process_groups(group_axes)
             inner.set_param_ns_homes(assignment)
+            # A Megatron wrapper's prepare_grads rebuilds every main param's .grad each step
+            # (an fp32 copy of the main grad under Float16, an alias of it under
+            # FP32Optimizer) and nothing reads it after the inner step, so the step may drop
+            # each one as soon as it is consumed instead of holding all of them through the
+            # exchange. An unwrapped optimizer's grads belong to its caller.
+            inner.release_grads_after_use = inner is not opt
 
     @staticmethod
     def _check_gtp_group_matches(params: list, specs: list, gtp_remat_group) -> None:

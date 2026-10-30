@@ -152,6 +152,9 @@ def _run_pair(extra, label):
         assert not gtp._GTP_PENDING_WGRAD_ACCUM, "layer-sharded run left GTP gradients unflushed"
         assert harness.layer_sharded_instances >= 1, "no LayerShardedMuon was constructed"
         assert harness.wired_groups > 0, "the layer-wise wiring assigned no NS homes"
+        assert all(
+            opt.release_grads_after_use for opt in harness.layer_sharded_optimizers
+        ), "the layer-wise wiring left grad release off, so this run does not cover it"
         assert harness.two_d_groups == harness.wired_groups, (
             f"only {harness.two_d_groups} of {harness.wired_groups} wired groups span a 2-D "
             "(GTP_remat x TP) domain; the test grid is not what it claims"
