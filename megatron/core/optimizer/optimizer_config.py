@@ -332,6 +332,15 @@ class OptimizerConfig:
     all groups are live at once — disable (or lower muon_ns_batch_size) if peak memory is
     tight. Only used when muon_tp_mode='layer_sharded'. Defaults to True."""
 
+    muon_exchange_chunk_mb: int = 0
+    """Upper bound, in MiB, on the fp32 local Newton-Schulz inputs one round of the
+    layer-sharded routed path carries. Unchunked, a param group's whole momentum goes through
+    the all_to_all exchanges at once and the transient buffers hold several copies of it,
+    which does not fit for the expert group of a large MoE model. Each round runs the full
+    exchange / Newton-Schulz / reverse-exchange pipeline; a round never splits a
+    Newton-Schulz batch, so results are bitwise identical to the unchunked step. 0 runs every
+    routed param in one round. Only used when muon_tp_mode='layer_sharded'. Defaults to 0."""
+
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""

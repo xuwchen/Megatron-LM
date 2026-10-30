@@ -610,7 +610,13 @@ def test_shared_muon_kwargs_ignore_layer_sharding_flag():
     kwargs = eo_mod._muon_config_to_kwargs(
         _dispatch_cfg(True), [_DispatchChunk()], pg_collection=None
     )
-    for lsh_only in ("gtp_remat_group", "tp_group", "ns_batch_size", "concurrent_groups"):
+    for lsh_only in (
+        "gtp_remat_group",
+        "tp_group",
+        "ns_batch_size",
+        "concurrent_groups",
+        "exchange_chunk_mb",
+    ):
         assert lsh_only not in kwargs, f"LayerShardedMuon-only kwarg leaked: {lsh_only}"
     assert "is_qkv_fn" in kwargs
     assert "qkv_split_shapes" in kwargs

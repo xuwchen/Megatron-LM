@@ -693,6 +693,80 @@ def test_concurrent_groups_match_serial_bitwise():
 
 
 @pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("ns_batch", [1, 3], ids=["ns_batch1", "ns_batch3"])
+def test_chunked_exchange_matches_unchunked_bitwise(ns_batch):
+    """Rounds of the routed path never split a Newton-Schulz batch, so chunking only
+    changes the buffer sizes and the number of collectives, never a result bit."""
+    _require_four_ranks()
+    _require_batched_ns(ns_batch)
+    r = dist.get_rank()
+    t, g = r % 2, r // 2
+    ep_rank, egtp_rank = r // 2, r % 2
+    tp_group, gtp_remat_group = _get_2d_groups()
+    egtp_group = _get_expert_group()
+
+    def _run(chunk_bytes):
+        dense, _, _, expert, _, _, homes = _dense_and_expert_params(
+            t, g, ep_rank, egtp_rank, n_same_experts=9
+        )
+        opt = _muon(
+            [{"params": dense}, {"params": expert}],
+            gtp_remat_group=gtp_remat_group,
+            tp_group=tp_group,
+            ns_batch_size=ns_batch,
+        )
+        opt.exchange_chunk_bytes = chunk_bytes  # below 1 MiB: set directly
+        opt.set_group_process_groups({0: (gtp_remat_group, tp_group), 1: (egtp_group, None)})
+        opt.set_param_ns_homes(homes)
+        for _ in range(2):  # the second step reads momentum the first one wrote
+            opt.step()
+        return [p.data.clone() for p in dense + expert], [len(opt._plans[i].chunks) for i in (0, 1)]
+
+    reference, n_chunks = _run(0)
+    assert n_chunks == [1, 1]
+    chunked, n_chunks = _run(1)
+    assert n_chunks[0] == 2 and n_chunks[1] > 2, n_chunks
+    for i, (a, b) in enumerate(zip(reference, chunked)):
+        assert torch.equal(a, b), (
+            f"param {i} differs between chunked and unchunked exchange on rank {r}: "
+            f"max |diff| = {(a - b).abs().max().item():.3e}"
+        )
+
+
+def test_chunk_partition_keeps_newton_schulz_batches_whole():
+    """Every routed param lands in exactly one round, and every home's same-shape
+    matrices are cut into rounds only at ``ns_batch_size`` boundaries, in order."""
+    opt = _make_opt(ns_batch_size=3)
+    opt.exchange_chunk_bytes = 64 * 4 * 5  # five 64-element shards per round
+    # (shape, tp_dim) with a 2x2 domain: TP-sharded params home on (g, t), GTP-only ones on
+    # (g, every t). One home mixes partition dims of the same full shape.
+    layout = [((16, 4), 0, (0, 1)), ((8, 8), 1, (0, 1))] * 4 + [((8, 8), None, (1, 0))] * 7
+    params = [torch.nn.Parameter(torch.zeros(*shape)) for shape, _, _ in layout]
+    specs = [
+        ParamShardSpec(tp_dim=pd, gtp_sharded=True, pad_length=0, full_shape=(32, 16))
+        for _, pd, _ in layout
+    ]
+    routed = list(range(len(layout)))
+    ns_homes = [home for _, _, home in layout]
+    chunks = opt._chunk_routed(params, specs, routed, ns_homes, gtp_remat_size=2)
+
+    assert sorted(n for c in chunks for n in c) == routed
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert sum(params[n].numel() * 4 for n in chunk) <= opt.exchange_chunk_bytes + 3 * 64 * 4
+
+    def _batches(ns):
+        """_run_ns's batches on each home for the params ``ns``."""
+        by_home = {}
+        for n in sorted(ns, key=lambda n: (specs[n].tp_dim or 0, n)):
+            home = (ns_homes[n][0], ns_homes[n][1] if specs[n].tp_dim is not None else None)
+            by_home.setdefault(home, []).append(n)
+        return {tuple(seq[i : i + 3]) for seq in by_home.values() for i in range(0, len(seq), 3)}
+
+    assert set().union(*(_batches(c) for c in chunks)) == _batches(routed)
+
+
+@pytest.mark.launch_on_gb200
 def test_degenerate_domain_group_falls_back_to_local_ns():
     """A group whose (GTP_remat x TP) domain is a single rank runs plain local NS."""
     _require_four_ranks()
@@ -994,7 +1068,7 @@ def test_exchange_plan_cache_bitwise_and_reused():
             opt.step()
         for pa, pb in zip(params_a, params_b):
             assert torch.equal(pa.data, pb.data), f"warm/cold divergence at step {step}"
-        current = {tag: id(sub) for tag, sub in opt_a._plans[0].route_plans.items()}
+        current = {tag: id(sub) for tag, sub in opt_a._plans[0].chunks[0].route_plans.items()}
         assert current, "no plans were cached"
         if plan_ids is None:
             plan_ids = current

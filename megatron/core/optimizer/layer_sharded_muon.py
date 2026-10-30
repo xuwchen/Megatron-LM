@@ -255,13 +255,32 @@ class ParamShardSpec:
 
 
 @dataclasses.dataclass
+class _ExchangeChunk:
+    """One round of the routed path: a subset of a group's routed params that goes through
+    both exchanges, Newton-Schulz and the reverse exchanges together.
+
+    Index spaces: ``c`` indexes this chunk's routed sub-list, ``k`` the subset of it that
+    stage 1 delivers to this rank (``stage1_routed_indices``).
+    """
+
+    routed: list[int]  # per c: the group's grad-bearing param index i
+    g_home: dict[int, int]  # c -> g_home, the stage-1 routing table
+    pad_lengths: list[int]  # per c
+    stage1_routed_indices: list[int]  # k -> c: routed params whose g_home is this rank
+    tp_exchanges: dict[int, tuple[list[int], dict[int, int]]]  # tp_dim -> (k's, j -> t_home)
+    tp_complete: list[int]  # k: complete after stage 1 (no TP axis), skips stage 2
+    # a2a routing metadata per stage ("s1f", "s1b", ("s2f", pd), ("s2b", pd)), filled by
+    # the route_* helpers on the first step.
+    route_plans: dict = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
 class _GroupExchangePlan:
     """Everything ``step()`` needs for one param group that is constant across steps.
 
     Built once per param identity tuple by :meth:`LayerShardedMuon._build_plan` and
-    invalidated by both setters; ``step()`` only consumes it. Index spaces: ``i`` indexes
-    the group's grad-bearing params, ``n`` the routed sub-list, ``k`` the subset of the
-    routed list that stage 1 delivers to this rank (``stage1_routed_indices``).
+    invalidated by both setters; ``step()`` only consumes it. ``i`` indexes the group's
+    grad-bearing params, ``n`` the routed sub-list.
     """
 
     param_ids: tuple[int, ...]
@@ -269,14 +288,7 @@ class _GroupExchangePlan:
     replicated: list[int]  # i: whole on every rank, local NS
     routed: list[int]  # i: goes through the exchanges
     ns_homes: list[tuple[int, int]]  # per n: (g_home, t_home)
-    g_home: dict[int, int]  # n -> g_home, the stage-1 routing table
-    pad_lengths: list[int]  # per n
-    stage1_routed_indices: list[int]  # k -> n: routed params whose g_home is this rank
-    tp_exchanges: dict[int, tuple[list[int], dict[int, int]]]  # tp_dim -> (k's, j -> t_home)
-    tp_complete: list[int]  # k: complete after stage 1 (no TP axis), skips stage 2
-    # a2a routing metadata per stage ("s1f", "s1b", ("s2f", pd), ("s2b", pd)), filled by
-    # the route_* helpers on the first step.
-    route_plans: dict = dataclasses.field(default_factory=dict)
+    chunks: list[_ExchangeChunk]  # partition of ``routed``, run one after another
 
 
 class LayerShardedMuon(TensorParallelMuon):
@@ -314,6 +326,9 @@ class LayerShardedMuon(TensorParallelMuon):
     5. Reverse stage-2 / stage-1 all_to_all scatter the scaled NS result back to
        every rank's original shard, which applies ``p -= lr * update``.
 
+    With ``exchange_chunk_mb`` set, steps 2-5 run in rounds over subsets of the routed
+    params, bounding their transient memory; step 1 still covers every param up front.
+
     Args:
         params: Parameters to optimize. Every rank in the domain must pass the same
             params in the same order (they hold different shards of the same weights).
@@ -344,6 +359,15 @@ class LayerShardedMuon(TensorParallelMuon):
             than two param groups or without CUDA. Requires the groups' domains to
             be disjoint; groups sharing a (gtp_remat, tp) domain are automatically
             serialized (NCCL forbids concurrent collectives on one communicator).
+        exchange_chunk_mb: Upper bound, in MiB, on the fp32 local Newton-Schulz inputs
+            one round of the routed path carries. A group's routed params are split into
+            rounds that each run the full exchange / Newton-Schulz / reverse-exchange
+            pipeline, so the transient buffers scale with the round instead of the
+            group: unchunked, the expert group of a large MoE model needs several copies
+            of its whole momentum at once. A round never splits a Newton-Schulz batch
+            (``ns_batch_size`` same-shape matrices on one home), so it may exceed the
+            bound by up to one batch, and results are bitwise identical to the unchunked
+            step. 0 (default) runs every routed param in one round.
         All other args: same as :class:`TensorParallelMuon`. In particular
             ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
             ``pg_collection`` only take effect on the paths that delegate to the
@@ -385,6 +409,7 @@ class LayerShardedMuon(TensorParallelMuon):
         ns_batch_size: int = 1,
         use_syrk: bool = False,
         concurrent_groups: bool = True,
+        exchange_chunk_mb: int = 0,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
@@ -420,6 +445,8 @@ class LayerShardedMuon(TensorParallelMuon):
         # version gate for use_syrk itself: no version upgrade fixes unfit hardware, so
         # that message must not be masked.
         _validate_ns_config(use_syrk, ns_batch_size)
+        if exchange_chunk_mb < 0:
+            raise ValueError(f"exchange_chunk_mb must be non-negative, got {exchange_chunk_mb}")
         # Explicit class call, matching the convention used by
         # TensorParallelAdaptiveMuon (see the comment in TensorParallelMuon.__init__).
         TensorParallelMuon.__init__(
@@ -452,6 +479,7 @@ class LayerShardedMuon(TensorParallelMuon):
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
         self.concurrent_groups = concurrent_groups
+        self.exchange_chunk_bytes = exchange_chunk_mb * 2**20
         self._group_streams: list | None = None
         # id(param) -> (g_home, t_home). Set via set_param_ns_homes(); until then step()
         # delegates to the parent.
@@ -684,7 +712,84 @@ class LayerShardedMuon(TensorParallelMuon):
         ns_homes = [
             self._param_ns_homes.get(id(params[i]), (i % gtp_remat_size, 0)) for i in routed
         ]
-        g_home = {n: home[0] for n, home in enumerate(ns_homes)}
+        chunks = [
+            self._build_chunk(
+                [routed[n] for n in ns], [ns_homes[n] for n in ns], specs, gtp_remat_group
+            )
+            for ns in self._chunk_routed(params, specs, routed, ns_homes, gtp_remat_size)
+        ]
+        return _GroupExchangePlan(
+            param_ids=tuple(id(p) for p in params),
+            specs=specs,
+            replicated=replicated,
+            routed=routed,
+            ns_homes=ns_homes,
+            chunks=chunks,
+        )
+
+    def _chunk_routed(
+        self,
+        params: list[torch.Tensor],
+        specs: list[ParamShardSpec],
+        routed: list[int],
+        ns_homes: list[tuple[int, int]],
+        gtp_remat_size: int,
+    ) -> list[list[int]]:
+        """Partition the routed list (``n`` indices) into rounds of at most
+        ``exchange_chunk_bytes`` of local fp32 Newton-Schulz input.
+
+        Every rank of the domain holds equal-size shards of the same params with the same
+        homes, so every rank computes the same partition. The packing unit is one
+        Newton-Schulz batch exactly as the unchunked :meth:`_run_ns` forms it: per home
+        and full shape, the home's matrices in the order ``_run_ns`` receives them (stage-1
+        index order, TP exchanges by partition dim first), cut into ``ns_batch_size``
+        runs. A round holds whole units and, per (home, shape), a contiguous run of them,
+        so every home batches exactly the matrices it batches unchunked.
+        """
+        if not routed:
+            return []
+        if not self.exchange_chunk_bytes:
+            return [list(range(len(routed)))]
+        sequences: dict[tuple, list[tuple[int, int]]] = {}
+        for n, i in enumerate(routed):
+            spec = specs[i]
+            # A trivial axis is not part of the home: every rank holds the matrix there.
+            g = ns_homes[n][0] if gtp_remat_size > 1 else 0
+            t = ns_homes[n][1] if spec.tp_dim is not None else None
+            sequences.setdefault((g, t, spec.full_shape), []).append((spec.tp_dim or 0, n))
+        units: list[tuple[int, int, list[int]]] = []
+        for seq in sequences.values():
+            ordered = [n for _, n in sorted(seq)]
+            for j, start in enumerate(range(0, len(ordered), self.ns_batch_size)):
+                unit = ordered[start : start + self.ns_batch_size]
+                units.append((j, min(unit), unit))
+        # Round-robin over the (home, shape) sequences keeps each round spread over all
+        # homes while taking every sequence's units in order.
+        units.sort(key=lambda u: (u[0], u[1]))
+
+        chunks: list[list[int]] = []
+        current: list[int] = []
+        current_bytes = 0
+        for _, _, unit in units:
+            unit_bytes = sum(params[routed[n]].numel() for n in unit) * 4
+            if current and current_bytes + unit_bytes > self.exchange_chunk_bytes:
+                chunks.append(sorted(current))
+                current, current_bytes = [], 0
+            current.extend(unit)
+            current_bytes += unit_bytes
+        chunks.append(sorted(current))
+        return chunks
+
+    @staticmethod
+    def _build_chunk(
+        routed: list[int],
+        ns_homes: list[tuple[int, int]],
+        specs: list[ParamShardSpec],
+        gtp_remat_group,
+    ) -> _ExchangeChunk:
+        """Routing tables for one round over ``routed`` (ascending ``i``) and their homes."""
+        gtp_remat_size = get_pg_size(gtp_remat_group)
+        g_home = {c: home[0] for c, home in enumerate(ns_homes)}
 
         # This rank's share of the stage-1 exchange, by the rule the router itself applies
         # (a trivial gtp_remat group homes everything locally).
@@ -695,8 +800,8 @@ class LayerShardedMuon(TensorParallelMuon):
                 get_pg_rank(gtp_remat_group)
             ]
         by_tp_dim: dict[int | None, list[int]] = {0: [], 1: [], None: []}
-        for k, n in enumerate(stage1_routed_indices):
-            by_tp_dim[specs[routed[n]].tp_dim].append(k)
+        for k, c in enumerate(stage1_routed_indices):
+            by_tp_dim[specs[routed[c]].tp_dim].append(k)
         tp_exchanges: dict[int, tuple[list[int], dict[int, int]]] = {}
         for pd in (0, 1):
             positions = by_tp_dim[pd]
@@ -707,12 +812,8 @@ class LayerShardedMuon(TensorParallelMuon):
                 }
                 tp_exchanges[pd] = (positions, t_home)
 
-        return _GroupExchangePlan(
-            param_ids=tuple(id(p) for p in params),
-            specs=specs,
-            replicated=replicated,
+        return _ExchangeChunk(
             routed=routed,
-            ns_homes=ns_homes,
             g_home=g_home,
             pad_lengths=[specs[i].pad_length for i in routed],
             stage1_routed_indices=stage1_routed_indices,
@@ -741,23 +842,15 @@ class LayerShardedMuon(TensorParallelMuon):
                 continue
             plan = self._plan_for(group_index, params, gtp_remat_group, tp_group)
 
-            # 1. Momentum update on the local shard. Each entry is this rank's local
-            #    Newton-Schulz input: the Nesterov-corrected direction, or the momentum
-            #    buffer itself.
-            # NOTE: with nesterov=False, ``local_ns_inputs[i]`` aliases the momentum buffer
-            # (``.float()`` is a no-op on fp32); everything below treats it as read-only.
-            local_ns_inputs: list[torch.Tensor] = []
+            # 1. Momentum update on the local shard, for every param up front. The
+            #    Newton-Schulz input derived from it (the Nesterov-corrected direction, or
+            #    the momentum buffer itself) is built per round below, so only one round's
+            #    worth of it is ever live.
             with _phase("momentum"):
                 for p in params:
                     grad = p.grad
-                    state = self.state[p]
                     self._apply_weight_decay_inplace(p, grad, lr, group["weight_decay"])
-                    state["momentum_buffer"].lerp_(grad, 1 - beta)
-                    if self.nesterov:
-                        local_ns_input = grad.lerp(state["momentum_buffer"], beta)
-                    else:
-                        local_ns_input = state["momentum_buffer"]
-                    local_ns_inputs.append(local_ns_input.float())
+                    self.state[p]["momentum_buffer"].lerp_(grad, 1 - beta)
 
             # 2. Replicated params (whole on every rank of the domain, which is every param
             #    of a single-rank domain): local Newton-Schulz on each rank's own copy,
@@ -766,147 +859,169 @@ class LayerShardedMuon(TensorParallelMuon):
             if plan.replicated:
                 with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
                     replicated_ns_outputs = self._run_ns(
-                        {i: local_ns_inputs[i] for i in plan.replicated}
+                        {i: self._local_ns_input(params[i], beta) for i in plan.replicated}
                     )
                     for i, ns_output in replicated_ns_outputs.items():
                         self._apply_update(params[i], ns_output, lr)
-            if not plan.routed:
-                continue
-            # The rank-local shards that enter the GTP_remat / TP routing path.
-            local_param_shards = [params[i] for i in plan.routed]
-            local_ns_input_shards = [local_ns_inputs[i] for i in plan.routed]
-            stage1_routed_indices = plan.stage1_routed_indices
-            route_plans = plan.route_plans
 
-            with fp32_matmul_precision(self.fp32_matmul_prec):
-                with _phase("a2a_fwd"):
-                    # 3. Stage-1 all_to_all over gtp_remat (dim 0): each param's gtp_remat
-                    #    extent is assembled on its g_home column. The router delivers the
-                    #    same params to this rank as ``plan.stage1_routed_indices`` (both
-                    #    use params_by_home).
-                    stage1_ns_inputs, _ = route_to_ns_home(
-                        local_ns_input_shards,
-                        plan.g_home,
-                        gtp_remat_group,
-                        0,
-                        plan=route_plans.setdefault("s1f", {}),
-                    )
-                    # Strip the GTP alignment padding at the stage-1 seam: the stage-1
-                    # output is the gtp-gathered TP-LOCAL tensor, where the pad is a
-                    # contiguous dim-0 tail for every partition dim (after TP assembly it
-                    # would be embedded per TP block), the same strip point the parent's
-                    # duplicated path uses.
-                    stage1_ns_inputs = [
-                        self._strip_pad(t, plan.pad_lengths[stage1_routed_indices[k]])
-                        for k, t in enumerate(stage1_ns_inputs)
-                    ]
+            # 3-8. The routed params, one bounded-memory round at a time.
+            for chunk in plan.chunks:
+                self._step_chunk(chunk, params, beta, lr, gtp_remat_group, tp_group)
 
-                    # 4. Stage-2 all_to_all over TP, one exchange per partition dim.
-                    #    GTP_REMAT-only params skip it: every TP peer of the column already
-                    #    holds their full matrix. Both dicts below are keyed by ``k``, the
-                    #    stage-1 index.
-                    full_ns_inputs_by_stage1_index: dict[int, torch.Tensor] = {}
-                    # Forward TP-routing state the reverse exchange needs, per partition dim:
-                    # the TP-local shards sent and the positions this rank's home received.
-                    tp_reverse_context_by_partition_dim: dict[
-                        int, tuple[list[torch.Tensor], list[int]]
-                    ] = {}
-                    for pd, (positions, t_home) in plan.tp_exchanges.items():
-                        tp_local_ns_input_shards = [stage1_ns_inputs[k] for k in positions]
-                        local_full_ns_inputs, tp_input_indices_for_local_home = route_to_ns_home(
-                            tp_local_ns_input_shards,
-                            t_home,
-                            tp_group,
-                            pd,
-                            plan=route_plans.setdefault(("s2f", pd), {}),
-                        )
-                        tp_reverse_context_by_partition_dim[pd] = (
-                            tp_local_ns_input_shards,
-                            tp_input_indices_for_local_home,
-                        )
-                        for tp_index, full_ns_input in zip(
-                            tp_input_indices_for_local_home, local_full_ns_inputs
-                        ):
-                            full_ns_inputs_by_stage1_index[positions[tp_index]] = full_ns_input
-                    for k in plan.tp_complete:
-                        full_ns_inputs_by_stage1_index[k] = stage1_ns_inputs[k]
+    def _local_ns_input(self, p: torch.Tensor, beta: float) -> torch.Tensor:
+        """This rank's local Newton-Schulz input for ``p`` after the momentum update.
 
-                # 5. Full-matrix Newton-Schulz on the home (identical to duplicated mode),
-                #    batched by shape; see _run_ns. The TP-complete (GTP_REMAT-only)
-                #    subset runs through its OWN _run_ns call: every TP column
-                #    orthogonalizes those matrices independently and scatters its own
-                #    result over gtp_remat alone, so their batch chunking must not depend
-                #    on the column's TP-sharded params (a different set per column).
-                #    Pooled chunking would put the same replicated matrix in a baddbmm
-                #    chunk on one column and addmm on another, and the TP replicas of its
-                #    weight would drift apart and compound every step.
-                tp_complete_indices = set(plan.tp_complete)
-                with _phase("ns"):
-                    ns_outputs_by_stage1_index = self._run_ns(
-                        {
-                            k: v
-                            for k, v in full_ns_inputs_by_stage1_index.items()
-                            if k not in tp_complete_indices
-                        }
-                    )
-                    ns_outputs_by_stage1_index.update(
-                        self._run_ns(
-                            {k: full_ns_inputs_by_stage1_index[k] for k in plan.tp_complete}
-                        )
-                    )
+        NOTE: with nesterov=False this aliases the momentum buffer (``.float()`` is a no-op
+        on fp32); every consumer treats it as read-only.
+        """
+        momentum_buffer = self.state[p]["momentum_buffer"]
+        if self.nesterov:
+            return p.grad.lerp(momentum_buffer, beta).float()
+        return momentum_buffer.float()
 
-            with _phase("a2a_bwd"):
-                # 6. Reverse stage-2 all_to_all: scatter NS results back to TP parts. The
-                #    result, per stage-1 index, is the update for the TP-local shard.
-                stage1_update_shards: list = [None] * len(stage1_routed_indices)
-                for pd, (positions, t_home) in plan.tp_exchanges.items():
-                    tp_local_ns_input_shards, tp_input_indices_for_local_home = (
-                        tp_reverse_context_by_partition_dim[pd]
-                    )
-                    tp_ns_outputs = [
-                        ns_outputs_by_stage1_index[positions[tp_index]]
-                        for tp_index in tp_input_indices_for_local_home
-                    ]
-                    tp_update_shards = route_from_ns_home(
-                        tp_ns_outputs,
-                        tp_input_indices_for_local_home,
+    def _step_chunk(
+        self,
+        chunk: _ExchangeChunk,
+        params: list[torch.Tensor],
+        beta: float,
+        lr: float,
+        gtp_remat_group,
+        tp_group,
+    ) -> None:
+        """Exchange, Newton-Schulz, reverse exchange and weight update for one round."""
+        # The rank-local shards that enter the GTP_remat / TP routing path.
+        local_param_shards = [params[i] for i in chunk.routed]
+        local_ns_input_shards = [self._local_ns_input(p, beta) for p in local_param_shards]
+        stage1_routed_indices = chunk.stage1_routed_indices
+        route_plans = chunk.route_plans
+
+        with fp32_matmul_precision(self.fp32_matmul_prec):
+            with _phase("a2a_fwd"):
+                # 3. Stage-1 all_to_all over gtp_remat (dim 0): each param's gtp_remat
+                #    extent is assembled on its g_home column. The router delivers the
+                #    same params to this rank as ``chunk.stage1_routed_indices`` (both
+                #    use params_by_home).
+                stage1_ns_inputs, _ = route_to_ns_home(
+                    local_ns_input_shards,
+                    chunk.g_home,
+                    gtp_remat_group,
+                    0,
+                    plan=route_plans.setdefault("s1f", {}),
+                )
+                # Strip the GTP alignment padding at the stage-1 seam: the stage-1
+                # output is the gtp-gathered TP-LOCAL tensor, where the pad is a
+                # contiguous dim-0 tail for every partition dim (after TP assembly it
+                # would be embedded per TP block), the same strip point the parent's
+                # duplicated path uses.
+                stage1_ns_inputs = [
+                    self._strip_pad(t, chunk.pad_lengths[stage1_routed_indices[k]])
+                    for k, t in enumerate(stage1_ns_inputs)
+                ]
+
+                # 4. Stage-2 all_to_all over TP, one exchange per partition dim.
+                #    GTP_REMAT-only params skip it: every TP peer of the column already
+                #    holds their full matrix. Both dicts below are keyed by ``k``, the
+                #    stage-1 index.
+                full_ns_inputs_by_stage1_index: dict[int, torch.Tensor] = {}
+                # Forward TP-routing state the reverse exchange needs, per partition dim:
+                # the TP-local shards sent and the positions this rank's home received.
+                tp_reverse_context_by_partition_dim: dict[
+                    int, tuple[list[torch.Tensor], list[int]]
+                ] = {}
+                for pd, (positions, t_home) in chunk.tp_exchanges.items():
+                    tp_local_ns_input_shards = [stage1_ns_inputs[k] for k in positions]
+                    local_full_ns_inputs, tp_input_indices_for_local_home = route_to_ns_home(
                         tp_local_ns_input_shards,
                         t_home,
                         tp_group,
                         pd,
-                        plan=route_plans.setdefault(("s2b", pd), {}),
+                        plan=route_plans.setdefault(("s2f", pd), {}),
                     )
-                    for tp_index, tp_update_shard in enumerate(tp_update_shards):
-                        stage1_update_shards[positions[tp_index]] = tp_update_shard
-                for k in plan.tp_complete:
-                    stage1_update_shards[k] = ns_outputs_by_stage1_index[k]
-
-                # Restore the padding (zero rows) before the reverse gtp_remat exchange:
-                # its split sizes derive from the padded momentum shards, and every
-                # rank's shard slice must line up again.
-                stage1_update_shards = [
-                    (
-                        None
-                        if t is None
-                        else self._restore_pad(t, plan.pad_lengths[stage1_routed_indices[k]])
+                    tp_reverse_context_by_partition_dim[pd] = (
+                        tp_local_ns_input_shards,
+                        tp_input_indices_for_local_home,
                     )
-                    for k, t in enumerate(stage1_update_shards)
-                ]
+                    for tp_index, full_ns_input in zip(
+                        tp_input_indices_for_local_home, local_full_ns_inputs
+                    ):
+                        full_ns_inputs_by_stage1_index[positions[tp_index]] = full_ns_input
+                for k in chunk.tp_complete:
+                    full_ns_inputs_by_stage1_index[k] = stage1_ns_inputs[k]
 
-                # 7. Reverse stage-1 all_to_all: scatter the TP-local updates back to the
-                #    gtp_remat shards.
-                update_shards = route_from_ns_home(
-                    stage1_update_shards,
-                    stage1_routed_indices,
-                    local_ns_input_shards,
-                    plan.g_home,
-                    gtp_remat_group,
-                    0,
-                    plan=route_plans.setdefault("s1b", {}),
+            # 5. Full-matrix Newton-Schulz on the home (identical to duplicated mode),
+            #    batched by shape; see _run_ns. The TP-complete (GTP_REMAT-only)
+            #    subset runs through its OWN _run_ns call: every TP column
+            #    orthogonalizes those matrices independently and scatters its own
+            #    result over gtp_remat alone, so their batch chunking must not depend
+            #    on the column's TP-sharded params (a different set per column).
+            #    Pooled chunking would put the same replicated matrix in a baddbmm
+            #    chunk on one column and addmm on another, and the TP replicas of its
+            #    weight would drift apart and compound every step.
+            tp_complete_indices = set(chunk.tp_complete)
+            with _phase("ns"):
+                ns_outputs_by_stage1_index = self._run_ns(
+                    {
+                        k: v
+                        for k, v in full_ns_inputs_by_stage1_index.items()
+                        if k not in tp_complete_indices
+                    }
+                )
+                ns_outputs_by_stage1_index.update(
+                    self._run_ns({k: full_ns_inputs_by_stage1_index[k] for k in chunk.tp_complete})
                 )
 
-            # 8. Weight update on the local shard.
-            with _phase("update"):
-                for p, shard in zip(local_param_shards, update_shards):
-                    if shard is not None:
-                        self._apply_update(p, shard, lr)
+        with _phase("a2a_bwd"):
+            # 6. Reverse stage-2 all_to_all: scatter NS results back to TP parts. The
+            #    result, per stage-1 index, is the update for the TP-local shard.
+            stage1_update_shards: list = [None] * len(stage1_routed_indices)
+            for pd, (positions, t_home) in chunk.tp_exchanges.items():
+                tp_local_ns_input_shards, tp_input_indices_for_local_home = (
+                    tp_reverse_context_by_partition_dim[pd]
+                )
+                tp_ns_outputs = [
+                    ns_outputs_by_stage1_index[positions[tp_index]]
+                    for tp_index in tp_input_indices_for_local_home
+                ]
+                tp_update_shards = route_from_ns_home(
+                    tp_ns_outputs,
+                    tp_input_indices_for_local_home,
+                    tp_local_ns_input_shards,
+                    t_home,
+                    tp_group,
+                    pd,
+                    plan=route_plans.setdefault(("s2b", pd), {}),
+                )
+                for tp_index, tp_update_shard in enumerate(tp_update_shards):
+                    stage1_update_shards[positions[tp_index]] = tp_update_shard
+            for k in chunk.tp_complete:
+                stage1_update_shards[k] = ns_outputs_by_stage1_index[k]
+
+            # Restore the padding (zero rows) before the reverse gtp_remat exchange:
+            # its split sizes derive from the padded momentum shards, and every
+            # rank's shard slice must line up again.
+            stage1_update_shards = [
+                (
+                    None
+                    if t is None
+                    else self._restore_pad(t, chunk.pad_lengths[stage1_routed_indices[k]])
+                )
+                for k, t in enumerate(stage1_update_shards)
+            ]
+
+            # 7. Reverse stage-1 all_to_all: scatter the TP-local updates back to the
+            #    gtp_remat shards.
+            update_shards = route_from_ns_home(
+                stage1_update_shards,
+                stage1_routed_indices,
+                local_ns_input_shards,
+                chunk.g_home,
+                gtp_remat_group,
+                0,
+                plan=route_plans.setdefault("s1b", {}),
+            )
+
+        # 8. Weight update on the local shard.
+        with _phase("update"):
+            for p, shard in zip(local_param_shards, update_shards):
+                if shard is not None:
+                    self._apply_update(p, shard, lr)

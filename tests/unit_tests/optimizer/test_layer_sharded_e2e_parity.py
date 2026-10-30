@@ -101,6 +101,7 @@ class _LayerShardedHarness(_Harness):
         visit(optimizer)
         wired = [pgs for o in found for pgs in o._group_process_groups.values()]
         self.layer_sharded_instances = len(found)
+        self.layer_sharded_optimizers = found
         self.wired_groups = len(wired)
         # A domain is 2-D only when both axis groups are non-trivial.
         self.two_d_groups = sum(
@@ -155,6 +156,13 @@ def _run_pair(extra, label):
             f"only {harness.two_d_groups} of {harness.wired_groups} wired groups span a 2-D "
             "(GTP_remat x TP) domain; the test grid is not what it claims"
         )
+        if extra.get("muon_exchange_chunk_mb"):
+            rounds = max(
+                len(plan.chunks)
+                for opt in harness.layer_sharded_optimizers
+                for plan in opt._plans.values()
+            )
+            assert rounds > 1, "muon_exchange_chunk_mb did not split any group into rounds"
         _assert_bitwise_across_ranks(loss_dup, loss_lsh, label)
         if torch.distributed.get_rank() == 0:
             print(
@@ -180,3 +188,9 @@ def test_dense_layer_sharded_matches_duplicated_end_to_end():
 def test_moe_layer_sharded_matches_duplicated_end_to_end():
     """GPT-MoE (EP1, ETP2 x EGTP2): layer_sharded (two-stage) == duplicated, bitwise."""
     _run_pair(_MOE, "moe")
+
+
+@pytest.mark.launch_on_gb200
+def test_moe_layer_sharded_chunked_matches_duplicated_end_to_end():
+    """GPT-MoE with the routed exchange split into 1 MiB rounds == duplicated, bitwise."""
+    _run_pair({**_MOE, "muon_exchange_chunk_mb": 1}, "moe_chunked")

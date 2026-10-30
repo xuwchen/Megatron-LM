@@ -3687,6 +3687,16 @@ def _add_regularization_args(parser):
         'when the concurrent transient buffers push peak memory too high.',
     )
     group.add_argument(
+        '--muon-exchange-chunk-mb',
+        type=int,
+        default=0,
+        help='Under --muon-tp-mode layer_sharded, split each param group\'s '
+        'routed params into rounds of at most this many MiB of fp32 local '
+        'Newton-Schulz input, each running the full exchange / Newton-Schulz '
+        '/ reverse-exchange pipeline. Bounds the transient memory of large '
+        'expert groups; bitwise-neutral. 0 (default) runs one round.',
+    )
+    group.add_argument(
         '--muon-extra-scale-factor',
         type=float,
         default=1.0,
