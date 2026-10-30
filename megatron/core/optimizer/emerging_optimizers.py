@@ -444,7 +444,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         concatenate once.
         """
         group_size = get_pg_size(group)
-        if torch.distributed.get_backend(group) != torch.distributed.Backend.NCCL:
+        try:
+            backend = torch.distributed.get_backend(group)
+        except Exception:  # not a real process group (tests fake the collective)
+            backend = None
+        if backend != torch.distributed.Backend.NCCL:
             # all_gather_into_tensor is NCCL-only; gloo (CPU tests) keeps the list form.
             shards = [torch.empty_like(t) for _ in range(group_size)]
             torch.distributed.all_gather(shards, t.contiguous(), group)
