@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import os
+from unittest import mock
 
 import pytest
 import torch
@@ -964,6 +965,52 @@ def test_muon_optimizer_different_modes_single_rank(mode):
     ), f"Weight should be updated with mode={mode}"
 
 
+@pytest.mark.parametrize("mode", ["duplicated", "distributed"])
+def test_muon_one_rank_tp_group_runs_single_rank_newton_schulz(monkeypatch, mode):
+    """A TP-partitioned weight in a one-rank TP group needs no TP collective.
+
+    newton_schulz_tp would still all-gather over the one-rank group (one NCCL kernel plus a
+    concat copy per parameter per step); the Megatron wrapper drops partition_dim instead,
+    which is the same computation.
+    """
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        assert pg_collection.tp.size() == 1
+
+        torch.manual_seed(42)
+        model = torch.nn.Linear(100, 50, bias=False, dtype=torch.float32, device='cuda')
+        model.weight.partition_dim = 0
+        optimizer = TensorParallelMuon(
+            params=[model.weight],
+            lr=0.01,
+            momentum=0.95,
+            weight_decay=0.0,
+            num_ns_steps=5,
+            pg_collection=pg_collection,
+            tp_mode=mode,
+        )
+
+        real_newton_schulz_tp = eo_mod.newton_schulz_tp
+        calls = []
+
+        def recording_newton_schulz_tp(x, *args, **kwargs):
+            calls.append(kwargs.get("partition_dim", "unset"))
+            return real_newton_schulz_tp(x, *args, **kwargs)
+
+        monkeypatch.setattr(eo_mod, "newton_schulz_tp", recording_newton_schulz_tp)
+        with mock.patch.object(
+            torch.distributed, "all_gather", wraps=torch.distributed.all_gather
+        ) as all_gather:
+            model(torch.randn(32, 100, device='cuda')).sum().backward()
+            optimizer.step()
+
+        assert calls == [None]
+        all_gather.assert_not_called()
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
@@ -1049,6 +1096,21 @@ class TestMuonOptimizerMultiRankTP:
         assert not torch.equal(
             model.weight.data, original_weight
         ), "Weight should be updated with mode=blockwise"
+
+    @pytest.mark.parametrize("dim", [0, 1])
+    def test_all_gather_tensor_matches_list_gather(self, dim):
+        """The single-buffer gather is bitwise the concatenation of the per-rank shards."""
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        rank = torch.distributed.get_rank(tp_group)
+        shard = torch.arange(15, dtype=torch.float32, device='cuda').view(3, 5) * (rank + 1)
+
+        shards = [torch.empty_like(shard) for _ in range(tp_group.size())]
+        torch.distributed.all_gather(shards, shard, tp_group)
+        reference = torch.cat(shards, dim=dim)
+
+        gathered = TensorParallelMuon._all_gather_tensor(shard, tp_group, dim)
+        assert gathered.shape == reference.shape
+        assert torch.equal(gathered, reference)
 
     def test_optimizer_factory_tags_qkv_when_tp_exceeds_query_groups(self):
         """The public optimizer factory tags query groups fragmented across TP ranks."""

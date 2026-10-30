@@ -378,6 +378,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 # This overrides only the final Muon scalar; NS still uses grad's physical
                 # shape and partition metadata for its collectives.
                 size = scale_shape
+            if partition_dim is not None and get_pg_size(tp_group) == 1:
+                # A one-rank TP group holds the whole matrix already. newton_schulz_tp would
+                # still all-gather it (one NCCL kernel plus a concat copy per parameter) in
+                # "duplicated" mode; the single-rank Newton-Schulz is the same computation.
+                partition_dim = None
             # Only forward the kwarg when enabled; older emerging_optimizers do not
             # accept it at all, and __init__ has already rejected use_syrk on those.
             ns_kwargs = {"use_syrk": True} if use_syrk else {}
@@ -391,7 +396,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 **ns_kwargs,
             )
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
-            return orth_grad * scale_factor * extra_scale_factor
+            # newton_schulz_tp returns a fresh tensor, so scale it in place. Two separate
+            # multiplies keep the rounding of the former ``orth_grad * a * b`` expression; a
+            # multiply by exactly 1.0 is an identity and is skipped.
+            orth_grad.mul_(scale_factor)
+            if extra_scale_factor != 1.0:
+                orth_grad.mul_(extra_scale_factor)
+            return orth_grad
 
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
@@ -426,10 +437,23 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
     @staticmethod
     def _all_gather_tensor(t, group, dim):
-        """All-gather equal-size shards of ``t`` over ``group`` and concat along ``dim``."""
-        shards = [torch.empty_like(t) for _ in range(get_pg_size(group))]
-        torch.distributed.all_gather(shards, t.contiguous(), group)
-        return torch.cat(shards, dim=dim)
+        """All-gather equal-size shards of ``t`` over ``group`` and concat along ``dim``.
+
+        The shards land in one ``[group_size, *t.shape]`` buffer. Along dim 0 that buffer *is*
+        the concatenation, so the gathered matrix needs no extra copy; other dims still
+        concatenate once.
+        """
+        group_size = get_pg_size(group)
+        if torch.distributed.get_backend(group) != torch.distributed.Backend.NCCL:
+            # all_gather_into_tensor is NCCL-only; gloo (CPU tests) keeps the list form.
+            shards = [torch.empty_like(t) for _ in range(group_size)]
+            torch.distributed.all_gather(shards, t.contiguous(), group)
+            return torch.cat(shards, dim=dim)
+        gathered = torch.empty((group_size,) + tuple(t.shape), dtype=t.dtype, device=t.device)
+        torch.distributed.all_gather_into_tensor(gathered, t.contiguous(), group)
+        if dim == 0:
+            return gathered.view(group_size * t.size(0), *t.shape[1:])
+        return torch.cat(gathered.unbind(0), dim=dim)
 
     @staticmethod
     def _strip_pad(t, pad_length):

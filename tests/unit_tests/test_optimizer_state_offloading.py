@@ -710,7 +710,8 @@ def test_h2d_targets_record_the_transfer_stream():
     master_param.data = master_cpu
     master_manager = object.__new__(ChunkedOptimizerStateOffloader)
     master_manager._selected_params = (master_param,)
-    master_manager._master_h2d_event = None
+    master_manager._master_h2d_pending = {}
+    master_manager._master_h2d_events = {}
     master_manager._explicit_master_param_ids = {id(master_param)}
     master_manager._master_weights_resident = True
     master_manager._param_devices = {master_param: object()}
@@ -1074,6 +1075,73 @@ def test_master_h2d_allocates_on_compute_stream():
     assert allocation_streams == [compute_stream.cuda_stream]
     assert param.is_cuda
     torch.testing.assert_close(param, torch.ones_like(param))
+    manager.synchronize_for_checkpoint()
+
+
+def _chunked_sgd_manager():
+    """Four one-parameter chunks of SGD-with-momentum state, offloaded to the CPU."""
+
+    params = [nn.Parameter(torch.full((4096,), float(i + 1), device="cuda")) for i in range(4)]
+    optimizer = torch.optim.SGD(params, lr=0.1, momentum=0.9)
+    for param in params:
+        param.grad = torch.ones_like(param)
+    optimizer.step()  # materialize the momentum buffers so the state is chunkable
+    manager = ChunkedOptimizerStateOffloader(
+        optimizer=optimizer,
+        master_params=params,
+        chunk_size_bytes=4096 * torch.float32.itemsize,
+        offload_fraction=1.0,
+        state_dtypes=(torch.float32,),
+    )
+    assert len(manager.chunks) == 4
+    manager.synchronize_for_checkpoint()
+    assert all(param.device.type == "cpu" for param in params)
+    return params, manager, [param.detach().clone() for param in params]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_master_h2d_streams_one_chunk_ahead():
+    """Masters are bound at once but copied per chunk, so chunk 0 never waits for the rest."""
+
+    params, manager, before = _chunked_sgd_manager()
+
+    manager.prefetch_master_for_step()
+    # Every master already has CUDA storage: gradients can attach before any copy lands.
+    assert all(param.is_cuda for param in params)
+    assert not manager._master_weights_resident
+    first_chunk_ids = {id(param) for param in manager.chunks[0].params}
+    later_chunk_ids = {id(param) for chunk in manager.chunks[1:] for param in chunk.params}
+    assert set(manager._master_h2d_events) == first_chunk_ids
+    assert set(manager._master_h2d_pending) == later_chunk_ids
+
+    for param in params:
+        param.grad = torch.ones_like(param)
+    manager.step()
+    torch.cuda.synchronize()
+
+    assert not manager._master_h2d_in_flight()
+    assert manager._master_weights_resident
+    # Second SGD step with the restored momentum buffer (1.0): p -= lr * (0.9 * 1.0 + 1.0).
+    for param, previous in zip(params, before):
+        torch.testing.assert_close(param.detach().cpu(), previous - 0.1 * 1.9)
+    manager.synchronize_for_checkpoint()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_master_restore_for_param_sync_drains_pending_chunks():
+    """A whole-master consumer enqueues the copies the per-chunk prefetch left pending."""
+
+    params, manager, before = _chunked_sgd_manager()
+
+    manager.prefetch_master_for_step()
+    assert manager._master_h2d_pending
+    manager.ensure_master_for_param_sync()
+    torch.cuda.synchronize()
+
+    assert not manager._master_h2d_in_flight()
+    assert manager._master_weights_resident
+    for param, previous in zip(params, before):
+        torch.testing.assert_close(param.detach().cpu(), previous)
     manager.synchronize_for_checkpoint()
 
 

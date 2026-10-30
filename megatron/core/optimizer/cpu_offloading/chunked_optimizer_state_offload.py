@@ -225,7 +225,14 @@ class ChunkedOptimizerStateOffloader:
 
         self._d2h_stream = d2h_stream if d2h_stream is not None else torch.cuda.Stream()
         self._h2d_stream = h2d_stream if h2d_stream is not None else torch.cuda.Stream()
-        self._master_h2d_event: torch.cuda.Event | None = None
+        # Master restore is two-phase. Binding allocates the CUDA storage and rebinds every
+        # selected master to it at once, so gradients can attach before any copy lands; the
+        # copies themselves are enqueued per state chunk (``_enqueue_master_h2d``) so the first
+        # chunk's update does not wait behind every other master's transfer.
+        # id(param) -> (param, state_key, cpu_tensor, gpu_tensor) bound but not yet enqueued.
+        self._master_h2d_pending: Dict[int, tuple] = {}
+        # id(param) -> event recorded after its copy; dropped once a consumer waited on it.
+        self._master_h2d_events: Dict[int, torch.cuda.Event] = {}
         self._master_weights_resident = True
         self._staging_pool = _StagingSlotPool()
         self._first_prefetch: _StatePrefetch | None = None
@@ -371,7 +378,7 @@ class ChunkedOptimizerStateOffloader:
         if d2h_stream is self._d2h_stream and h2d_stream is self._h2d_stream:
             return
         if (
-            self._master_h2d_event is not None
+            self._master_h2d_in_flight()
             or self._first_prefetch is not None
             or self._cpu_state
             or self._cpu_master
@@ -718,8 +725,19 @@ class ChunkedOptimizerStateOffloader:
                 else:
                     self.optimizer.state[param][state_key] = cpu_tensor
 
-    def _schedule_master_h2d(self) -> None:
-        if not self._selected_params or self._master_h2d_event is not None:
+    def _master_h2d_in_flight(self) -> bool:
+        """Return whether any selected master is bound to CUDA storage its copy has not filled."""
+
+        return bool(self._master_h2d_pending or self._master_h2d_events)
+
+    def _bind_masters_for_h2d(self) -> None:
+        """Rebind every CPU-bound selected master to fresh CUDA storage, copies still pending.
+
+        The storage is allocated on the current (compute) stream so the caching allocator can
+        recycle it later; ``_enqueue_master_h2d`` orders the H2D stream after that allocation.
+        """
+
+        if not self._selected_params:
             return
         self._validate_master_storage()
 
@@ -731,42 +749,76 @@ class ChunkedOptimizerStateOffloader:
             if isinstance(state_master, torch.Tensor) and not state_master.is_cuda:
                 transfers.append((param, _MASTER_PARAM_KEY, state_master))
         if not transfers:
-            self._master_weights_resident = self._master_bindings_are_cuda()
+            if not self._master_h2d_in_flight():
+                self._master_weights_resident = self._master_bindings_are_cuda()
             return
 
         self._master_weights_resident = False
-        gpu_transfers = [
-            (
-                param,
-                state_key,
-                cpu_tensor,
-                torch.empty_like(cpu_tensor, device=self._param_devices[param]),
-            )
-            for param, state_key, cpu_tensor in transfers
-        ]
+        for param, state_key, cpu_tensor in transfers:
+            gpu_tensor = torch.empty_like(cpu_tensor, device=self._param_devices[param])
+            if state_key is None:
+                param.data = gpu_tensor
+            else:
+                self.optimizer.state[param][state_key] = gpu_tensor
+            self._cpu_master[param] = cpu_tensor
+            self._master_h2d_pending[id(param)] = (param, state_key, cpu_tensor, gpu_tensor)
+
+    def _enqueue_master_h2d(self, params: Sequence[torch.Tensor] | None = None) -> None:
+        """Enqueue the H2D copies of bound masters: those of ``params``, or every pending one."""
+
+        if params is None:
+            entries = list(self._master_h2d_pending.values())
+            self._master_h2d_pending.clear()
+        else:
+            entries = [
+                self._master_h2d_pending.pop(id(param))
+                for param in params
+                if id(param) in self._master_h2d_pending
+            ]
+        if not entries:
+            return
 
         self._order_h2d_after_source_streams()
         with torch.cuda.stream(self._h2d_stream):
-            for param, state_key, cpu_tensor, gpu_tensor in gpu_transfers:
+            for _, _, cpu_tensor, gpu_tensor in entries:
                 gpu_tensor.copy_(cpu_tensor, non_blocking=cpu_tensor.is_pinned())
                 gpu_tensor.record_stream(self._h2d_stream)
-                if state_key is None:
-                    param.data = gpu_tensor
-                else:
-                    self.optimizer.state[param][state_key] = gpu_tensor
-                self._cpu_master[param] = cpu_tensor
-
             event = torch.cuda.Event()
             event.record(self._h2d_stream)
+        for param, _, _, _ in entries:
+            self._master_h2d_events[id(param)] = event
 
-        self._master_h2d_event = event
+    def _schedule_master_h2d(self, params: Sequence[torch.Tensor] | None = None) -> None:
+        """Bind every CPU-bound master, then enqueue the copies of ``params`` (default: all)."""
 
-    def _wait_master_h2d(self) -> None:
-        if self._master_h2d_event is None:
-            return
-        torch.cuda.current_stream().wait_event(self._master_h2d_event)
-        self._master_h2d_event = None
-        self._master_weights_resident = self._master_bindings_are_cuda()
+        self._bind_masters_for_h2d()
+        self._enqueue_master_h2d(params)
+
+    def _wait_master_h2d(self, params: Sequence[torch.Tensor] | None = None) -> None:
+        """Make the current stream wait for the master copies of ``params`` (default: all).
+
+        Copies of the requested masters that were bound but never enqueued are enqueued first,
+        so a caller never waits on storage no copy was scheduled into.
+        """
+
+        self._enqueue_master_h2d(params)
+        if params is None:
+            events = list(self._master_h2d_events.values())
+            self._master_h2d_events.clear()
+        else:
+            events = [
+                self._master_h2d_events.pop(id(param))
+                for param in params
+                if id(param) in self._master_h2d_events
+            ]
+        stream = torch.cuda.current_stream()
+        waited: set[int] = set()
+        for event in events:
+            if id(event) not in waited:
+                waited.add(id(event))
+                stream.wait_event(event)
+        if not self._master_h2d_in_flight():
+            self._master_weights_resident = self._master_bindings_are_cuda()
 
     def _order_h2d_after_source_streams(self) -> None:
         """Order H2D after CPU production and compute-stream GPU allocation/use.
@@ -853,25 +905,37 @@ class ChunkedOptimizerStateOffloader:
         if prefetch.event is not None:
             torch.cuda.current_stream().wait_event(prefetch.event)
 
+    def _first_chunk_params(self) -> Sequence[torch.Tensor] | None:
+        """Parameters whose masters the first chunked update needs; None means all of them."""
+
+        return self._chunks[0].params if self._chunks else None
+
     def prefetch_for_step(self) -> None:
-        """Asynchronously restore masters and the first state chunk for the next update."""
+        """Asynchronously restore masters and the first state chunk for the next update.
+
+        Every master is bound to CUDA storage here, but only the first chunk's copies are
+        enqueued together with its state; :meth:`step` streams the rest one chunk ahead.
+        """
 
         if not self._selected_params:
             return
-        self._schedule_master_h2d()
+        self._schedule_master_h2d(self._first_chunk_params())
         if self._chunks and self._first_prefetch is None:
             self._first_prefetch = self._prefetch_state(self._chunks[0])
 
     def prefetch_master_for_step(self) -> None:
-        """Asynchronously restore only masters, leaving tensor state CPU-resident."""
+        """Asynchronously restore only masters, leaving tensor state CPU-resident.
+
+        Same per-chunk pipeline as :meth:`prefetch_for_step`: bind all, copy the first chunk.
+        """
 
         if self._selected_params:
-            self._schedule_master_h2d()
+            self._schedule_master_h2d(self._first_chunk_params())
 
     def ensure_master_for_param_sync(self) -> None:
         """Ensure selected master weights are available for pre-forward FP8 staging."""
 
-        if self._master_weights_resident and self._master_h2d_event is None:
+        if self._master_weights_resident and not self._master_h2d_in_flight():
             return
         self._schedule_master_h2d()
         self._wait_master_h2d()
@@ -1040,7 +1104,6 @@ class ChunkedOptimizerStateOffloader:
             }
         )
         self.prefetch_for_step()
-        self._wait_master_h2d()
 
         original_groups = list(self.optimizer.param_groups)
         base_group_metadata = self._snapshot_group_metadata(original_groups)
@@ -1062,11 +1125,15 @@ class ChunkedOptimizerStateOffloader:
             for chunk_index, chunk in enumerate(self._chunks):
                 if current_prefetch is None:
                     current_prefetch = self._prefetch_state(chunk)
+                # Masters and state of this chunk only; later chunks keep streaming in.
+                self._wait_master_h2d(chunk.params)
                 self._wait_state_prefetch(current_prefetch)
 
                 next_prefetch = None
                 if chunk_index + 1 < len(self._chunks):
-                    next_prefetch = self._prefetch_state(self._chunks[chunk_index + 1])
+                    next_chunk = self._chunks[chunk_index + 1]
+                    self._enqueue_master_h2d(next_chunk.params)
+                    next_prefetch = self._prefetch_state(next_chunk)
 
                 self._step_subset(
                     chunk.params, original_groups, base_group_metadata, resulting_group_metadata
