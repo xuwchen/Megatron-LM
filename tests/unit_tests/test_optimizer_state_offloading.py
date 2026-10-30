@@ -22,6 +22,7 @@ from megatron.core.optimizer import (
 )
 from megatron.core.optimizer.cpu_offloading.chunked_optimizer_state_offload import (
     ChunkedOptimizerStateOffloader,
+    _PinnedHostArena,
 )
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -740,6 +741,75 @@ def test_initialize_state_for_loading_requires_an_initializer():
 
     with pytest.raises(RuntimeError, match="requires an optimizer state initializer"):
         manager.initialize_state_for_loading(None, object())
+
+
+def test_pinned_arena_carves_exact_size_aligned_views_from_power_of_two_blocks():
+    """Buffers share blocks, keep exact shapes, stay 256-byte aligned, and oversized requests
+    get a dedicated power-of-two block; nothing is rounded per tensor."""
+
+    blocks = []
+
+    def pageable_block(nbytes):
+        blocks.append(nbytes)
+        return torch.empty(nbytes, dtype=torch.uint8)
+
+    arena = _PinnedHostArena(block_bytes=1 << 20, block_allocator=pageable_block)
+    a = arena.allocate((100, 7), torch.float32)  # 2800 B -> padded 2816
+    b = arena.allocate((3,), torch.bfloat16)  # 6 B -> padded 256
+    big = arena.allocate((300_000,), torch.float32)  # 1.2 MB > block -> dedicated 2 MiB
+
+    assert a.shape == (100, 7) and a.dtype == torch.float32
+    assert b.shape == (3,) and b.dtype == torch.bfloat16
+    assert a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+    assert b.data_ptr() - a.data_ptr() == 2816
+    assert big.untyped_storage().nbytes() == 2 << 20
+    assert blocks == [1 << 20, 2 << 20]
+    assert arena.allocated_bytes == 2800 + 6 + 1_200_000
+    assert arena.reserved_bytes == (1 << 20) + (2 << 20)
+
+    # Filling the first block moves to a second one; the tail of the first stays unused.
+    c = arena.allocate((1 << 20 - 2,), torch.float32)  # exactly 1 MiB - 2816 does not fit
+    assert c.untyped_storage().data_ptr() != a.untyped_storage().data_ptr()
+    assert blocks[-1] == 1 << 20
+
+    a.fill_(1.5)
+    b.fill_(2.0)
+    assert float(a.sum()) == 1050.0 and float(b.float().sum()) == 6.0
+
+    with pytest.raises(ValueError, match="power of two"):
+        _PinnedHostArena(block_bytes=3 << 20, block_allocator=pageable_block)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_cpu_buffers_are_pinned_views_of_shared_blocks():
+    """Offloaded masters and states land in pinned arena blocks, not one allocation per tensor."""
+
+    params = [nn.Parameter(torch.full((1000,), float(i), device="cuda")) for i in range(3)]
+    optimizer = torch.optim.SGD(params, lr=0.1, momentum=0.9)
+    for param in params:
+        param.grad = torch.ones_like(param)
+    optimizer.step()
+    manager = ChunkedOptimizerStateOffloader(
+        optimizer=optimizer,
+        master_params=params,
+        chunk_size_bytes=0,
+        offload_fraction=1.0,
+        state_dtypes=(torch.float32,),
+        pinned_block_bytes=1 << 20,
+    )
+    manager.synchronize_for_checkpoint()
+
+    masters = [manager._cpu_master[p] for p in params]
+    states = [manager._cpu_state[p]["momentum_buffer"] for p in params]
+    assert all(t.is_pinned() and t.shape == (1000,) for t in masters + states)
+    # Six 4000-byte buffers fit in one 1 MiB block: one storage, six 4096-byte-aligned slices.
+    storages = {t.untyped_storage().data_ptr() for t in masters + states}
+    assert len(storages) == 1
+    assert manager._pinned_arena.reserved_bytes == 1 << 20
+    assert manager._pinned_arena.allocated_bytes == 6 * 4000
+    for i, (master, state) in enumerate(zip(masters, states)):
+        torch.testing.assert_close(master, torch.full((1000,), float(i) - 0.1))
+        torch.testing.assert_close(state, torch.ones(1000))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")

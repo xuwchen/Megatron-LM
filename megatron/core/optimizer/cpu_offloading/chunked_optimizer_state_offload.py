@@ -4,9 +4,14 @@
 
 The wrapped optimizer continues to own its normal param_groups and state mappings.
 Parameters selected for offload keep their master weights and tensor states in pinned CPU
-memory between updates. Immediately before an update, master weights are restored as one
-window and optimizer tensor states are restored one chunk at a time. The external optimizer
+memory between updates. Immediately before an update, master weights are restored one state
+chunk ahead and optimizer tensor states are restored one chunk at a time. The external optimizer
 therefore only ever observes regular CUDA tensors and does not need an offload-specific API.
+
+The pinned CPU buffers are carved out of large power-of-two blocks (``_PinnedHostArena``)
+rather than allocated one tensor at a time: PyTorch's caching host allocator rounds every
+pinned request up to the next power of two, so per-tensor allocation of an 84 MiB fp32 expert
+weight costs 128 MiB of host memory, about 1.5x the nominal state size across a MoE model.
 """
 
 from __future__ import annotations
@@ -37,6 +42,71 @@ class OptimizerStateChunk:
     """
 
     params: tuple[torch.Tensor, ...]
+
+
+class _PinnedHostArena:
+    """Bump allocator carving exact-size pinned CPU tensors out of power-of-two blocks.
+
+    PyTorch's caching host allocator rounds each pinned allocation up to a power of two and
+    keeps the rounded block, so a tensor of 84 MiB occupies 128 MiB of page-locked host memory
+    for the life of the process. Allocating ``block_bytes``-sized blocks (a power of two) and
+    slicing tensors out of them wastes at most one unfilled tail per block instead. Requests
+    larger than a block get a dedicated block rounded up to the next power of two, which is
+    what the allocator would have done anyway. Memory is never returned to the allocator: the
+    buffers live as long as the offload manager, and a buffer dropped on a schema change keeps
+    its slot until the arena is dropped.
+
+    Args:
+        block_bytes: Block size in bytes; must be a power of two. Default 1 GiB.
+        block_allocator: Callable returning a one-dimensional ``uint8`` CPU tensor of the given
+            byte count (pinned in production; tests inject a pageable allocator).
+    """
+
+    _ALIGNMENT = 256
+
+    def __init__(
+        self,
+        block_bytes: int = 1 << 30,
+        block_allocator: Callable[[int], torch.Tensor] | None = None,
+    ) -> None:
+        if block_bytes <= 0 or block_bytes & (block_bytes - 1):
+            raise ValueError(f"block_bytes must be a power of two, got {block_bytes}")
+        self.block_bytes = block_bytes
+        self._block_allocator = block_allocator or self._pinned_block
+        self._blocks: List[torch.Tensor] = []
+        self._offset = 0  # bump pointer inside the last block
+        self.allocated_bytes = 0  # bytes handed out (exact sizes)
+        self.reserved_bytes = 0  # bytes of blocks obtained from the allocator
+
+    @staticmethod
+    def _pinned_block(nbytes: int) -> torch.Tensor:
+        return torch.empty(nbytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+
+    def _new_block(self, nbytes: int) -> torch.Tensor:
+        block = self._block_allocator(nbytes)
+        self._blocks.append(block)
+        self.reserved_bytes += nbytes
+        return block
+
+    def allocate(self, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+        """Return an uninitialised pinned CPU tensor of ``shape`` and ``dtype``."""
+        numel = math.prod(shape) if len(shape) else 1
+        nbytes = numel * torch.empty((), dtype=dtype).element_size()
+        if nbytes == 0:
+            return torch.empty(tuple(shape), dtype=dtype, device="cpu")
+        padded = (nbytes + self._ALIGNMENT - 1) // self._ALIGNMENT * self._ALIGNMENT
+        if padded > self.block_bytes:
+            dedicated = self._new_block(1 << (padded - 1).bit_length())
+            self.allocated_bytes += nbytes
+            return dedicated[:nbytes].view(dtype).view(tuple(shape))
+        if not self._blocks or self._offset + padded > self.block_bytes:
+            self._new_block(self.block_bytes)
+            self._offset = 0
+        block = self._blocks[-1]
+        start = self._offset
+        self._offset += padded
+        self.allocated_bytes += nbytes
+        return block[start : start + nbytes].view(dtype).view(tuple(shape))
 
 
 @dataclasses.dataclass
@@ -143,6 +213,8 @@ class ChunkedOptimizerStateOffloader:
             accounts for compact int16 parameter remainders.
         d2h_stream: Optional transfer stream shared by related optimizer wrappers.
         h2d_stream: Optional transfer stream shared by related optimizer wrappers.
+        pinned_block_bytes: Size of the power-of-two pinned host blocks the CPU buffers are
+            carved from (see ``_PinnedHostArena``). Default 1 GiB.
     """
 
     def __init__(
@@ -155,9 +227,11 @@ class ChunkedOptimizerStateOffloader:
         optimizer_owned_master_dtypes: Mapping[torch.Tensor, torch.dtype] | None = None,
         d2h_stream: torch.cuda.Stream | None = None,
         h2d_stream: torch.cuda.Stream | None = None,
+        pinned_block_bytes: int = 1 << 30,
     ) -> None:
         if chunk_size_bytes < 0:
             raise ValueError(f"chunk_size_bytes must be non-negative, got {chunk_size_bytes}")
+        self._pinned_arena = _PinnedHostArena(pinned_block_bytes)
         if not 0.0 <= offload_fraction <= 1.0:
             raise ValueError(f"offload_fraction must be in [0, 1], got {offload_fraction}")
         if not state_dtypes:
@@ -387,11 +461,17 @@ class ChunkedOptimizerStateOffloader:
         self._d2h_stream = d2h_stream
         self._h2d_stream = h2d_stream
 
-    @staticmethod
-    def _new_cpu_buffer(tensor: torch.Tensor) -> torch.Tensor:
-        return torch.empty(
-            tensor.size(), dtype=tensor.dtype, layout=tensor.layout, device="cpu", pin_memory=True
-        )
+    def _new_cpu_buffer(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Exact-size pinned CPU buffer for ``tensor``, carved from the manager's arena."""
+        if tensor.layout != torch.strided:
+            return torch.empty(
+                tensor.size(),
+                dtype=tensor.dtype,
+                layout=tensor.layout,
+                device="cpu",
+                pin_memory=True,
+            )
+        return self._pinned_arena.allocate(tuple(tensor.size()), tensor.dtype)
 
     def _cpu_buffer_for_state(
         self, param: torch.Tensor, key: str, tensor: torch.Tensor
