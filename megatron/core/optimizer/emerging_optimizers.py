@@ -635,42 +635,56 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         torch.distributed.all_gather_into_tensor(out, t.contiguous(), group)
 
     def _launch_gtp_batch(self, key, items, compute_stream):
-        """Momentum update of a batch on the compute stream, then its gathers on the side stream.
+        """Momentum update of a batch on the compute stream, then ONE gather on the side stream.
 
-        Returns ``(inputs, gathered, done)``: the momentum tensors (kept alive until the
-        gathers finished), the ``[batch, gtp_remat_size * rows, cols]`` gathered buffer, and
-        the event the consumer waits on (None without CUDA).
+        The batch's momentum shards are stacked into a single ``[batch, rows, cols]`` tensor
+        and all-gathered with one collective, so a batch of 8 weights costs one NCCL kernel
+        instead of 8 latency-bound ones; the result is rank-major,
+        ``[gtp_remat_size * batch, rows, cols]``, and ``_apply_gtp_batch`` reorders it.
+
+        Returns ``(stacked, gathered, done)``: the stacked input (kept alive until the gather
+        finished), the rank-major gathered buffer, and the event the consumer waits on (None
+        without CUDA).
         """
-        inputs = [self._momentum_input(p, group) for p, group in items]
+        stacked = torch.stack([self._momentum_input(p, group) for p, group in items])
         gtp_remat_size = get_pg_size(key.gtp_remat_group)
         gathered = torch.empty(
-            (len(items), gtp_remat_size * key.rows, key.cols),
+            (gtp_remat_size * len(items), key.rows, key.cols),
             dtype=key.dtype,
-            device=inputs[0].device,
+            device=stacked.device,
         )
         if compute_stream is None:
-            for i, t in enumerate(inputs):
-                self._all_gather_into(gathered[i], t, key.gtp_remat_group)
-            return inputs, gathered, None
+            self._all_gather_into(gathered, stacked, key.gtp_remat_group)
+            return stacked, gathered, None
         if self._gather_stream is None:
-            self._gather_stream = torch.cuda.Stream()
+            # High priority: the gather overlaps the previous batch's Newton-Schulz GEMMs,
+            # which occupy every SM; without priority the NCCL kernel's CTAs wait for whole
+            # GEMM waves to drain (measured 155 us -> 1.9 ms per gather on GB300).
+            self._gather_stream = torch.cuda.Stream(priority=-1)
         ready = torch.cuda.Event()
         ready.record(compute_stream)
         with torch.cuda.stream(self._gather_stream):
             self._gather_stream.wait_event(ready)
-            for i, t in enumerate(inputs):
-                self._all_gather_into(gathered[i], t, key.gtp_remat_group)
+            self._all_gather_into(gathered, stacked, key.gtp_remat_group)
             done = torch.cuda.Event()
             done.record(self._gather_stream)
-        return inputs, gathered, done
+        return stacked, gathered, done
 
     def _apply_gtp_batch(self, key, items, gathered: torch.Tensor) -> None:
         """Batched whole-matrix Newton-Schulz on ``gathered``; reshard and apply the updates.
 
         Same operations as the duplicated branch of ``scaled_orthogonalize_fn_with_gtp_remat``
         plus ``scaled_orthogonalize_fn`` with ``partition_dim=None``, applied to a
-        ``[batch, rows, cols]`` stack instead of one matrix at a time.
+        ``[batch, rows, cols]`` stack instead of one matrix at a time. ``gathered`` is the
+        rank-major ``[gtp_remat_size * batch, rows, cols]`` buffer of ``_launch_gtp_batch``;
+        the per-weight whole matrices are ``[batch, gtp_remat_size * rows, cols]``.
         """
+        gtp_remat_size = get_pg_size(key.gtp_remat_group)
+        gathered = (
+            gathered.view(gtp_remat_size, len(items), key.rows, key.cols)
+            .transpose(0, 1)
+            .reshape(len(items), gtp_remat_size * key.rows, key.cols)
+        )
         x = gathered[:, : -key.pad_length] if key.pad_length else gathered
         ns_kwargs = {"use_syrk": True} if self.use_syrk else {}
         with eo_utils.fp32_matmul_precision(self.fp32_matmul_prec):
@@ -696,7 +710,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         compute_stream = torch.cuda.current_stream() if batches[0][1][0][0].is_cuda else None
         pending = self._launch_gtp_batch(*batches[0], compute_stream)
         for i, (key, items) in enumerate(batches):
-            inputs, gathered, done = pending
+            stacked, gathered, done = pending
             pending = (
                 self._launch_gtp_batch(*batches[i + 1], compute_stream)
                 if i + 1 < len(batches)
@@ -709,10 +723,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 self.gtp_batch_counts[0] + 1,
                 self.gtp_batch_counts[1] + len(items),
             )
-            # ``inputs`` were read by the side stream, ``gathered`` written by it; both were
+            # ``stacked`` was read by the side stream, ``gathered`` written by it; both were
             # allocated on the compute stream, which has now waited for those reads/writes,
             # so dropping them here cannot hand their memory to an earlier side-stream user.
-            del inputs, gathered
+            del stacked, gathered
 
     def _resolve_tp_mode(self, m: int, n: int, group_size: int) -> str:
         """Cached per-shape mode for tp_mode="auto", dense (GTP) weights only.

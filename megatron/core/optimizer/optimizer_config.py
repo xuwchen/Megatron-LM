@@ -332,8 +332,9 @@ class OptimizerConfig:
     muon_ns_batch_max_mb: int = 2048
     """Upper bound, in MiB, on the gathered fp32 momentum one batched Newton-Schulz of the
     duplicated-GTP path stacks (muon_ns_batch_size matrices at most). It caps the transient
-    memory of the batch: the stack itself, its one-batch-ahead gather buffer, the result,
-    and the bf16 Newton-Schulz working set. Only used when muon_ns_batch_size > 1 under
+    memory of the batch: the stacked shards, the one-batch-ahead (rank-major) gather buffer
+    and its per-weight reordering, the result, and the bf16 Newton-Schulz working set. Only
+    used when muon_ns_batch_size > 1 under
     muon_tp_mode='duplicated'. Defaults to 2048."""
 
     muon_concurrent_groups: bool = True

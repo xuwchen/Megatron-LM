@@ -245,6 +245,9 @@ def test_moe_duplicated_batched_ns_matches_per_param_end_to_end():
             "tensor_parallel_num_weight_shards": 4,
             "expert_tensor_parallel_size": 1,
             "expert_tensor_parallel_num_weight_shards": 4,
+            # TP1 on 4 ranks => DP4 (GTP_remat shards over the DP group), so the global batch
+            # must hold one micro-batch per DP rank.
+            "global_batch_size": 4,
         }
         loss_per_param = harness._run_test_helper(
             tp_size=1,

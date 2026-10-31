@@ -366,7 +366,9 @@ def _fake_two_rank_gtp(monkeypatch, gtp_rank):
     def fake_all_gather(shards, local, _group):
         gathers.append(tuple(local.shape))
         shards[gtp_rank].copy_(local)
-        shards[1 - gtp_rank].copy_(torch.roll(local, 1, dims=1) * 0.5)
+        # Roll along the last dim so a stacked [batch, rows, cols] gather derives the same
+        # peer shard as the per-weight [rows, cols] one.
+        shards[1 - gtp_rank].copy_(torch.roll(local, 1, dims=-1) * 0.5)
 
     monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
     return pg_collection, gathers
@@ -433,7 +435,14 @@ def test_muon_batched_duplicated_gtp_step_matches_per_param_step(monkeypatch, gt
         gathers.clear()
         ns_calls.clear()
         batched.step()
-        assert sorted(gathers) == sorted(ref_gathers)  # one gather per GTP weight, same shapes
+        # The per-parameter path gathers each GTP weight on its own; the batched path stacks
+        # a batch into one [batch, rows, cols] gather. Same weights, same shapes, fewer calls.
+        assert all(len(shape) == 2 for shape in ref_gathers)
+        assert all(len(shape) == 3 for shape in gathers)
+        assert sorted(shape[1:] for shape in gathers for _ in range(shape[0])) == sorted(
+            ref_gathers
+        )
+        assert len(gathers) == 3  # [3, 6, 5], [2, 6, 5] and [1, 4, 7]
         for p_ref, p_batched in zip(ref_params, batched_params):
             p_batched.grad = p_ref.grad = torch.randn_like(p_ref) * 0.1
 
@@ -740,18 +749,16 @@ def _dispatch_cfg(layer_sharded: bool) -> OptimizerConfig:
 
 
 def test_shared_muon_kwargs_ignore_layer_sharding_flag():
-    """The shared builder must stay pure even with the lsh flag set."""
+    """The shared builder must stay pure even with the lsh flag set.
+
+    ``ns_batch_size`` / ``ns_batch_max_mb`` are deliberately absent from the list: since the
+    batched duplicated-GTP step they are ``TensorParallelMuon`` kwargs shared by every mode."""
     kwargs = eo_mod._muon_config_to_kwargs(
         _dispatch_cfg(True), [_DispatchChunk()], pg_collection=None
     )
-    for lsh_only in (
-        "gtp_remat_group",
-        "tp_group",
-        "ns_batch_size",
-        "concurrent_groups",
-        "exchange_chunk_mb",
-    ):
+    for lsh_only in ("gtp_remat_group", "tp_group", "concurrent_groups", "exchange_chunk_mb"):
         assert lsh_only not in kwargs, f"LayerShardedMuon-only kwarg leaked: {lsh_only}"
+    assert kwargs["ns_batch_size"] == 1 and kwargs["ns_batch_max_mb"] == 2048
     assert "is_qkv_fn" in kwargs
     assert "qkv_split_shapes" in kwargs
     assert "pg_collection" in kwargs
