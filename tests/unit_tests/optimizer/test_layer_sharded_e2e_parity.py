@@ -229,7 +229,7 @@ def test_moe_duplicated_batched_ns_matches_per_param_end_to_end():
     """GPT-MoE on a TP1 x GTP4 / ETP1 x EGTP4 grid (the Kimi-K3 expert layout: GTP is the
     only sharding axis, so the gathered matrix needs no TP collective), duplicated mode:
     --muon-ns-batch-size 4 (same-shape GTP-sharded weights stacked into one batched
-    Newton-Schulz, gathers one batch ahead on a side stream) tracks the per-parameter step
+    Newton-Schulz, one all-gather per batch) tracks the per-parameter step
     (--muon-ns-batch-size 1) to baddbmm-vs-addmm rounding, and the batched path actually
     ran."""
     if Utils.world_size != 4:

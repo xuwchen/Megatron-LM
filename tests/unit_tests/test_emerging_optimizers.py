@@ -389,7 +389,7 @@ def _gtp_param(rows, cols, seed, pad_length=0, gtp=True):
 @pytest.mark.parametrize("nesterov", [True, False])
 def test_muon_batched_duplicated_gtp_step_matches_per_param_step(monkeypatch, gtp_rank, nesterov):
     """ns_batch_size > 1 stacks same-shape duplicated-GTP weights into one batched
-    Newton-Schulz with one-batch-ahead gathers; the update must equal the per-parameter path
+    Newton-Schulz with one all-gather per batch; the update must equal the per-parameter path
     (same gathers, same padding handling, same scale), and weights that are not eligible
     (no GTP sharding, other shape) must still be updated through the plain path."""
     pg_collection, gathers = _fake_two_rank_gtp(monkeypatch, gtp_rank)

@@ -321,9 +321,9 @@ class OptimizerConfig:
     to a single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
     transient stack of this many matrices for far fewer launches. Under
     muon_tp_mode='duplicated' with GTP, same-shape GTP-sharded weights whose gathered matrix
-    carries no TP sharding are likewise stacked: their GTP all-gathers move to a side stream
-    one batch ahead of the Newton-Schulz that consumes them, and the per-matrix
-    Newton-Schulz becomes one batched call (bounded by muon_ns_batch_max_mb). The value is
+    carries no TP sharding are likewise stacked: the batch's GTP shards are all-gathered
+    with one collective instead of one per weight, and the per-matrix Newton-Schulz becomes
+    one batched call (bounded by muon_ns_batch_max_mb). The value is
     an upper bound per same-shape bucket, so oversizing it is harmless. Batches of more than
     one use baddbmm instead of addmm and differ from the per-matrix path by kernel-level
     rounding, so bitwise parity with the unbatched step is lost; the default of 1 keeps the
@@ -332,8 +332,8 @@ class OptimizerConfig:
     muon_ns_batch_max_mb: int = 2048
     """Upper bound, in MiB, on the gathered fp32 momentum one batched Newton-Schulz of the
     duplicated-GTP path stacks (muon_ns_batch_size matrices at most). It caps the transient
-    memory of the batch: the stacked shards, the one-batch-ahead (rank-major) gather buffer
-    and its per-weight reordering, the result, and the bf16 Newton-Schulz working set. Only
+    memory of the batch: the stacked shards, the (rank-major) gather buffer and its
+    per-weight reordering, the result, and the bf16 Newton-Schulz working set. Only
     used when muon_ns_batch_size > 1 under
     muon_tp_mode='duplicated'. Defaults to 2048."""
 
