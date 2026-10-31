@@ -197,3 +197,89 @@ def test_moe_layer_sharded_matches_duplicated_end_to_end():
 def test_moe_layer_sharded_chunked_matches_duplicated_end_to_end():
     """GPT-MoE with the routed exchange split into 1 MiB rounds == duplicated, bitwise."""
     _run_pair({**_MOE, "muon_exchange_chunk_mb": 1}, "moe_chunked")
+
+
+class _DuplicatedHarness(_Harness):
+    """Records the TensorParallelMuon instances so the batched-step counters can be read."""
+
+    def _on_model_built(self, model_chunks, optimizer, args):
+        from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+
+        found = []
+
+        def visit(opt):
+            if isinstance(opt, TensorParallelMuon):
+                found.append(opt)
+                return
+            children = getattr(opt, 'chained_optimizers', None)
+            if children:
+                for child in children:
+                    visit(child)
+                return
+            inner = vars(opt).get('optimizer')
+            if inner is not None and inner is not opt:
+                visit(inner)
+
+        visit(optimizer)
+        self.muon_optimizers = found
+
+
+@pytest.mark.launch_on_gb200
+def test_moe_duplicated_batched_ns_matches_per_param_end_to_end():
+    """GPT-MoE on a TP1 x GTP4 / ETP1 x EGTP4 grid (the Kimi-K3 expert layout: GTP is the
+    only sharding axis, so the gathered matrix needs no TP collective), duplicated mode:
+    --muon-ns-batch-size 4 (same-shape GTP-sharded weights stacked into one batched
+    Newton-Schulz, gathers one batch ahead on a side stream) tracks the per-parameter step
+    (--muon-ns-batch-size 1) to baddbmm-vs-addmm rounding, and the batched path actually
+    ran."""
+    if Utils.world_size != 4:
+        pytest.skip("Requires exactly 4 torchrun ranks for TP1 x GTP4")
+    harness = _DuplicatedHarness()
+    harness.setup_method(None)
+    harness.seq_length = 64
+    harness.micro_batch_size = 1
+    try:
+        common = {
+            **_COMMON,
+            **_MOE,
+            "tensor_parallel_num_weight_shards": 4,
+            "expert_tensor_parallel_size": 1,
+            "expert_tensor_parallel_num_weight_shards": 4,
+        }
+        loss_per_param = harness._run_test_helper(
+            tp_size=1,
+            recipe=_RECIPE,
+            fp8_param_gather=False,
+            muon_tp_mode="duplicated",
+            muon_ns_batch_size=1,
+            **common,
+        )
+        assert all(opt.gtp_batch_counts == (0, 0) for opt in harness.muon_optimizers)
+        loss_batched = harness._run_test_helper(
+            tp_size=1,
+            recipe=_RECIPE,
+            fp8_param_gather=False,
+            muon_tp_mode="duplicated",
+            muon_ns_batch_size=4,
+            **common,
+        )
+        batches, matrices = map(
+            sum, zip(*(opt.gtp_batch_counts for opt in harness.muon_optimizers))
+        )
+        assert batches > 0 and matrices > batches, (
+            "the batched duplicated-GTP step never stacked more than one matrix: "
+            f"batches={batches}, matrices={matrices}"
+        )
+        assert loss_per_param.shape == loss_batched.shape == (common["num_steps"],)
+        assert bool(torch.isfinite(loss_batched).all())
+        torch.testing.assert_close(loss_batched, loss_per_param, rtol=1e-2, atol=1e-2)
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[moe_batched_ns] {batches} batches / {matrices} matrices; "
+                f"max |loss diff| = {(loss_batched - loss_per_param).abs().max().item():.3e}"
+            )
+    finally:
+        harness.teardown_method(None)
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
+
+        update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)

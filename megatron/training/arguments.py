@@ -3662,10 +3662,22 @@ def _add_regularization_args(parser):
         type=int,
         default=1,
         help='Max number of same-shape matrices fused into one batched '
-        'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
-        'The default of 1 keeps the bit-exact per-matrix path; raise '
-        '(e.g. to 32) to cut kernel launches on MoE expert homes at '
-        'the cost of bitwise parity (baddbmm vs addmm rounding).',
+        'Newton-Schulz: on an NS home under --muon-tp-mode layer_sharded, '
+        'or, under --muon-tp-mode duplicated with GTP, across GTP-sharded '
+        'weights whose gathered matrix has no TP sharding (their all-gathers '
+        'then run on a side stream one batch ahead). The default of 1 keeps '
+        'the bit-exact per-matrix path; raise (e.g. to 32) to cut kernel '
+        'launches on MoE expert weights at the cost of bitwise parity '
+        '(baddbmm vs addmm rounding). See OptimizerConfig.muon_ns_batch_size.',
+    )
+    group.add_argument(
+        '--muon-ns-batch-max-mb',
+        type=int,
+        default=2048,
+        help='Under --muon-tp-mode duplicated with --muon-ns-batch-size > 1, '
+        'cap in MiB on the gathered fp32 momentum one batched Newton-Schulz '
+        'stacks; bounds the transient memory of a batch (stack, one-batch-ahead '
+        'gather buffer, result, bf16 working set). Default 2048.',
     )
     group.add_argument(
         '--muon-use-syrk',

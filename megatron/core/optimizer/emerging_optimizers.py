@@ -11,7 +11,7 @@ To add a new emerging optimizer:
 import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Literal, Optional, get_args
+from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -29,12 +29,17 @@ from .optimizer_config import ParamKey, ParamPredicate
 
 try:
     from emerging_optimizers import registry
+    from emerging_optimizers import utils as eo_utils
     from emerging_optimizers.orthogonalized_optimizers import (
         AdaptiveMuon,
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz_tp
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+        NSCoeffT,
+        newton_schulz,
+        newton_schulz_tp,
+    )
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
@@ -344,6 +349,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        ns_batch_size: int = 1,
+        ns_batch_max_mb: int = 2048,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -355,6 +362,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             )
         if split_qkv_per_head and not split_qkv:
             raise ValueError("split_qkv_per_head requires split_qkv=True")
+        if ns_batch_size > 1:
+            # Same floor as LayerShardedMuon: batched (3-D) newton_schulz and, with SYRK, the
+            # batched SYRK kernel. Imported lazily; layer_sharded_muon imports this module.
+            from megatron.core.optimizer.layer_sharded_muon import _validate_ns_config
+
+            _validate_ns_config(use_syrk, ns_batch_size)
+        elif ns_batch_size < 1:
+            raise ValueError(f"ns_batch_size must be at least 1, got {ns_batch_size}")
+        if ns_batch_max_mb < 1:
+            raise ValueError(f"ns_batch_max_mb must be at least 1, got {ns_batch_max_mb}")
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -414,6 +431,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.num_ns_steps = num_ns_steps
         self.use_syrk = use_syrk
         self.elem_size = 2 if fp32_matmul_prec == "medium" else 4  # bf16 vs tf32/fp32
+        # For the batched duplicated-GTP step (see step / _step_gtp_batches).
+        self.coefficient_type = coefficient_type
+        self.scale_mode = scale_mode
+        self.extra_scale_factor = extra_scale_factor
+        self.fp32_matmul_prec = fp32_matmul_prec
+        self.ns_batch_size = ns_batch_size
+        self.ns_batch_max_bytes = ns_batch_max_mb << 20
+        self._gather_stream: Optional[torch.cuda.Stream] = None
+        # Batched duplicated-GTP steps taken so far: (batches, matrices). Tests and probes
+        # read it to confirm the batched path ran at all.
+        self.gtp_batch_counts = (0, 0)
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
         self._warned_qkv_split_disabled = False
@@ -468,6 +496,223 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
     def _restore_pad(t, pad_length):
         """Re-append ``pad_length`` zero rows to dim 0 (no-op if ``pad_length == 0``)."""
         return torch.nn.functional.pad(t, (0, 0, 0, pad_length)) if pad_length else t
+
+    # ------------------------------------------------------------------------------------------
+    # Batched duplicated-GTP step.
+    #
+    # In duplicated mode every GTP-sharded 2-D weight costs one all-gather plus one whole-matrix
+    # Newton-Schulz, serialized on the compute stream by the per-parameter loop of
+    # OrthogonalizedOptimizer.step. A MoE model has thousands of identically shaped expert
+    # weights per rank, so that loop is bound by kernel launches (tens of thousands of small
+    # GEMMs) and by all-gathers that nothing overlaps. With ``ns_batch_size > 1`` the step
+    # below groups same-shape eligible weights, all-gathers each group on a side stream one
+    # batch ahead of the Newton-Schulz that consumes it, and runs one batched (3-D)
+    # Newton-Schulz per group. Weights that need anything else (TP sharding, split-QKV,
+    # blockwise/distributed GTP, no GTP) keep the per-parameter path unchanged.
+    # ------------------------------------------------------------------------------------------
+
+    class _GtpBatchKey(NamedTuple):
+        """Weights that share a key can be stacked into one batched Newton-Schulz."""
+
+        gtp_remat_group: Any
+        rows: int  # local (sharded) rows
+        cols: int
+        pad_length: int
+        dtype: torch.dtype
+
+    def _gtp_batch_key(self, p: torch.Tensor) -> Optional["TensorParallelMuon._GtpBatchKey"]:
+        """The batch key of ``p``, or None when ``p`` must take the per-parameter path.
+
+        Eligible: a 2-D GTP-sharded weight whose resolved mode is ``duplicated`` and whose
+        gathered matrix carries no further TP sharding, so the whole-matrix Newton-Schulz
+        needs no collective of its own and only the GTP all-gather and the reshard remain.
+        Mirrors the branch structure of ``orthogonalize`` /
+        ``scaled_orthogonalize_fn_with_gtp_remat``; the two must stay in sync.
+        """
+        if p.dim() != 2 or self.pg_collection is None:
+            return None
+        if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
+            return None
+        is_expert = getattr(p, 'expert_tp', False)
+        gtp_remat_group = resolve_gtp_remat_group(self.pg_collection, is_expert)
+        if (
+            gtp_remat_group is None
+            or get_pg_size(gtp_remat_group) <= 1
+            or not getattr(p, 'is_gtp_weight_remat', False)
+        ):
+            return None
+        mode = self.tp_mode
+        if mode == "auto":
+            gtp_remat_size = get_pg_size(gtp_remat_group)
+            mode = (
+                self._resolve_tp_mode(p.shape[0] * gtp_remat_size, p.shape[1], gtp_remat_size)
+                if not is_expert
+                else "duplicated"
+            )
+        if mode != "duplicated":
+            return None
+        tp_group = self.pg_collection.expt_tp if is_expert else self.pg_collection.tp
+        partition_dim = getattr(p, "partition_dim", None)
+        if partition_dim is not None and partition_dim != -1:
+            if tp_group is not None and get_pg_size(tp_group) > 1:
+                return None  # TP-sharded after the GTP gather: newton_schulz_tp owns it
+        return self._GtpBatchKey(
+            gtp_remat_group, p.shape[0], p.shape[1], getattr(p, 'pad_length', 0), p.dtype
+        )
+
+    def _momentum_input(self, p: torch.Tensor, group: dict) -> torch.Tensor:
+        """Weight decay + momentum update of ``p``; returns the tensor Newton-Schulz consumes.
+
+        Same statements, same order as OrthogonalizedOptimizer.step.
+        """
+        grad = p.grad
+        state = self.state[p]
+        self._apply_weight_decay_inplace(p, grad, group["lr"], group["weight_decay"])
+        state["momentum_buffer"].lerp_(grad, 1 - group["momentum"])
+        if self.nesterov:
+            return grad.lerp(state["momentum_buffer"], group["momentum"])
+        return state["momentum_buffer"]
+
+    def _step_param(self, p: torch.Tensor, group: dict) -> None:
+        """The per-parameter body of OrthogonalizedOptimizer.step for one weight."""
+        grad = self._momentum_input(p, group)
+        with eo_utils.fp32_matmul_precision(self.fp32_matmul_prec):
+            group_kwargs = {k: v for k, v in group.items() if k != "params"}
+            orth_grad = self.orthogonalize(p, grad, **group_kwargs)
+        self.pre_weight_update_fn_inplace(p, orth_grad)
+        p.add_(orth_grad, alpha=-group["lr"])
+        self.post_weight_update_fn_inplace(p)
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """One optimizer step; batches same-shape duplicated-GTP weights when enabled."""
+        if self.ns_batch_size <= 1:
+            return OrthogonalizedOptimizer.step(self, closure)
+        if closure is not None:
+            raise ValueError("closure is not supported")
+
+        plain: List[tuple[torch.Tensor, dict]] = []
+        buckets: Dict[TensorParallelMuon._GtpBatchKey, List[tuple[torch.Tensor, dict]]] = {}
+        for group in self.param_groups:
+            self._init_group(group)
+            for p in group["params"]:
+                if p.grad is None:
+                    continue  # pragma: no cover
+                key = self._gtp_batch_key(p)
+                if key is None:
+                    plain.append((p, group))
+                else:
+                    buckets.setdefault(key, []).append((p, group))
+
+        # The per-parameter weights first: their work overlaps the first batch's gathers.
+        for p, group in plain:
+            self._step_param(p, group)
+
+        batches: List[tuple[TensorParallelMuon._GtpBatchKey, List[tuple[torch.Tensor, dict]]]] = []
+        for key, items in buckets.items():
+            gathered_bytes = (
+                get_pg_size(key.gtp_remat_group) * key.rows * key.cols * key.dtype.itemsize
+            )
+            batch_size = max(1, min(self.ns_batch_size, self.ns_batch_max_bytes // gathered_bytes))
+            for start in range(0, len(items), batch_size):
+                batches.append((key, items[start : start + batch_size]))
+        self._step_gtp_batches(batches)
+        return None
+
+    def _all_gather_into(self, out: torch.Tensor, t: torch.Tensor, group) -> None:
+        """All-gather ``t`` over ``group`` along dim 0 into the preallocated ``out``."""
+        try:
+            backend = torch.distributed.get_backend(group)
+        except Exception:  # not a real process group (tests fake the collective)
+            backend = None
+        if backend != torch.distributed.Backend.NCCL:
+            # all_gather_into_tensor is NCCL-only; gloo (CPU tests) keeps the list form. The
+            # row chunks of a contiguous ``out`` are contiguous, so no copy follows.
+            torch.distributed.all_gather(
+                list(out.chunk(get_pg_size(group), dim=0)), t.contiguous(), group
+            )
+            return
+        torch.distributed.all_gather_into_tensor(out, t.contiguous(), group)
+
+    def _launch_gtp_batch(self, key, items, compute_stream):
+        """Momentum update of a batch on the compute stream, then its gathers on the side stream.
+
+        Returns ``(inputs, gathered, done)``: the momentum tensors (kept alive until the
+        gathers finished), the ``[batch, gtp_remat_size * rows, cols]`` gathered buffer, and
+        the event the consumer waits on (None without CUDA).
+        """
+        inputs = [self._momentum_input(p, group) for p, group in items]
+        gtp_remat_size = get_pg_size(key.gtp_remat_group)
+        gathered = torch.empty(
+            (len(items), gtp_remat_size * key.rows, key.cols),
+            dtype=key.dtype,
+            device=inputs[0].device,
+        )
+        if compute_stream is None:
+            for i, t in enumerate(inputs):
+                self._all_gather_into(gathered[i], t, key.gtp_remat_group)
+            return inputs, gathered, None
+        if self._gather_stream is None:
+            self._gather_stream = torch.cuda.Stream()
+        ready = torch.cuda.Event()
+        ready.record(compute_stream)
+        with torch.cuda.stream(self._gather_stream):
+            self._gather_stream.wait_event(ready)
+            for i, t in enumerate(inputs):
+                self._all_gather_into(gathered[i], t, key.gtp_remat_group)
+            done = torch.cuda.Event()
+            done.record(self._gather_stream)
+        return inputs, gathered, done
+
+    def _apply_gtp_batch(self, key, items, gathered: torch.Tensor) -> None:
+        """Batched whole-matrix Newton-Schulz on ``gathered``; reshard and apply the updates.
+
+        Same operations as the duplicated branch of ``scaled_orthogonalize_fn_with_gtp_remat``
+        plus ``scaled_orthogonalize_fn`` with ``partition_dim=None``, applied to a
+        ``[batch, rows, cols]`` stack instead of one matrix at a time.
+        """
+        x = gathered[:, : -key.pad_length] if key.pad_length else gathered
+        ns_kwargs = {"use_syrk": True} if self.use_syrk else {}
+        with eo_utils.fp32_matmul_precision(self.fp32_matmul_prec):
+            orth = newton_schulz(
+                x, steps=self.num_ns_steps, coefficient_type=self.coefficient_type, **ns_kwargs
+            )
+        orth.mul_(get_muon_scale_factor(orth.size(-2), orth.size(-1), mode=self.scale_mode))
+        if self.extra_scale_factor != 1.0:
+            orth.mul_(self.extra_scale_factor)
+        if key.pad_length:
+            orth = torch.nn.functional.pad(orth, (0, 0, 0, key.pad_length))
+        start = get_pg_rank(key.gtp_remat_group) * key.rows
+        for (p, group), full in zip(items, orth.unbind(0)):
+            update = full[start : start + key.rows].contiguous()
+            self.pre_weight_update_fn_inplace(p, update)
+            p.add_(update, alpha=-group["lr"])
+            self.post_weight_update_fn_inplace(p)
+
+    def _step_gtp_batches(self, batches) -> None:
+        """Run the batches: gathers of batch i+1 on the side stream under Newton-Schulz of i."""
+        if not batches:
+            return
+        compute_stream = torch.cuda.current_stream() if batches[0][1][0][0].is_cuda else None
+        pending = self._launch_gtp_batch(*batches[0], compute_stream)
+        for i, (key, items) in enumerate(batches):
+            inputs, gathered, done = pending
+            pending = (
+                self._launch_gtp_batch(*batches[i + 1], compute_stream)
+                if i + 1 < len(batches)
+                else None
+            )
+            if done is not None:
+                compute_stream.wait_event(done)
+            self._apply_gtp_batch(key, items, gathered)
+            self.gtp_batch_counts = (
+                self.gtp_batch_counts[0] + 1,
+                self.gtp_batch_counts[1] + len(items),
+            )
+            # ``inputs`` were read by the side stream, ``gathered`` written by it; both were
+            # allocated on the compute stream, which has now waited for those reads/writes,
+            # so dropping them here cannot hand their memory to an earlier side-stream user.
+            del inputs, gathered
 
     def _resolve_tp_mode(self, m: int, n: int, group_size: int) -> str:
         """Cached per-shape mode for tp_mode="auto", dense (GTP) weights only.
@@ -1022,10 +1267,14 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        ns_batch_size: int = 1,
+        ns_batch_max_mb: int = 2048,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
     ) -> None:
+        # ns_batch_size / ns_batch_max_mb are accepted so the shared ``muon_*`` config mapping
+        # can pass them, but AdaptiveMuon.step owns this class's step, so they are inert here.
         TensorParallelMuon.__init__(
             self,
             params,
@@ -1046,6 +1295,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
             use_syrk=use_syrk,
+            ns_batch_size=ns_batch_size,
+            ns_batch_max_mb=ns_batch_max_mb,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
