@@ -28,6 +28,7 @@ from megatron.core.optimizer.layer_sharded_a2a import (
     route_from_ns_home,
     route_to_ns_home,
 )
+from megatron.core.optimizer.param_layout import newton_schulz_cost
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import (
     get_emerging_optimizers_version,
@@ -250,8 +251,7 @@ class ParamShardSpec:
         weight NS-home balancing uses; non-2-D shapes count their elements."""
         if len(self.full_shape) != 2:
             return math.prod(self.full_shape)
-        m, n = self.full_shape
-        return m * n * min(m, n)
+        return newton_schulz_cost(*self.full_shape)
 
 
 @dataclasses.dataclass
