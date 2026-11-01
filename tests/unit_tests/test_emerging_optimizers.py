@@ -390,11 +390,16 @@ def _gtp_param(rows, cols, seed, pad_length=0, gtp=True):
 
 @pytest.mark.parametrize("gtp_rank", [0, 1])
 @pytest.mark.parametrize("nesterov", [True, False])
-def test_muon_batched_duplicated_gtp_step_matches_per_param_step(monkeypatch, gtp_rank, nesterov):
+@pytest.mark.parametrize("gather_ahead", [0, 1, 2])
+def test_muon_batched_duplicated_gtp_step_matches_per_param_step(
+    monkeypatch, gtp_rank, nesterov, gather_ahead
+):
     """ns_batch_size > 1 stacks same-shape duplicated-GTP weights into one batched
     Newton-Schulz with one all-gather per batch; the update must equal the per-parameter path
     (same gathers, same padding handling, same scale), and weights that are not eligible
-    (no GTP sharding, other shape) must still be updated through the plain path."""
+    (no GTP sharding, other shape) must still be updated through the plain path.
+    ``ns_gather_ahead`` only moves the gathers to a side stream ahead of their consumer (on
+    CUDA; a no-op on CPU): same collectives in the same order, same result."""
     pg_collection, gathers = _fake_two_rank_gtp(monkeypatch, gtp_rank)
 
     def make_params():
@@ -418,7 +423,9 @@ def test_muon_batched_duplicated_gtp_step_matches_per_param_step(monkeypatch, gt
     ref_params = make_params()
     ref = TensorParallelMuon(ref_params, ns_batch_size=1, **kwargs)
     batched_params = make_params()
-    batched = TensorParallelMuon(batched_params, ns_batch_size=3, **kwargs)
+    batched = TensorParallelMuon(
+        batched_params, ns_batch_size=3, ns_gather_ahead=gather_ahead, **kwargs
+    )
 
     import megatron.core.optimizer.emerging_optimizers as eo_mod
 
@@ -520,6 +527,12 @@ def test_muon_batched_gtp_step_plan_hash_is_order_and_size_sensitive():
         [(6, 4, 0, "torch.float32", 1), (8, 4, 0, "torch.float32", 1)]
     )
     assert -(2**63) <= h(a) < 2**63
+
+
+def test_muon_ns_gather_ahead_rejects_negative_values():
+    p = _gtp_param(4, 4, seed=0)
+    with pytest.raises(ValueError, match="ns_gather_ahead"):
+        TensorParallelMuon([p], lr=0.1, ns_batch_size=2, ns_gather_ahead=-1)
 
 
 def test_muon_ns_batch_size_rejects_invalid_values():

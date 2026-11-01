@@ -346,6 +346,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         use_syrk: bool = False,
         ns_batch_size: int = 1,
         ns_batch_max_mb: int = 2048,
+        ns_gather_ahead: int = 0,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -367,6 +368,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             raise ValueError(f"ns_batch_size must be at least 1, got {ns_batch_size}")
         if ns_batch_max_mb < 1:
             raise ValueError(f"ns_batch_max_mb must be at least 1, got {ns_batch_max_mb}")
+        if ns_gather_ahead < 0:
+            raise ValueError(f"ns_gather_ahead must be non-negative, got {ns_gather_ahead}")
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -433,6 +436,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.fp32_matmul_prec = fp32_matmul_prec
         self.ns_batch_size = ns_batch_size
         self.ns_batch_max_bytes = ns_batch_max_mb << 20
+        # Batched duplicated-GTP gathers issued this many batches ahead of the Newton-Schulz
+        # that consumes them, on a side stream (0 = in order on the compute stream).
+        self.ns_gather_ahead = ns_gather_ahead
+        self._gather_stream: Optional[torch.cuda.Stream] = None
         # Batched duplicated-GTP steps taken so far: (batches, matrices). Tests and probes
         # read it to confirm the batched path ran at all.
         self.gtp_batch_counts = (0, 0)
@@ -503,10 +510,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
     # weights per rank, so that loop is bound by kernel launches (tens of thousands of small
     # GEMMs) and by one latency-bound all-gather per weight. With ``ns_batch_size > 1`` the
     # step below groups same-shape eligible weights, all-gathers each group with ONE
-    # collective, and runs one batched (3-D) Newton-Schulz per group, all in order on the
-    # compute stream. (Overlapping the gathers with the previous group's Newton-Schulz on a
-    # side stream, even a high-priority one, was measured to lose on GB300: the GEMMs occupy
-    # every SM and the NCCL kernel ran 4-12x longer than in order.)
+    # collective, and runs one batched (3-D) Newton-Schulz per group. With ``ns_gather_ahead``
+    # the gathers run on a side stream that many batches ahead of their Newton-Schulz, so
+    # they overlap the GEMMs of the batches before them; by default they run in order on the
+    # compute stream. (An earlier "side-stream gathers run 4-12x longer under the GEMMs"
+    # measurement was taken while the offload chunks split the expert weights differently on
+    # each rank, so the peers' gathers were mismatched and each one waited for the peer's next
+    # collective; it says nothing about the overlap itself.)
     # Weights that need anything else (TP sharding, split-QKV,
     # blockwise/distributed GTP, no GTP) keep the per-parameter path unchanged.
     # ------------------------------------------------------------------------------------------
@@ -728,13 +738,21 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             return
         torch.distributed.all_gather_into_tensor(out, t.contiguous(), group)
 
-    def _gather_gtp_batch(self, key, items):
+    def _gather_gtp_batch(self, key, items, compute_stream=None):
         """Momentum update of a batch, then ONE all-gather of the stacked shards.
 
         The batch's momentum shards are stacked into a single ``[batch, rows, cols]`` tensor
         and all-gathered with one collective, so a batch of 8 weights costs one NCCL kernel
-        instead of 8 latency-bound ones. Returns the rank-major
-        ``[gtp_remat_size * batch, rows, cols]`` result; ``_apply_gtp_batch`` reorders it.
+        instead of 8 latency-bound ones. Returns ``(stacked, gathered, done)``: the stacked
+        input, the rank-major ``[gtp_remat_size * batch, rows, cols]`` result that
+        ``_apply_gtp_batch`` reorders, and the event the consumer must wait on (None when the
+        gather ran in order on ``compute_stream``/CPU).
+
+        With ``compute_stream`` given the gather is issued on the side stream
+        ``self._gather_stream`` after an event recorded on the compute stream (so it sees the
+        momentum update), which lets it overlap the Newton-Schulz of the batches before it.
+        Every rank issues the same gathers in the same order on the same communicator, so the
+        stream placement cannot reorder collectives across ranks.
         """
         stacked = torch.stack([self._momentum_input(p, group) for p, group in items])
         gathered = torch.empty(
@@ -742,8 +760,22 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             dtype=key.dtype,
             device=stacked.device,
         )
-        self._all_gather_into(gathered, stacked, key.gtp_remat_group)
-        return gathered
+        if compute_stream is None:
+            self._all_gather_into(gathered, stacked, key.gtp_remat_group)
+            return stacked, gathered, None
+        if self._gather_stream is None:
+            # High priority so the NCCL kernel's CTAs are scheduled at the next GEMM wave
+            # boundary instead of queueing behind the whole Newton-Schulz of the previous
+            # batch; it does not preempt resident blocks.
+            self._gather_stream = torch.cuda.Stream(priority=-1)
+        ready = torch.cuda.Event()
+        ready.record(compute_stream)
+        with torch.cuda.stream(self._gather_stream):
+            self._gather_stream.wait_event(ready)
+            self._all_gather_into(gathered, stacked, key.gtp_remat_group)
+            done = torch.cuda.Event()
+            done.record(self._gather_stream)
+        return stacked, gathered, done
 
     def _apply_gtp_batch(self, key, items, gathered: torch.Tensor) -> None:
         """Batched whole-matrix Newton-Schulz on ``gathered``; reshard and apply the updates.
@@ -779,13 +811,44 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             self.post_weight_update_fn_inplace(p)
 
     def _step_gtp_batches(self, batches) -> None:
-        """Run the batches in order: one gather, one batched Newton-Schulz, the updates."""
-        for key, items in batches:
-            self._apply_gtp_batch(key, items, self._gather_gtp_batch(key, items))
+        """Run the batches: one gather, one batched Newton-Schulz, the updates, per batch.
+
+        With ``ns_gather_ahead > 0`` (and CUDA) the gather of batch ``i + ns_gather_ahead`` is
+        issued on the side stream before the Newton-Schulz of batch ``i`` runs, so up to that
+        many gathers are in flight under the GEMMs; the buffers of a batch stay referenced
+        until its Newton-Schulz consumed them. ``ns_gather_ahead == 0`` is the in-order path:
+        every gather on the compute stream right before its Newton-Schulz.
+        """
+        if not batches:
+            return
+        ahead = self.ns_gather_ahead
+        compute_stream = (
+            torch.cuda.current_stream() if ahead > 0 and batches[0][1][0][0].is_cuda else None
+        )
+        if compute_stream is None:
+            ahead = 0
+        # Gathers issued but not yet consumed, oldest first.
+        inflight: List[tuple] = []
+        for i in range(min(ahead, len(batches))):
+            inflight.append(self._gather_gtp_batch(*batches[i], compute_stream))
+        for i, (key, items) in enumerate(batches):
+            if ahead == 0:
+                stacked, gathered, done = self._gather_gtp_batch(key, items)
+            else:
+                stacked, gathered, done = inflight.pop(0)
+                if i + ahead < len(batches):
+                    inflight.append(self._gather_gtp_batch(*batches[i + ahead], compute_stream))
+                if done is not None:
+                    compute_stream.wait_event(done)
+            self._apply_gtp_batch(key, items, gathered)
             self.gtp_batch_counts = (
                 self.gtp_batch_counts[0] + 1,
                 self.gtp_batch_counts[1] + len(items),
             )
+            # ``stacked`` was read and ``gathered`` written by the side stream; both were
+            # allocated on the compute stream, which has now waited for that work, so freeing
+            # them here cannot hand their memory to an earlier side-stream user.
+            del stacked, gathered
 
     def _resolve_tp_mode(self, m: int, n: int, group_size: int) -> str:
         """Cached per-shape mode for tp_mode="auto", dense (GTP) weights only.
@@ -1342,6 +1405,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         use_syrk: bool = False,
         ns_batch_size: int = 1,
         ns_batch_max_mb: int = 2048,
+        ns_gather_ahead: int = 0,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -1370,6 +1434,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             use_syrk=use_syrk,
             ns_batch_size=ns_batch_size,
             ns_batch_max_mb=ns_batch_max_mb,
+            ns_gather_ahead=ns_gather_ahead,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor

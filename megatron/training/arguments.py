@@ -2952,6 +2952,16 @@ def _add_regularization_args(parser):
         'result, bf16 working set). Default 2048.',
     )
     group.add_argument(
+        '--muon-ns-gather-ahead',
+        type=int,
+        default=0,
+        help='Under --muon-tp-mode duplicated with --muon-ns-batch-size > 1, '
+        'issue each batch\'s all-gather this many batches ahead of its '
+        'Newton-Schulz on a side stream so the gathers overlap the GEMMs; '
+        'each batch in flight costs one more gather buffer. Default 0 '
+        '(gathers in order on the compute stream).',
+    )
+    group.add_argument(
         '--muon-use-syrk',
         action='store_true',
         help='Use the Triton SYRK kernel for the symmetric-output '
