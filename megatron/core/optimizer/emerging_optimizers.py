@@ -8,6 +8,7 @@ To add a new emerging optimizer:
   3. Add an ``EmergingOptimizerEntry`` to ``_EMERGING_OPTIMIZERS`` at the bottom.
 """
 
+import hashlib
 import inspect
 import logging
 from dataclasses import dataclass, field
@@ -441,6 +442,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         # Batched duplicated-GTP steps taken so far: (batches, matrices). Tests and probes
         # read it to confirm the batched path ran at all.
         self.gtp_batch_counts = (0, 0)
+        # Batch-plan hashes exchanged with the GTP remat peers but not yet verified
+        # (see _exchange_gtp_batch_plans / verify_gtp_batch_plans).
+        self._pending_gtp_plan_checks: List[tuple] = []
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
         self._warned_qkv_split_disabled = False
@@ -618,8 +622,82 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             batch_size = max(1, min(self.ns_batch_size, self.ns_batch_max_bytes // gathered_bytes))
             for start in range(0, len(items), batch_size):
                 batches.append((key, items[start : start + batch_size]))
+        self.verify_gtp_batch_plans(wait=False)
+        self._exchange_gtp_batch_plans(batches)
         self._step_gtp_batches(batches)
         return None
+
+    # ------------------------------------------------------------------------------------------
+    # Batch-plan guard.
+    #
+    # Every batch is one collective over the GTP remat group, so the peers must form the same
+    # batches in the same order. Nothing in NCCL enforces that: with mismatched sizes a ring
+    # all-gather neither errors nor hangs, it streams the next collective's bytes into the
+    # previous one, so each gather finishes one batch late and the gathered momentum is wrong
+    # without any symptom but a slow optimizer step. (The chunked optimizer-state offload hit
+    # exactly this: it stepped the optimizer per chunk and packed a different number of
+    # expert weights into a chunk on each data-parallel rank until it partitioned the chunks
+    # by expert_tp.) The guard below all-gathers an 8-byte hash of each call's batch plan per
+    # group, issued ahead of the batches on the same stream, and checks the hashes once the
+    # gather has completed, so a mismatch raises within a few calls instead of corrupting the
+    # update silently. Checks are deferred so the host keeps running ahead of the GPU.
+    # ------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _gtp_batch_plan_hash(plan: List[tuple]) -> int:
+        """A stable 63-bit hash of one group's ordered batch plan."""
+        digest = hashlib.blake2b(repr(plan).encode(), digest_size=8).digest()
+        return int.from_bytes(digest, "little", signed=True)
+
+    def _all_gather_plan_hash(self, gathered: torch.Tensor, local: torch.Tensor, group) -> None:
+        """All-gather the ``[1]`` int64 plan hash into ``gathered`` (``[group_size]``)."""
+        self._all_gather_into(gathered, local, group)
+
+    def _exchange_gtp_batch_plans(self, batches) -> None:
+        """Queue one small all-gather per GTP remat group carrying this call's plan hash."""
+        plans: Dict[Any, List[tuple]] = {}
+        for key, items in batches:
+            plans.setdefault(key.gtp_remat_group, []).append(
+                (key.rows, key.cols, key.pad_length, str(key.dtype), len(items))
+            )
+        if not plans:
+            return
+        device = batches[0][1][0][0].device
+        for group, plan in plans.items():
+            value = self._gtp_batch_plan_hash(plan)
+            local = torch.tensor([value], dtype=torch.int64, device=device)
+            gathered = torch.empty(get_pg_size(group), dtype=torch.int64, device=device)
+            self._all_gather_plan_hash(gathered, local, group)
+            event = None
+            if gathered.is_cuda:
+                event = torch.cuda.Event()
+                event.record()
+            self._pending_gtp_plan_checks.append((value, gathered, event, plan))
+
+    def verify_gtp_batch_plans(self, wait: bool = True) -> None:
+        """Check the exchanged batch-plan hashes against the local ones.
+
+        With ``wait=False`` only the exchanges whose gather has completed are checked (the
+        rest stay pending); ``wait=True`` synchronizes and checks them all. Raises
+        ``RuntimeError`` on the first mismatch: the ranks of a GTP remat group formed
+        different batches, so their batched gathers would not line up.
+        """
+        remaining = []
+        for value, gathered, event, plan in self._pending_gtp_plan_checks:
+            if not wait and event is not None and not event.query():
+                remaining.append((value, gathered, event, plan))
+                continue
+            peers = gathered.tolist()
+            if any(v != value for v in peers):
+                bad = [i for i, v in enumerate(peers) if v != value]
+                raise RuntimeError(
+                    "Batched Muon step: the GTP remat peers did not form the same batches. "
+                    f"Local plan of {len(plan)} batches (rows, cols, pad, dtype, size), first: "
+                    f"{plan[:3]}; group ranks with another plan: {bad}. Every rank of a GTP "
+                    "remat group must see the same eligible weights in the same order in each "
+                    "step() call (with chunked optimizer-state offload, every chunk)."
+                )
+        self._pending_gtp_plan_checks = remaining
 
     def _all_gather_into(self, out: torch.Tensor, t: torch.Tensor, group) -> None:
         """All-gather ``t`` over ``group`` along dim 0 into the preallocated ``out``."""

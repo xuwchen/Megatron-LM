@@ -371,6 +371,12 @@ def _fake_two_rank_gtp(monkeypatch, gtp_rank):
         shards[1 - gtp_rank].copy_(torch.roll(local, 1, dims=-1) * 0.5)
 
     monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+
+    # The batch-plan guard's hash exchange: the faked peer formed the same plan.
+    def fake_plan_hash(self, gathered, local, _group):
+        gathered.fill_(local.item())
+
+    monkeypatch.setattr(TensorParallelMuon, "_all_gather_plan_hash", fake_plan_hash)
     return pg_collection, gathers
 
 
@@ -480,6 +486,43 @@ def test_muon_batched_duplicated_gtp_step_respects_byte_cap(monkeypatch):
     optimizer.step()
     assert ns_shapes == [(1, 128, 64)] * 4
     assert optimizer.gtp_batch_counts == (4, 4)
+
+
+def test_muon_batched_gtp_step_detects_mismatched_batch_plans(monkeypatch):
+    """Every batch is one collective over the GTP remat group, so a peer that formed other
+    batches (e.g. a chunked offload that split the parameters differently on its rank) must
+    be reported: NCCL would otherwise misalign the gathers silently. The hash exchange is
+    checked lazily, so the mismatch surfaces on the next step() or on an explicit verify."""
+    pg_collection, _ = _fake_two_rank_gtp(monkeypatch, gtp_rank=0)
+
+    def peer_with_another_plan(self, gathered, local, _group):
+        gathered.fill_(local.item())
+        gathered[1] = local.item() ^ 1
+
+    monkeypatch.setattr(TensorParallelMuon, "_all_gather_plan_hash", peer_with_another_plan)
+    params = [_gtp_param(8, 4, seed=i) for i in range(4)]
+    optimizer = TensorParallelMuon(
+        params, num_ns_steps=1, pg_collection=pg_collection, ns_batch_size=2
+    )
+    optimizer.step()  # the exchange is queued; the batches still run
+    assert optimizer.gtp_batch_counts == (2, 4)
+    with pytest.raises(RuntimeError, match="did not form the same batches"):
+        optimizer.step()
+    # An explicit verification reports the same thing and clears nothing on failure.
+    with pytest.raises(RuntimeError, match="group ranks with another plan: \\[1\\]"):
+        optimizer.verify_gtp_batch_plans()
+
+
+def test_muon_batched_gtp_step_plan_hash_is_order_and_size_sensitive():
+    h = TensorParallelMuon._gtp_batch_plan_hash
+    a = [(8, 4, 0, "torch.float32", 2), (8, 4, 0, "torch.float32", 2)]
+    assert h(a) == h(list(a))
+    assert h(a) != h(a[:1])
+    assert h(a) != h([(8, 4, 0, "torch.float32", 1), (8, 4, 0, "torch.float32", 3)])
+    assert h([(8, 4, 0, "torch.float32", 1), (6, 4, 0, "torch.float32", 1)]) != h(
+        [(6, 4, 0, "torch.float32", 1), (8, 4, 0, "torch.float32", 1)]
+    )
+    assert -(2**63) <= h(a) < 2**63
 
 
 def test_muon_ns_batch_size_rejects_invalid_values():
