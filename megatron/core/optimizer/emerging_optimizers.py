@@ -665,14 +665,31 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         device = batches[0][1][0][0].device
         for group, plan in plans.items():
             value = self._gtp_batch_plan_hash(plan)
-            local = torch.tensor([value], dtype=torch.int64, device=device)
-            gathered = torch.empty(get_pg_size(group), dtype=torch.int64, device=device)
-            self._all_gather_plan_hash(gathered, local, group)
-            event = None
-            if gathered.is_cuda:
+            size = get_pg_size(group)
+            if device.type == "cuda":
+                # Stage through pinned host memory with non-blocking copies: a pageable
+                # ``torch.tensor(..., device=cuda)`` and a ``.tolist()`` each synchronize the
+                # current stream, and this runs once per step() call (per offload chunk), so
+                # either would stall the host behind the GPU at every chunk boundary.
+                local_host = torch.empty(1, dtype=torch.int64, pin_memory=True)
+                local_host[0] = value
+                local = local_host.to(device, non_blocking=True)
+                gathered = torch.empty(size, dtype=torch.int64, device=device)
+                self._all_gather_plan_hash(gathered, local, group)
+                peers = torch.empty(size, dtype=torch.int64, pin_memory=True)
+                peers.copy_(gathered, non_blocking=True)
                 event = torch.cuda.Event()
                 event.record()
-            self._pending_gtp_plan_checks.append((value, gathered, event, plan))
+                # ``local`` / ``gathered`` stay referenced until the event has completed so the
+                # caching allocators cannot hand their blocks to another stream's work.
+                self._pending_gtp_plan_checks.append(
+                    (value, peers, event, plan, (local_host, local, gathered))
+                )
+            else:
+                local = torch.tensor([value], dtype=torch.int64, device=device)
+                gathered = torch.empty(size, dtype=torch.int64, device=device)
+                self._all_gather_plan_hash(gathered, local, group)
+                self._pending_gtp_plan_checks.append((value, gathered, None, plan, ()))
 
     def verify_gtp_batch_plans(self, wait: bool = True) -> None:
         """Check the exchanged batch-plan hashes against the local ones.
@@ -683,10 +700,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         different batches, so their batched gathers would not line up.
         """
         remaining = []
-        for value, gathered, event, plan in self._pending_gtp_plan_checks:
-            if not wait and event is not None and not event.query():
-                remaining.append((value, gathered, event, plan))
-                continue
+        for value, gathered, event, plan, keepalive in self._pending_gtp_plan_checks:
+            if event is not None:
+                if wait:
+                    event.synchronize()
+                elif not event.query():
+                    remaining.append((value, gathered, event, plan, keepalive))
+                    continue
             peers = gathered.tolist()
             if any(v != value for v in peers):
                 bad = [i for i, v in enumerate(peers) if v != value]
