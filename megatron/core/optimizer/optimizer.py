@@ -146,6 +146,18 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
 
 
+def offload_chunk_partition_key(param: torch.Tensor) -> bool:
+    """Chunk partition of ``param`` for chunked optimizer-state offload: expert-TP or not.
+
+    Expert-tensor-parallel parameters are gathered by the batched duplicated-GTP Muon step
+    over the expert GTP remat group, whose ranks are different data-parallel ranks and so own
+    different dense parameters (the LayerWise optimizer shards dense parameters across data
+    parallelism). Keeping expert parameters in chunks of their own makes every rank of that
+    group pack them identically, so the batches, and the all-gathers they issue, match.
+    """
+    return bool(getattr(param, "expert_tp", False))
+
+
 class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
@@ -219,6 +231,7 @@ class MegatronOptimizer(ABC):
             optimizer_owned_master_dtypes=optimizer_owned_master_dtypes,
             d2h_stream=d2h_stream,
             h2d_stream=h2d_stream,
+            chunk_partition_key=offload_chunk_partition_key,
         )
 
     def set_optimizer_state_offload_deferred_lifecycle(

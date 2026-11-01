@@ -12,6 +12,14 @@ The pinned CPU buffers are carved out of large power-of-two blocks (``_PinnedHos
 rather than allocated one tensor at a time: PyTorch's caching host allocator rounds every
 pinned request up to the next power of two, so per-tensor allocation of an 84 MiB fp32 expert
 weight costs 128 MiB of host memory, about 1.5x the nominal state size across a MoE model.
+
+Chunk boundaries are part of the optimizer's collective schedule: the external optimizer runs
+once per chunk, so an optimizer that batches collectives across the parameters of one ``step()``
+call (the duplicated-GTP Muon batches, one all-gather per batch over the GTP remat group) issues
+a batch sequence that depends on where the chunks fall. Ranks that gather together must
+therefore see identical chunks for the parameters they gather together; ``chunk_partition_key``
+forces a boundary wherever the key changes so the packing of one partition never depends on the
+bytes of another (see ``ChunkedOptimizerStateOffloader``).
 """
 
 from __future__ import annotations
@@ -215,7 +223,19 @@ class ChunkedOptimizerStateOffloader:
         h2d_stream: Optional transfer stream shared by related optimizer wrappers.
         pinned_block_bytes: Size of the power-of-two pinned host blocks the CPU buffers are
             carved from (see ``_PinnedHostArena``). Default 1 GiB.
+        chunk_partition_key: Optional function of a parameter whose value changes exactly where
+            a chunk boundary must fall. Parameters with different keys never share a chunk, and
+            a partial ``offload_fraction`` selects whole runs of equal keys, so the chunks of one
+            partition depend only on that partition's own parameters. MCore keys expert-tensor-
+            parallel parameters apart from dense ones: the expert GTP remat group gathers batched
+            Muon momentum across ranks that own different dense parameters, and a chunk that
+            mixed the two would put a different number of expert weights in the first expert
+            batch on each of those ranks, so the ranks would issue all-gathers of different sizes
+            (silent corruption, or a hang when the sizes stop matching up by chance).
     """
+
+    # Class-level default so planners built without __init__ (tests) behave as unkeyed.
+    _chunk_partition_key: Callable[[torch.Tensor], object] | None = None
 
     def __init__(
         self,
@@ -228,6 +248,7 @@ class ChunkedOptimizerStateOffloader:
         d2h_stream: torch.cuda.Stream | None = None,
         h2d_stream: torch.cuda.Stream | None = None,
         pinned_block_bytes: int = 1 << 30,
+        chunk_partition_key: Callable[[torch.Tensor], object] | None = None,
     ) -> None:
         if chunk_size_bytes < 0:
             raise ValueError(f"chunk_size_bytes must be non-negative, got {chunk_size_bytes}")
@@ -242,6 +263,7 @@ class ChunkedOptimizerStateOffloader:
         self.offload_fraction = offload_fraction
         self.state_dtypes = tuple(state_dtypes)
         self._state_bytes_per_param = sum(dtype.itemsize for dtype in self.state_dtypes)
+        self._chunk_partition_key = chunk_partition_key
 
         self._params = self._unique_optimizer_params(optimizer.param_groups)
         # Parameter-group membership is fixed for the optimizer lifetime. Cache it once so each
@@ -355,12 +377,34 @@ class ChunkedOptimizerStateOffloader:
         candidates = sorted(self._params, key=lambda param: not self._param_has_master(param))
         selected = []
         selected_bytes = 0
-        for param in candidates:
-            if selected_bytes >= target_bytes:
+        for index, param in enumerate(candidates):
+            if selected_bytes >= target_bytes and not self._continues_partition_run(
+                candidates, index
+            ):
                 break
             selected.append(param)
             selected_bytes += self._estimated_bundle_bytes(param)
         return tuple(selected)
+
+    def _partition_key(self, param: torch.Tensor) -> object:
+        return None if self._chunk_partition_key is None else self._chunk_partition_key(param)
+
+    def _continues_partition_run(self, params: Sequence[torch.Tensor], index: int) -> bool:
+        """Whether ``params[index]`` has the same partition key as its predecessor.
+
+        A partial offload budget may only stop between two runs of equal keys: the resident
+        remainder of a run is stepped in one call, and its composition would otherwise depend
+        on how many bytes the other partitions contributed before the budget ran out.
+        """
+        if self._chunk_partition_key is None or index == 0:
+            return False
+        return self._partition_key(params[index]) == self._partition_key(params[index - 1])
+
+    def _starts_partition_run(self, params: Sequence[torch.Tensor], index: int) -> bool:
+        """Whether ``params[index]`` is the first parameter of a new run of equal keys."""
+        if self._chunk_partition_key is None or index == 0:
+            return False
+        return not self._continues_partition_run(params, index)
 
     def _estimated_state_bytes(self, param: torch.Tensor) -> int:
         return param.numel() * self._state_bytes_per_param
@@ -376,12 +420,15 @@ class ChunkedOptimizerStateOffloader:
         current_bytes = 0
         oversized_param_count = 0
         largest_oversized_param_bytes = 0
-        for param in params:
+        for index, param in enumerate(params):
             param_bytes = self._estimated_state_bytes(param)
             if param_bytes > self.chunk_size_bytes:
                 oversized_param_count += 1
                 largest_oversized_param_bytes = max(largest_oversized_param_bytes, param_bytes)
-            if current_params and current_bytes + param_bytes > self.chunk_size_bytes:
+            new_partition = self._starts_partition_run(params, index)
+            if current_params and (
+                new_partition or current_bytes + param_bytes > self.chunk_size_bytes
+            ):
                 chunks.append(OptimizerStateChunk(tuple(current_params)))
                 current_params = []
                 current_bytes = 0
