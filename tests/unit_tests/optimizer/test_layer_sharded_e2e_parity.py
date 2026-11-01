@@ -254,10 +254,29 @@ def test_moe_duplicated_batched_ns_matches_per_param_end_to_end():
         assert loss_per_param.shape == loss_batched.shape == (common["num_steps"],)
         assert bool(torch.isfinite(loss_batched).all())
         torch.testing.assert_close(loss_batched, loss_per_param, rtol=1e-2, atol=1e-2)
+        # Gathers one batch ahead on a side stream: same collectives, same math, so this
+        # must track the in-order batched run far tighter than the batched-vs-per-param bound.
+        loss_ahead = harness._run_test_helper(
+            tp_size=1,
+            recipe=_RECIPE,
+            fp8_param_gather=False,
+            muon_tp_mode="duplicated",
+            muon_ns_batch_size=4,
+            muon_ns_gather_ahead=1,
+            **common,
+        )
+        assert all(opt.ns_gather_ahead == 1 for opt in harness.muon_optimizers)
+        assert all(
+            opt._gather_stream is not None for opt in harness.muon_optimizers
+        ), "the side-stream gather path never ran"
+        assert bool(torch.isfinite(loss_ahead).all())
+        torch.testing.assert_close(loss_ahead, loss_batched, rtol=1e-4, atol=1e-4)
         if torch.distributed.get_rank() == 0:
             print(
                 f"[moe_batched_ns] {batches} batches / {matrices} matrices; "
-                f"max |loss diff| = {(loss_batched - loss_per_param).abs().max().item():.3e}"
+                f"max |loss diff| = {(loss_batched - loss_per_param).abs().max().item():.3e}; "
+                f"gather-ahead vs in-order max |loss diff| = "
+                f"{(loss_ahead - loss_batched).abs().max().item():.3e}"
             )
     finally:
         harness.teardown_method(None)

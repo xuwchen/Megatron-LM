@@ -338,6 +338,14 @@ class OptimizerConfig:
     used when muon_ns_batch_size > 1 under
     muon_tp_mode='duplicated'. Defaults to 2048."""
 
+    muon_ns_gather_ahead: int = 0
+    """Under muon_tp_mode='duplicated' with GTP and muon_ns_batch_size > 1: issue each batch's
+    all-gather this many batches ahead of the Newton-Schulz that consumes it, on a side
+    stream, so the gathers overlap the preceding batches' GEMMs; each batch in flight holds
+    one more gather buffer (bounded by muon_ns_batch_max_mb). 0 (default) gathers in order on
+    the compute stream. Same collectives in the same order on every rank, so the result is
+    unchanged; 1 is enough when a gather is shorter than a Newton-Schulz."""
+
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
     on its own CUDA stream so one group's compute fills another group's all_to_all stall.
