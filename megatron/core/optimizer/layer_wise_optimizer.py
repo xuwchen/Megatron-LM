@@ -1089,19 +1089,57 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     _SCALAR_COST_PER_ELEMENT = 4096
 
     @staticmethod
-    def _step_cost(param: torch.nn.Parameter) -> int:
+    def _step_cost(param: torch.nn.Parameter, optimizer=None) -> int:
         """Estimated per-step cost of owning ``param``, in Newton-Schulz units.
 
         A Muon matrix costs ``m * n * min(m, n)`` of its full (post GTP all-gather) shape, the
         dominant term of its orthogonalization; every other param (scalar optimizer, vectors,
         embeddings) costs ``numel * _SCALAR_COST_PER_ELEMENT``.
+
+        A fused QKV weight that ``optimizer`` splits (``split_qkv`` and the param is tagged
+        ``is_qkv``) is orthogonalized piecewise, so it costs the sum over its pieces: the
+        per-head pieces of ``qkv_split_shapes_global`` with ``split_qkv_per_head``, else one
+        piece per projection (the repeated per-group shapes summed up). Charging such a weight
+        as one whole matrix (e.g. a KDA in_proj of [36864, 7168] = 3 attention matrices) would
+        over-weight it ~5x and unbalance the assignment the other way.
         """
         if param.dim() == 2 and is_managed_by_layer_wise_optimizer(param):
             m, n = param.shape
             if getattr(param, 'is_gtp_weight_remat', False):
                 m *= getattr(param, 'gtp_remat_size', 1)
+            pieces = LayerWiseDistributedOptimizer._qkv_split_pieces(param, optimizer, m)
+            if pieces is not None:
+                return sum(r * n * min(r, n) for r in pieces)
             return m * n * min(m, n)
         return param.numel() * LayerWiseDistributedOptimizer._SCALAR_COST_PER_ELEMENT
+
+    @staticmethod
+    def _qkv_split_pieces(param, optimizer, full_rows: int):
+        """Row counts of the pieces ``optimizer`` orthogonalizes ``param`` in, or None."""
+        if optimizer is None or not getattr(optimizer, 'split_qkv', False):
+            return None
+        if not getattr(param, 'is_qkv', False):
+            return None
+        shapes = getattr(param, 'qkv_split_shapes_global', None) or getattr(
+            optimizer, 'qkv_split_shapes', None
+        )
+        if not shapes or any(s <= 0 for s in shapes) or sum(shapes) != full_rows:
+            return None
+        if getattr(optimizer, 'split_qkv_per_head', False):
+            return list(shapes)
+        # Projection mode: ``shapes`` is the per-group pattern repeated for every query group
+        # and each projection is orthogonalized across all groups at once.
+        period = next(
+            (
+                p
+                for p in range(1, len(shapes) + 1)
+                if len(shapes) % p == 0
+                and all(shapes[i] == shapes[i % p] for i in range(len(shapes)))
+            ),
+            len(shapes),
+        )
+        groups = len(shapes) // period
+        return [s * groups for s in shapes[:period]]
 
     def _shard_params_cost_balanced(self, optimizers, dp_cp_size, expt_dp_size, model_chunks=None):
         """Whole-param ownership without a layout: balance the estimated step cost per rank.
@@ -1123,14 +1161,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
         param_groups = []
+        group_optimizer = []  # the child optimizer owning each group (its split-QKV settings)
         for optimizer in optimizers:
             param_groups += optimizer.param_groups
+            group_optimizer += [optimizer] * len(optimizer.param_groups)
 
         identity = self._build_param_sort_keys(model_chunks)
         param_list = []
+        cost = {}
         for group_index, group in enumerate(param_groups):
             for p in group["params"]:
                 param_list.append((p, group_index))
+                cost[id(p)] = self._step_cost(p, group_optimizer[group_index])
         if identity is not None:
             missing = [p for (p, _) in param_list if p not in identity]
             assert not missing, (
@@ -1140,14 +1182,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 "allgather_params gather assumes every rank agrees on each param's single owner)."
             )
             param_list.sort(
-                key=lambda x: (
-                    -self._step_cost(x[0]),
-                    _param_sort_key(x[0].numel(), identity[x[0]]),
-                )
+                key=lambda x: (-cost[id(x[0])], _param_sort_key(x[0].numel(), identity[x[0]]))
             )
         else:
             # No layout info: cost order with insertion order for ties (legacy behaviour).
-            param_list.sort(key=lambda x: -self._step_cost(x[0]))
+            param_list.sort(key=lambda x: -cost[id(x[0])])
 
         axis_loads = {False: [0] * dp_cp_size, True: [0] * expt_dp_size}
         axis_lists = {False: self.dp_cp_params_list, True: self.expt_dp_params_list}
@@ -1157,7 +1196,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             is_expert = bool(param_groups[group_index].get("is_expert_parallel", False))
             loads = axis_loads[is_expert]
             owner = min(range(len(loads)), key=lambda r: (loads[r], r))
-            loads[owner] += self._step_cost(p)
+            loads[owner] += cost[id(p)]
             axis_lists[is_expert][owner].append(p)
             if owner == axis_rank[is_expert]:
                 owned_here.add(id(p))

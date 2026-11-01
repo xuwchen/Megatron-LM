@@ -31,8 +31,10 @@ def _scalar_param(*shape, **attrs):
 
 
 class _Opt:
-    def __init__(self, params, **group_flags):
+    def __init__(self, params, split_qkv=False, split_qkv_per_head=False, **group_flags):
         self.param_groups = [dict(params=list(params), **group_flags)]
+        self.split_qkv = split_qkv
+        self.split_qkv_per_head = split_qkv_per_head
 
 
 def _shard(monkeypatch, optimizers, dp_size, rank, expt_dp_size=1):
@@ -134,3 +136,48 @@ def test_expert_groups_balance_on_their_own_axis(monkeypatch):
     assert [len(owned) for owned in lwo.expt_dp_params_list] == [3, 3]
     expert_ids = {id(p) for p in experts}
     assert all(id(p) in expert_ids for owned in lwo.expt_dp_params_list for p in owned)
+
+
+def _qkv(rows, cols, shapes_global):
+    p = _matrix(rows, cols)
+    p.is_qkv = True
+    p.qkv_split_shapes_global = list(shapes_global)
+    return p
+
+
+def test_split_qkv_weights_cost_the_pieces_they_are_orthogonalized_in():
+    """A fused QKV weight the Muon child splits is several small Newton-Schulz runs, not one
+    whole-matrix one (a KDA in_proj of [36864, 7168] split per head costs ~1/5 of a whole
+    matrix). The cost follows the child's split mode; without split_qkv it stays whole."""
+    whole = 24 * 14 * 14
+    per_head = _qkv(3, 14, [4] * 6)  # full [24, 14], six 4-row heads
+    assert LWO._step_cost(per_head) == whole
+    assert LWO._step_cost(per_head, _Opt([], split_qkv=False)) == whole
+    assert LWO._step_cost(per_head, _Opt([], split_qkv=True, split_qkv_per_head=True)) == (
+        6 * (4 * 14 * 4)
+    )
+    # Projection mode: the per-group pattern [q, k, v] = [2, 1, 1] repeated for 6 groups is
+    # orthogonalized as three projections of 12, 6 and 6 rows across all groups.
+    proj = _qkv(3, 14, [2, 1, 1] * 6)
+    assert LWO._step_cost(proj, _Opt([], split_qkv=True)) == (12 * 14 * 12 + 2 * (6 * 14 * 6))
+    # Shapes that do not add up to the full rows cannot be trusted: whole-matrix cost.
+    odd = _qkv(3, 14, [4] * 5)
+    assert LWO._step_cost(odd, _Opt([], split_qkv=True, split_qkv_per_head=True)) == whole
+    # A non-QKV matrix is unaffected by the child's split settings.
+    assert LWO._step_cost(_matrix(3, 14), _Opt([], split_qkv=True)) == whole
+
+
+def test_split_qkv_weights_are_not_treated_as_heavy_items(monkeypatch):
+    """With nine per-head-split in_proj weights charged as whole [36864, 7168] matrices, the
+    ranks that received them were given fewer real matrices and finished early; priced by
+    their pieces they weigh almost nothing and the real matrices spread evenly."""
+    attn = [_matrix(3, 14) for _ in range(12)]  # 12 whole matrices, 3 per rank
+    in_proj = [_qkv(9, 14, [4] * 18) for _ in range(9)]  # full [72, 14]: 3x a matrix if whole
+    muon = _Opt(attn + in_proj, split_qkv=True, split_qkv_per_head=True)
+    lwo = _shard(monkeypatch, [muon], dp_size=4, rank=0)
+    whole_per_rank = [
+        sum(1 for p in owned if not getattr(p, "is_qkv", False)) for owned in lwo.dp_cp_params_list
+    ]
+    assert whole_per_rank == [3, 3, 3, 3], whole_per_rank
+    loads = [sum(LWO._step_cost(p, muon) for p in owned) for owned in lwo.dp_cp_params_list]
+    assert max(loads) - min(loads) <= LWO._step_cost(in_proj[0], muon), loads
