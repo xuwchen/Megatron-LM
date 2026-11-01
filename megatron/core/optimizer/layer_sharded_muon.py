@@ -410,6 +410,7 @@ class LayerShardedMuon(TensorParallelMuon):
         tp_group: torch.distributed.ProcessGroup | None = None,
         ns_batch_size: int = 1,
         ns_batch_max_mb: int = 2048,
+        ns_gather_ahead: int = 0,
         use_syrk: bool = False,
         concurrent_groups: bool = True,
         exchange_chunk_mb: int = 0,
@@ -475,6 +476,7 @@ class LayerShardedMuon(TensorParallelMuon):
             # (``super().step``) only; the layer-sharded path batches in _run_ns itself.
             ns_batch_size=ns_batch_size,
             ns_batch_max_mb=ns_batch_max_mb,
+            ns_gather_ahead=ns_gather_ahead,
         )
         self.gtp_remat_group = gtp_remat_group
         self.tp_group = tp_group
