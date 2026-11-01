@@ -78,7 +78,7 @@ def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: boo
 
 
 def _param_sort_key(numel: int, identity: tuple) -> tuple:
-    """Rank-independent total-order key for ping-pong ownership: ``(numel, *canonical-identity)``.
+    """Rank-independent total-order key for whole-param ownership: ``(numel, *canonical-identity)``.
 
     ``numel`` alone is not a total order (stable sort tie-breaks by rank-local insertion order),
     so equal-numel params would get different owners across ranks; the canonical identity
@@ -653,9 +653,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for chunk in model_chunks
                 if hasattr(chunk, 'full_param_layout') and chunk.full_param_layout is not None
             ] or None
-        # Decouple path keeps whole-matrix ping-pong ownership (Newton-Schulz runs on whole
-        # matrices on one rank; param sync via ``allgather_params``). ``model_chunks`` lets the
-        # ping-pong fallback break equal-numel ties by a rank-independent identity (see below).
+        # Decouple path keeps whole-matrix ownership, balanced by step cost (Newton-Schulz runs
+        # on whole matrices on one rank; param sync via ``allgather_params``). ``model_chunks``
+        # lets that fallback break equal-cost ties by a rank-independent identity (see below).
         self.shard_params(optimizers, full_param_layouts, model_chunks)
 
         # Engage FP8 param sync automatically when the decouple-managed params are actually
@@ -682,7 +682,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # model params, the buffer is already up-to-date in-place.  We can use DDP's
         # buffer-based all-gather (start_param_sync) instead of the flatten/unflatten
         # allgather_params path.  In the decouple path (incl. FP8 param-gather), Muon buffers are
-        # non-DistOpt and own whole params via ping-pong, so we use the legacy allgather_params.
+        # non-DistOpt and own whole params (cost-balanced), so we use the legacy allgather_params.
         self.use_buffer_param_sync = full_param_layouts is not None
 
         # Fall back to OptimizerConfig only for direct construction without model chunks.
@@ -962,8 +962,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         into ``dp_size`` equal shards; a param's shard index is determined by its
         position in the buffer.
 
-        Falls back to the legacy ping-pong-by-numel strategy when no layout is
-        available (e.g. ``dp_size == 1`` or no DDP wrapper).
+        Falls back to cost-balanced whole-param ownership
+        (:meth:`_shard_params_cost_balanced`) when no layout is available (e.g.
+        ``use_layer_wise_param_layout=False``, ``dp_size == 1`` or no DDP wrapper).
 
         Args:
             optimizers: Optimizers whose param groups will be narrowed to
@@ -983,7 +984,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if full_param_layouts is not None:
             self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
         else:
-            self._shard_params_ping_pong(optimizers, dp_cp_size, expt_dp_size, model_chunks)
+            self._shard_params_cost_balanced(optimizers, dp_cp_size, expt_dp_size, model_chunks)
 
     def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
         """Derive shard assignments from the param layout."""
@@ -1059,7 +1060,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         Both the chunk/buffer enumeration order and the ``param_index_map`` offsets come purely
         from model construction (identical across DP ranks), so the key is the same on every rank.
-        Used to break equal-numel ties in ``_shard_params_ping_pong``. Returns ``None`` if no layout
+        Used to break equal-cost ties in ``_shard_params_cost_balanced``. Returns ``None`` if no layout
         info is available, so the caller falls back to legacy numel-only ordering.
         """
         if model_chunks is None:
@@ -1080,69 +1081,90 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     identity[param] = (chunk_idx, buffer_idx, global_start)
         return identity or None
 
-    def _shard_params_ping_pong(self, optimizers, dp_cp_size, expt_dp_size, model_chunks=None):
-        """Legacy ping-pong shard assignment (no layout available).
+    # One element of an elementwise (scalar) optimizer, with chunked state offload the host
+    # traffic of its state, costs about as much as one element of a Newton-Schulz on a matrix
+    # whose inner dimension is this wide (GB300: a [12288, 7168] matrix takes ~10 ms, i.e.
+    # ~6e10 units/ms; an offloaded Adam element ~7e-8 ms). Without offload a scalar element is
+    # cheaper and this over-weights it, which only spreads scalar params more evenly.
+    _SCALAR_COST_PER_ELEMENT = 4096
 
-        Legacy: this method is a fallback for when no ``full_param_layout``
-        is provided.  Once all call sites supply a layout, this can be removed
-        in favor of :meth:`_shard_params_from_layout`.
+    @staticmethod
+    def _step_cost(param: torch.nn.Parameter) -> int:
+        """Estimated per-step cost of owning ``param``, in Newton-Schulz units.
 
-        Parameters are sorted by a rank-independent TOTAL order and assigned ping-pong style. E.g.
-        4 ranks, 10 params p0-p9 -> [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]].
-
-        CRITICAL: the sort key MUST be identical across DP ranks. ``numel`` alone is not (stable
-        sort tie-breaks equal-numel params by insertion order), which would give different owners
-        per rank -> params double-owned or zero-owned on the first step. So we tie-break by the
-        canonical identity ``(chunk_idx, buffer_idx, global_start_index)``.
+        A Muon matrix costs ``m * n * min(m, n)`` of its full (post GTP all-gather) shape, the
+        dominant term of its orthogonalization; every other param (scalar optimizer, vectors,
+        embeddings) costs ``numel * _SCALAR_COST_PER_ELEMENT``.
         """
-        dp_cp_idx, expt_dp_idx = 0, 0
-        # Create ping-pong style loop so memory is more balanced.
-        dp_cp_loop = list(range(dp_cp_size)) + list(range(dp_cp_size))[::-1]
-        expt_dp_loop = list(range(expt_dp_size)) + list(range(expt_dp_size))[::-1]
+        if param.dim() == 2 and is_managed_by_layer_wise_optimizer(param):
+            m, n = param.shape
+            if getattr(param, 'is_gtp_weight_remat', False):
+                m *= getattr(param, 'gtp_remat_size', 1)
+            return m * n * min(m, n)
+        return param.numel() * LayerWiseDistributedOptimizer._SCALAR_COST_PER_ELEMENT
+
+    def _shard_params_cost_balanced(self, optimizers, dp_cp_size, expt_dp_size, model_chunks=None):
+        """Whole-param ownership without a layout: balance the estimated step cost per rank.
+
+        Used when no ``full_param_layout`` is available (``use_layer_wise_param_layout=False``,
+        ``dp_size == 1`` or no DDP wrapper). Params are sorted by ``_step_cost`` descending and
+        each is given to the rank of its data-parallel axis (dense: ``dp_cp``; expert groups:
+        ``expt_dp``) with the least accumulated cost, ties to the lower rank. The former
+        ping-pong-by-numel assignment balanced element counts only: with GTP-sharded Muon
+        matrices of one size it dealt them out evenly, then put the dense MLP's fc1 on rank 0 and
+        fc2 on rank 1 on top, so those ranks' Newton-Schulz phase ran 15-45% longer and every
+        other rank waited for them at the first expert collective of each step.
+
+        CRITICAL: the assignment MUST be identical across DP ranks. Costs and shapes are (model
+        construction is), and equal costs are ordered by the canonical identity
+        ``(chunk_idx, buffer_idx, global_start_index)`` from ``_build_param_sort_keys``; the
+        legacy numel-only ordering (no layout info) keeps insertion order for equal costs.
+        """
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
-        # Get all param groups.
         param_groups = []
         for optimizer in optimizers:
             param_groups += optimizer.param_groups
 
-        # Sort param in all groups by a rank-independent TOTAL order, then assign to each rank.
         identity = self._build_param_sort_keys(model_chunks)
         param_list = []
         for group_index, group in enumerate(param_groups):
             for p in group["params"]:
                 param_list.append((p, group_index))
         if identity is not None:
-            # Total order: (numel, canonical-global-identity). Identical on every DP rank.
             missing = [p for (p, _) in param_list if p not in identity]
             assert not missing, (
-                "ping-pong ownership requires a canonical identity for every Muon param, "
+                "cost-balanced ownership requires a canonical identity for every Muon param, "
                 f"but {len(missing)} param(s) were not found in any model-chunk buffer's "
                 "param_index_map. Cannot guarantee identical ownership across ranks (the "
                 "allgather_params gather assumes every rank agrees on each param's single owner)."
             )
-            param_list.sort(key=lambda x: _param_sort_key(x[0].numel(), identity[x[0]]))
+            param_list.sort(
+                key=lambda x: (
+                    -self._step_cost(x[0]),
+                    _param_sort_key(x[0].numel(), identity[x[0]]),
+                )
+            )
         else:
-            # No layout info: keep the legacy numel-only ordering.
-            param_list.sort(key=lambda x: x[0].numel())
-        param_groups_this_rank = [[] for g in param_groups]
+            # No layout info: cost order with insertion order for ties (legacy behaviour).
+            param_list.sort(key=lambda x: -self._step_cost(x[0]))
 
-        # Assign params to rank in ping-pong style loop.
+        axis_loads = {False: [0] * dp_cp_size, True: [0] * expt_dp_size}
+        axis_lists = {False: self.dp_cp_params_list, True: self.expt_dp_params_list}
+        axis_rank = {False: get_pg_rank(self.dp_cp), True: get_pg_rank(self.expt_dp)}
+        owned_here = set()
         for p, group_index in param_list:
-            if param_groups[group_index].get("is_expert_parallel", False):
-                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.expt_dp):
-                    param_groups_this_rank[group_index].append(p)
-                self.expt_dp_params_list[expt_dp_loop[expt_dp_idx]].append(p)
-                expt_dp_idx = (expt_dp_idx + 1) % len(expt_dp_loop)
-            else:
-                if dp_cp_loop[dp_cp_idx] == get_pg_rank(self.dp_cp):
-                    param_groups_this_rank[group_index].append(p)
-                self.dp_cp_params_list[dp_cp_loop[dp_cp_idx]].append(p)
-                dp_cp_idx = (dp_cp_idx + 1) % len(dp_cp_loop)
+            is_expert = bool(param_groups[group_index].get("is_expert_parallel", False))
+            loads = axis_loads[is_expert]
+            owner = min(range(len(loads)), key=lambda r: (loads[r], r))
+            loads[owner] += self._step_cost(p)
+            axis_lists[is_expert][owner].append(p)
+            if owner == axis_rank[is_expert]:
+                owned_here.add(id(p))
 
-        # Now we modify the group to only handle local params.
-        for groups, params in zip(param_groups, param_groups_this_rank):
-            groups["params"] = params
+        # Now we modify the group to only handle local params, keeping the group's order.
+        for group in param_groups:
+            group["params"] = [p for p in group["params"] if id(p) in owned_here]
 
         # Simplify when expt_dp group size is 1 or expert parallel is off.
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
