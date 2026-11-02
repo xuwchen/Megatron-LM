@@ -980,6 +980,78 @@ def test_master_h2d_streams_one_chunk_ahead():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("offload_fraction", [1.0, 0.5])
+def test_chunked_step_stages_the_next_subsets_groups_with_the_optimizer(offload_fraction):
+    """An optimizer with ``stage_next_step`` (batched Muon gathering across calls) is told the
+    next subset's param groups before the current subset runs, gets exactly those group dicts
+    when the next subset steps, and can wait for that subset's masters and state from the
+    staging callback."""
+
+    class StagingSGD(torch.optim.SGD):
+        def __init__(self, params):
+            super().__init__(params, lr=0.1, momentum=0.9)
+            self.staged = []
+            self.stepped_with = []
+
+        def stage_next_step(self, param_groups, wait_ready=None):
+            if wait_ready is not None:
+                wait_ready()  # the real optimizer calls it right before touching the params
+            self.staged.append(param_groups)
+
+        @torch.no_grad()
+        def step(self, closure=None):
+            self.stepped_with.append(self.param_groups)
+            return super().step(closure)
+
+    params = [nn.Parameter(torch.full((4096,), float(i + 1), device="cuda")) for i in range(4)]
+    optimizer = StagingSGD(params)
+    for param in params:
+        param.grad = torch.ones_like(param)
+    optimizer.step()  # materialize the momentum buffers so the state is chunkable
+    optimizer.stepped_with.clear()
+    manager = ChunkedOptimizerStateOffloader(
+        optimizer=optimizer,
+        master_params=params,
+        chunk_size_bytes=4096 * torch.float32.itemsize,
+        offload_fraction=offload_fraction,
+        state_dtypes=(torch.float32,),
+    )
+    num_chunks = len(manager.chunks)
+    num_resident = len(manager._resident_params)
+    assert (num_chunks, num_resident) == ((4, 0) if offload_fraction == 1.0 else (2, 2))
+    manager.synchronize_for_checkpoint()
+    before = [param.detach().clone() for param in params]
+
+    # Bind the masters to CUDA storage first so the gradients attach on the device (the
+    # training loop's gradient finalization runs after this prefetch as well).
+    manager.prefetch_master_for_step()
+    assert all(param.is_cuda for param in params)
+    for param in params:
+        param.grad = torch.ones_like(param)
+    manager.step()
+    torch.cuda.synchronize()
+
+    subsets = optimizer.stepped_with
+    assert len(subsets) == num_chunks + (1 if num_resident else 0)
+    # Every subset after the first was staged during the subset before it, with the very
+    # group dicts it then ran with.
+    assert len(optimizer.staged) == len(subsets) - 1
+    for staged, ran in zip(optimizer.staged, subsets[1:]):
+        assert staged is ran or (
+            len(staged) == len(ran) and all(a is b for a, b in zip(staged, ran))
+        )
+    assert all(
+        all(param.is_cuda for param in group["params"])
+        for groups in optimizer.staged
+        for group in groups
+    )
+    # Second SGD step with the restored momentum buffer (1.0): p -= lr * (0.9 * 1.0 + 1.0).
+    for param, previous in zip(params, before):
+        torch.testing.assert_close(param.detach().cpu(), previous.cpu() - 0.1 * 1.9)
+    manager.synchronize_for_checkpoint()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_master_restore_for_param_sync_drains_pending_chunks():
     """A whole-master consumer enqueues the copies the per-chunk prefetch left pending."""
 

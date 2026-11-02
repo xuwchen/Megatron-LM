@@ -347,6 +347,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         ns_batch_size: int = 1,
         ns_batch_max_mb: int = 2048,
         ns_gather_ahead: int = 0,
+        ns_gather_across_steps: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -370,6 +371,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             raise ValueError(f"ns_batch_max_mb must be at least 1, got {ns_batch_max_mb}")
         if ns_gather_ahead < 0:
             raise ValueError(f"ns_gather_ahead must be non-negative, got {ns_gather_ahead}")
+        if ns_gather_across_steps and ns_gather_ahead < 1:
+            raise ValueError(
+                "ns_gather_across_steps issues the next step() call's first gather under this "
+                f"call's Newton-Schulz and so requires ns_gather_ahead >= 1, got {ns_gather_ahead}"
+            )
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -440,6 +446,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         # that consumes them, on a side stream (0 = in order on the compute stream).
         self.ns_gather_ahead = ns_gather_ahead
         self._gather_stream: Optional[torch.cuda.Stream] = None
+        # Cross-call gather prefetch (see stage_next_step): the param groups of the next step()
+        # call with a readiness callback, and the first batch gathered for that call.
+        self.ns_gather_across_steps = ns_gather_across_steps
+        self._staged_next_step: Optional[tuple[List[dict], Optional[Callable[[], None]]]] = None
+        self._prefetched_gtp_batch: Optional[tuple] = None
         # Batched duplicated-GTP steps taken so far: (batches, matrices). Tests and probes
         # read it to confirm the batched path ran at all.
         self.gtp_batch_counts = (0, 0)
@@ -601,10 +612,53 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if closure is not None:
             raise ValueError("closure is not supported")
 
+        plain, batches = self._plan_gtp_batches(self.param_groups, init_state=True)
+        prefetched = self._prefetched_gtp_batch
+        self._prefetched_gtp_batch = None
+        if prefetched is not None:
+            # The previous call gathered this call's first batch (stage_next_step) and already
+            # advanced its momentum, so this call must start with exactly that batch.
+            key, items = prefetched[0], prefetched[1]
+            same = (
+                bool(batches)
+                and batches[0][0] == key
+                and len(batches[0][1]) == len(items)
+                and all(
+                    p is q and group is other
+                    for (p, group), (q, other) in zip(batches[0][1], items)
+                )
+            )
+            if not same:
+                raise RuntimeError(
+                    "Batched Muon step: the first batch of this step() call is not the one "
+                    "prefetched for it through stage_next_step, whose momentum has already been "
+                    "advanced. stage_next_step must receive exactly the param groups of the "
+                    "following step() call."
+                )
+
+        # The per-parameter weights first: their work overlaps the first batch's gathers.
+        for p, group in plain:
+            self._step_param(p, group)
+
+        self.verify_gtp_batch_plans(wait=False)
+        self._exchange_gtp_batch_plans(batches)
+        self._step_gtp_batches(batches, prefetched=prefetched[2:] if prefetched else None)
+        return None
+
+    def _plan_gtp_batches(self, param_groups, init_state: bool):
+        """Split ``param_groups`` into per-parameter weights and the batched-gather batches.
+
+        Returns ``(plain, batches)``: ``plain`` is the list of ``(param, group)`` that take the
+        per-parameter path, ``batches`` the ordered ``(key, [(param, group), ...])`` batches of
+        the duplicated-GTP path. ``init_state`` runs the lazy state initialization of each
+        group (what ``step`` does); the cross-call prefetch plans without it and skips weights
+        whose momentum does not exist yet.
+        """
         plain: List[tuple[torch.Tensor, dict]] = []
         buckets: Dict[TensorParallelMuon._GtpBatchKey, List[tuple[torch.Tensor, dict]]] = {}
-        for group in self.param_groups:
-            self._init_group(group)
+        for group in param_groups:
+            if init_state:
+                self._init_group(group)
             for p in group["params"]:
                 if p.grad is None:
                     continue  # pragma: no cover
@@ -613,11 +667,6 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                     plain.append((p, group))
                 else:
                     buckets.setdefault(key, []).append((p, group))
-
-        # The per-parameter weights first: their work overlaps the first batch's gathers.
-        for p, group in plain:
-            self._step_param(p, group)
-
         batches: List[tuple[TensorParallelMuon._GtpBatchKey, List[tuple[torch.Tensor, dict]]]] = []
         for key, items in buckets.items():
             gathered_bytes = (
@@ -626,10 +675,43 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             batch_size = max(1, min(self.ns_batch_size, self.ns_batch_max_bytes // gathered_bytes))
             for start in range(0, len(items), batch_size):
                 batches.append((key, items[start : start + batch_size]))
-        self.verify_gtp_batch_plans(wait=False)
-        self._exchange_gtp_batch_plans(batches)
-        self._step_gtp_batches(batches)
-        return None
+        return plain, batches
+
+    def stage_next_step(
+        self, param_groups: List[dict], wait_ready: Optional[Callable[[], None]] = None
+    ) -> None:
+        """Announce the param groups of the next ``step()`` call (cross-call gather prefetch).
+
+        The chunked optimizer-state offload steps the optimizer once per state chunk, and the
+        gather pipeline of ``_step_gtp_batches`` cannot see past its own call: the first
+        batch's all-gather of every chunk is exposed. With ``ns_gather_across_steps`` the
+        caller passes the next call's param groups here before the current call; the current
+        call then issues the next call's first gather under its last Newton-Schulz, and the
+        next call starts from that gather. ``param_groups`` must be the very group dicts of
+        the next call (the prefetched items reference them). ``wait_ready`` is invoked on the
+        compute stream right before that batch's momentum update and must make the current
+        stream wait for the gradients, momentum and masters of those params to be resident
+        (the offloader's H2D copies). Weights whose momentum does not exist yet (lazy first
+        step) are not prefetched. A no-op unless ``ns_gather_across_steps``.
+        """
+        if not self.ns_gather_across_steps:
+            return
+        self._staged_next_step = (list(param_groups), wait_ready)
+
+    def _prefetch_next_step_batch(self, staged, compute_stream) -> None:
+        """Momentum update + gather of the next step() call's first batch (see stage_next_step)."""
+        param_groups, wait_ready = staged
+        _, batches = self._plan_gtp_batches(param_groups, init_state=False)
+        if not batches:
+            return
+        key, items = batches[0]
+        if any(p not in self.state or "momentum_buffer" not in self.state[p] for p, _ in items):
+            return  # lazily initialized state: nothing to gather ahead of the first step
+        if wait_ready is not None:
+            wait_ready()
+        self._prefetched_gtp_batch = (key, items) + tuple(
+            self._gather_gtp_batch(key, items, compute_stream)
+        )
 
     # ------------------------------------------------------------------------------------------
     # Batch-plan guard.
@@ -810,7 +892,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             p.add_(update, alpha=-group["lr"])
             self.post_weight_update_fn_inplace(p)
 
-    def _step_gtp_batches(self, batches) -> None:
+    def _step_gtp_batches(self, batches, prefetched=None) -> None:
         """Run the batches: one gather, one batched Newton-Schulz, the updates, per batch.
 
         With ``ns_gather_ahead > 0`` (and CUDA) the gather of batch ``i + ns_gather_ahead`` is
@@ -818,8 +900,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         many gathers are in flight under the GEMMs; the buffers of a batch stay referenced
         until its Newton-Schulz consumed them. ``ns_gather_ahead == 0`` is the in-order path:
         every gather on the compute stream right before its Newton-Schulz.
+
+        ``prefetched`` is the ``(stacked, gathered, done)`` of the first batch when the previous
+        call gathered it (stage_next_step); and when the next call's groups were staged, its
+        first gather is issued here once the last gather of this call is out, so the chunk
+        boundary of the offloader no longer exposes a gather.
         """
+        staged = self._staged_next_step
+        self._staged_next_step = None
         if not batches:
+            assert prefetched is None
             return
         ahead = self.ns_gather_ahead
         compute_stream = (
@@ -829,17 +919,24 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             ahead = 0
         # Gathers issued but not yet consumed, oldest first.
         inflight: List[tuple] = []
-        for i in range(min(ahead, len(batches))):
+        if prefetched is not None:
+            inflight.append(prefetched)
+        for i in range(len(inflight), min(ahead, len(batches))):
             inflight.append(self._gather_gtp_batch(*batches[i], compute_stream))
         for i, (key, items) in enumerate(batches):
-            if ahead == 0:
-                stacked, gathered, done = self._gather_gtp_batch(key, items)
-            else:
+            # Invariant with ahead > 0: ``inflight`` holds batches i .. i + ahead - 1.
+            if inflight:
                 stacked, gathered, done = inflight.pop(0)
+            else:
+                stacked, gathered, done = self._gather_gtp_batch(key, items)
+            if ahead > 0:
                 if i + ahead < len(batches):
                     inflight.append(self._gather_gtp_batch(*batches[i + ahead], compute_stream))
-                if done is not None:
-                    compute_stream.wait_event(done)
+                elif staged is not None:
+                    self._prefetch_next_step_batch(staged, compute_stream)
+                    staged = None
+            if done is not None:
+                compute_stream.wait_event(done)
             self._apply_gtp_batch(key, items, gathered)
             self.gtp_batch_counts = (
                 self.gtp_batch_counts[0] + 1,
@@ -849,6 +946,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             # allocated on the compute stream, which has now waited for that work, so freeing
             # them here cannot hand their memory to an earlier side-stream user.
             del stacked, gathered
+        if staged is not None:
+            # In-order path (no side stream): the next call's first gather still goes out at
+            # the end of this call, so the collective sequence is the same on every rank.
+            self._prefetch_next_step_batch(staged, None)
 
     def _resolve_tp_mode(self, m: int, n: int, group_size: int) -> str:
         """Cached per-shape mode for tp_mode="auto", dense (GTP) weights only.
@@ -1406,6 +1507,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         ns_batch_size: int = 1,
         ns_batch_max_mb: int = 2048,
         ns_gather_ahead: int = 0,
+        ns_gather_across_steps: bool = False,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -1435,6 +1537,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             ns_batch_size=ns_batch_size,
             ns_batch_max_mb=ns_batch_max_mb,
             ns_gather_ahead=ns_gather_ahead,
+            ns_gather_across_steps=ns_gather_across_steps,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor

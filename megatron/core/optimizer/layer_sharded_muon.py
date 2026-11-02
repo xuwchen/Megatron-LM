@@ -383,6 +383,7 @@ class LayerShardedMuon(TensorParallelMuon):
         ns_batch_size: int = 1,
         ns_batch_max_mb: int = 2048,
         ns_gather_ahead: int = 0,
+        ns_gather_across_steps: bool = False,
         use_syrk: bool = False,
         concurrent_groups: bool = True,
         use_decoupled_weight_decay: bool = True,
@@ -446,6 +447,7 @@ class LayerShardedMuon(TensorParallelMuon):
             ns_batch_size=ns_batch_size,
             ns_batch_max_mb=ns_batch_max_mb,
             ns_gather_ahead=ns_gather_ahead,
+            ns_gather_across_steps=ns_gather_across_steps,
         )
         self.gtp_remat_group = gtp_remat_group
         self.tp_group = tp_group

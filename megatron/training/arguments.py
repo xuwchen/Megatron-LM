@@ -2962,6 +2962,16 @@ def _add_regularization_args(parser):
         '(gathers in order on the compute stream).',
     )
     group.add_argument(
+        '--muon-ns-gather-across-steps',
+        action='store_true',
+        help='With --muon-ns-gather-ahead >= 1 and chunked optimizer state '
+        'offload: let the current state chunk\'s last Newton-Schulz also '
+        'cover the next chunk\'s first all-gather (the offloader steps the '
+        'optimizer per chunk, so that gather is otherwise exposed at every '
+        'chunk boundary). One more gather buffer alive across the boundary. '
+        'See OptimizerConfig.muon_ns_gather_across_steps.',
+    )
+    group.add_argument(
         '--muon-use-syrk',
         action='store_true',
         help='Use the Triton SYRK kernel for the symmetric-output '

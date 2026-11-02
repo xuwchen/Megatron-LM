@@ -346,6 +346,15 @@ class OptimizerConfig:
     the compute stream. Same collectives in the same order on every rank, so the result is
     unchanged; 1 is enough when a gather is shorter than a Newton-Schulz."""
 
+    muon_ns_gather_across_steps: bool = False
+    """With muon_ns_gather_ahead >= 1 under chunked optimizer-state offload: the offloader
+    steps the optimizer once per state chunk, and the gather pipeline cannot look past its
+    own call, so every chunk starts with one exposed all-gather. This lets the offloader hand
+    the next chunk's param groups to the optimizer before stepping the current one, so the
+    current chunk's last Newton-Schulz also covers the next chunk's first gather (one more
+    gather buffer alive across the chunk boundary, bounded by muon_ns_batch_max_mb). Same
+    collectives in the same order on every rank. Requires muon_ns_gather_ahead >= 1."""
+
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
     on its own CUDA stream so one group's compute fills another group's all_to_all stall.
