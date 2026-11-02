@@ -538,6 +538,128 @@ def test_muon_ns_gather_ahead_rejects_negative_values():
         TensorParallelMuon([p], lr=0.1, ns_batch_size=2, ns_gather_ahead=-1)
 
 
+def test_muon_ns_gather_across_steps_requires_gather_ahead():
+    p = _gtp_param(4, 4, seed=0)
+    with pytest.raises(ValueError, match="ns_gather_across_steps"):
+        TensorParallelMuon([p], lr=0.1, ns_batch_size=2, ns_gather_across_steps=True)
+    opt = TensorParallelMuon(
+        [p], lr=0.1, ns_batch_size=2, ns_gather_ahead=1, ns_gather_across_steps=True
+    )
+    assert opt.ns_gather_across_steps
+
+
+def _two_chunk_steps(optimizer, params_a, params_b, stage=False, wait_ready=None):
+    """Step ``optimizer`` the way the chunked offloader does: once per parameter subset, each
+    with its own group dict built from the original group's metadata. With ``stage`` the
+    second subset's groups are announced before the first subset runs."""
+    original = list(optimizer.param_groups)
+    base = {k: v for k, v in original[0].items() if k != "params"}
+    group_a = {**base, "params": list(params_a)}
+    group_b = {**base, "params": list(params_b)}
+    try:
+        if stage:
+            optimizer.stage_next_step([group_b], wait_ready)
+        optimizer.param_groups = [group_a]
+        optimizer.step()
+        yield_after_a = optimizer._prefetched_gtp_batch
+        optimizer.param_groups = [group_b]
+        optimizer.step()
+    finally:
+        optimizer.param_groups = original
+    return yield_after_a
+
+
+@pytest.mark.parametrize("gtp_rank", [0, 1])
+def test_muon_batched_gtp_step_gathers_the_next_calls_first_batch_ahead(monkeypatch, gtp_rank):
+    """ns_gather_across_steps: with the next step() call's groups staged, the current call
+    issues that call's first all-gather itself (after its own last gather) and the next call
+    starts from it, so a per-chunk stepping (chunked optimizer-state offload) no longer pays
+    one exposed gather per chunk. Same collectives in the same order, same update, and the
+    prefetched weights' momentum is advanced exactly once."""
+    pg_collection, gathers = _fake_two_rank_gtp(monkeypatch, gtp_rank)
+
+    def make_params():
+        return [_gtp_param(6, 5, seed=i, pad_length=2) for i in range(7)]
+
+    kwargs = dict(
+        lr=0.1,
+        momentum=0.9,
+        weight_decay=0.01,
+        num_ns_steps=3,
+        fp32_matmul_prec="highest",
+        pg_collection=pg_collection,
+        tp_mode="duplicated",
+        ns_batch_size=3,
+        ns_gather_ahead=1,
+    )
+    ref_params = make_params()
+    ref = TensorParallelMuon(ref_params, **kwargs)
+    params = make_params()
+    opt = TensorParallelMuon(params, ns_gather_across_steps=True, **kwargs)
+    ready_calls = []
+
+    for step in range(3):
+        # Reference: two plain calls (chunk A = 4 weights -> batches of 3 + 1, chunk B = 3).
+        gathers.clear()
+        _two_chunk_steps(ref, ref_params[:4], ref_params[4:])
+        ref_gathers = list(gathers)
+        assert [g[0] for g in ref_gathers] == [3, 1, 3]
+        assert ref._prefetched_gtp_batch is None
+
+        gathers.clear()
+        prefetched_after_a = _two_chunk_steps(
+            opt, params[:4], params[4:], stage=True, wait_ready=lambda: ready_calls.append(step)
+        )
+        if step == 0:
+            # Lazy first step: chunk B's momentum does not exist yet, so nothing is gathered
+            # ahead and the staging is dropped silently.
+            assert prefetched_after_a is None
+            assert ready_calls == []
+        else:
+            assert prefetched_after_a is not None
+            assert prefetched_after_a[0] == opt._gtp_batch_key(params[4])
+            assert [p for p, _ in prefetched_after_a[1]] == params[4:]
+            assert ready_calls == list(range(1, step + 1))
+        assert opt._prefetched_gtp_batch is None
+        # The same three gathers in the same order: the third one was merely issued during
+        # chunk A's call instead of at the start of chunk B's.
+        assert gathers == ref_gathers
+        for p_ref, p in zip(ref_params, params):
+            torch.testing.assert_close(p, p_ref)
+            torch.testing.assert_close(
+                opt.state[p]["momentum_buffer"], ref.state[p_ref]["momentum_buffer"]
+            )
+            p.grad = p_ref.grad = torch.randn_like(p_ref) * 0.1
+    assert opt.gtp_batch_counts == ref.gtp_batch_counts == (9, 21)
+
+
+def test_muon_batched_gtp_step_rejects_a_call_that_is_not_the_staged_one(monkeypatch):
+    """The prefetched batch advanced its weights' momentum, so the following call must be
+    exactly the staged one; anything else is an error rather than a silent double update.
+    Staging is inert without ns_gather_across_steps."""
+    pg_collection, gathers = _fake_two_rank_gtp(monkeypatch, gtp_rank=0)
+    params = [_gtp_param(6, 5, seed=i) for i in range(4)]
+    kwargs = dict(num_ns_steps=1, pg_collection=pg_collection, ns_batch_size=2, ns_gather_ahead=1)
+    inert = TensorParallelMuon(params, **kwargs)
+    inert.stage_next_step([{**inert.param_groups[0], "params": params[2:]}])
+    assert inert._staged_next_step is None
+
+    opt = TensorParallelMuon(params, ns_gather_across_steps=True, **kwargs)
+    opt.step()  # creates the momentum state
+    original = list(opt.param_groups)
+    base = {k: v for k, v in original[0].items() if k != "params"}
+    group_a = {**base, "params": params[:2]}
+    group_b = {**base, "params": params[2:]}
+    opt.stage_next_step([group_b])
+    opt.param_groups = [group_a]
+    opt.step()
+    assert opt._prefetched_gtp_batch is not None
+    # Same weights but other group dicts (what a caller that rebuilt the groups would do).
+    opt.param_groups = [{**base, "params": params[2:]}]
+    with pytest.raises(RuntimeError, match="not the one prefetched"):
+        opt.step()
+
+
 def test_muon_ns_batch_size_rejects_invalid_values():
     p = _gtp_param(4, 4, seed=0, gtp=False)
     with pytest.raises(ValueError, match="ns_batch_size"):
