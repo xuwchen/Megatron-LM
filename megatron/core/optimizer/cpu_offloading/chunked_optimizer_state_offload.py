@@ -1115,14 +1115,50 @@ class ChunkedOptimizerStateOffloader:
             indexed_groups.append((group_index, group))
         return groups, indexed_groups
 
+    def _stage_next_subset(
+        self,
+        params: Sequence[torch.Tensor],
+        base_group_metadata: Sequence[dict],
+        state_prefetch: _StatePrefetch | None,
+    ) -> tuple[List[dict], List[tuple[int, dict]]] | None:
+        """Hand the next subset's param groups to an optimizer that gathers across calls.
+
+        ``TensorParallelMuon.stage_next_step`` (batched duplicated-GTP Muon with
+        ``ns_gather_across_steps``) issues the next ``step()`` call's first all-gather under
+        the current call's last Newton-Schulz, so the per-chunk stepping does not expose one
+        gather per chunk. The groups built here are the ones :meth:`_step_subset` must run
+        with, so that the items the optimizer prefetched reference the groups it then steps.
+        The readiness callback makes the compute stream wait for the masters and the state
+        chunk of ``params`` (both already enqueued one chunk ahead) before the optimizer
+        touches them. Returns None when the optimizer has no such hook.
+        """
+        stage = getattr(self.optimizer, "stage_next_step", None)
+        if stage is None:
+            return None
+        groups, indexed_groups = self._make_subset_groups(params, base_group_metadata)
+        if not groups:
+            return None
+
+        def wait_ready() -> None:
+            self._wait_master_h2d(params)
+            if state_prefetch is not None:
+                self._wait_state_prefetch(state_prefetch)
+
+        stage(groups, wait_ready)
+        return groups, indexed_groups
+
     def _step_subset(
         self,
         params: Sequence[torch.Tensor],
         original_groups: Sequence[dict],
         base_group_metadata: Sequence[dict],
         resulting_group_metadata: Dict[int, dict],
+        prepared_groups: tuple[List[dict], List[tuple[int, dict]]] | None = None,
     ) -> None:
-        groups, indexed_groups = self._make_subset_groups(params, base_group_metadata)
+        if prepared_groups is None:
+            groups, indexed_groups = self._make_subset_groups(params, base_group_metadata)
+        else:
+            groups, indexed_groups = prepared_groups
         if not groups:
             return
         self.optimizer.param_groups = groups
@@ -1159,9 +1195,21 @@ class ChunkedOptimizerStateOffloader:
         resulting_group_metadata: Dict[int, dict] = {}
 
         try:
+            current_prefetch = self._first_prefetch
+            self._first_prefetch = None
+            if current_prefetch is None and self._chunks:
+                current_prefetch = self._prefetch_state(self._chunks[0])
+            # Groups of the chunk about to run when they were staged with the optimizer
+            # during the previous subset (see _stage_next_subset); None otherwise.
+            staged_groups = None
+
             # Resident state needs no transfers and provides useful compute while the first
             # selected chunk is being prefetched.
             if self._resident_params:
+                if self._chunks:
+                    staged_groups = self._stage_next_subset(
+                        self._chunks[0].params, base_group_metadata, current_prefetch
+                    )
                 self._step_subset(
                     self._resident_params,
                     original_groups,
@@ -1169,8 +1217,6 @@ class ChunkedOptimizerStateOffloader:
                     resulting_group_metadata,
                 )
 
-            current_prefetch = self._first_prefetch
-            self._first_prefetch = None
             for chunk_index, chunk in enumerate(self._chunks):
                 if current_prefetch is None:
                     current_prefetch = self._prefetch_state(chunk)
@@ -1179,14 +1225,23 @@ class ChunkedOptimizerStateOffloader:
                 self._wait_state_prefetch(current_prefetch)
 
                 next_prefetch = None
+                next_groups = None
                 if chunk_index + 1 < len(self._chunks):
                     next_chunk = self._chunks[chunk_index + 1]
                     self._enqueue_master_h2d(next_chunk.params)
                     next_prefetch = self._prefetch_state(next_chunk)
+                    next_groups = self._stage_next_subset(
+                        next_chunk.params, base_group_metadata, next_prefetch
+                    )
 
                 self._step_subset(
-                    chunk.params, original_groups, base_group_metadata, resulting_group_metadata
+                    chunk.params,
+                    original_groups,
+                    base_group_metadata,
+                    resulting_group_metadata,
+                    prepared_groups=staged_groups,
                 )
+                staged_groups = next_groups
                 created_state = self._has_unregistered_cuda_state(chunk.params)
                 self._schedule_state_d2h(chunk.params)
                 if created_state:
