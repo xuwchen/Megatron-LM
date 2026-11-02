@@ -123,9 +123,38 @@ def _te_supports_scaled_tanh_srelu() -> bool:
     return "tanh_clamp_scale" in inspect.signature(ScaledTanhSReLU).parameters
 
 
+def _te_supports_scaled_situ_glu() -> bool:
+    """Whether the installed TE provides ``ScaledSiTUGLU`` accepting ``beta1`` and ``beta2``.
+
+    SiTU-GLU (a gated activation with activation_func_tanh_clamp_scale) is fused by this op: it
+    soft-clamps the gate half by ``beta1`` and the linear half by ``beta2``. Checked by
+    capability rather than version, and not cached because tests swap the TE module out.
+    """
+    if not HAVE_TE:
+        return False
+    try:
+        from transformer_engine.pytorch.ops import ScaledSiTUGLU
+    except ImportError:
+        return False
+    parameters = inspect.signature(ScaledSiTUGLU).parameters
+    return "beta1" in parameters and "beta2" in parameters
+
+
 def _require_te_tanh_clamp_support(config) -> None:
     """Raise an actionable error if the op fuser is asked to clamp and the installed TE cannot."""
-    if config.activation_func_tanh_clamp_scale is None or _te_supports_scaled_tanh_srelu():
+    if config.activation_func_tanh_clamp_scale is None:
+        return
+    if config.gated_linear_unit:
+        # A clamped gated activation is SiTU-GLU; the op fuser runs it through ScaledSiTUGLU.
+        if _te_supports_scaled_situ_glu():
+            return
+        raise RuntimeError(
+            "SiTU-GLU (activation_func_tanh_clamp_scale with a gated activation) with "
+            "use_transformer_engine_op_fuser requires a Transformer Engine providing "
+            "ops.ScaledSiTUGLU(beta1=..., beta2=...). Upgrade Transformer Engine, or unset "
+            "use_transformer_engine_op_fuser to use the unfused path."
+        )
+    if _te_supports_scaled_tanh_srelu():
         return
     raise RuntimeError(
         "activation_func_tanh_clamp_scale with use_transformer_engine_op_fuser requires a "
@@ -618,10 +647,19 @@ class TEGroupedMLP(MegatronModule):
         if not (use_glu_fusion or use_srelu_fusion):
             return False
         if self.config.activation_func_tanh_clamp_scale is not None:
-            # Only non-gated squared ReLU can be soft-clamped on the fused path, and only when TE
-            # provides ScaledTanhSReLU. A clamped gated activation is SiTU-GLU, which the fused GLU
-            # path does not implement. Returning False selects the unfused (clamped) path.
-            if not use_srelu_fusion or not _te_supports_scaled_tanh_srelu():
+            # Returning False selects the unfused (clamped) path.
+            if use_glu_fusion:
+                # A clamped gated activation is SiTU-GLU (config validation requires silu), fused
+                # by TE's ScaledSiTUGLU: it clamps the gate half by beta1 and the linear half by
+                # beta2 and adds no linear offset, so it needs both scales and a zero offset.
+                if (
+                    self.config.activation_func_tanh_clamp_scale_linear is None
+                    or self.config.glu_linear_offset != 0.0
+                    or not _te_supports_scaled_situ_glu()
+                ):
+                    return False
+            elif not _te_supports_scaled_tanh_srelu():
+                # Non-gated squared ReLU is soft-clamped by ScaledTanhSReLU.
                 return False
         if self.config.activation_func == F.silu:
             if self.config.activation_func_clamp_value is not None:
@@ -736,12 +774,27 @@ class TEGroupedMLP(MegatronModule):
             op.ep_mxfp8_carrier_input = True
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU, clamped GLU, or SReLU).
+        # Activation and post-multiply probs (SwiGLU, SiTU-GLU, clamped GLU, or SReLU).
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         activation_recompute_in_mlp = bool(getattr(self, "activation_recompute", False))
         if self.config.activation_func == F.silu and self.config.gated_linear_unit:
             clamp_value = self.config.activation_func_clamp_value
-            if clamp_value is not None:
+            tanh_clamp_scale = self.config.activation_func_tanh_clamp_scale
+            if tanh_clamp_scale is not None:
+                # SiTU-GLU: beta1 clamps the gate half, beta2 the linear half.
+                # _is_fused_impl_supported admitted this only with both scales and no offset.
+                situ_glu_kwargs = {
+                    "glu_interleave_size": glu_interleave,
+                    "beta1": tanh_clamp_scale,
+                    "beta2": self.config.activation_func_tanh_clamp_scale_linear,
+                }
+                if (
+                    "activation_recompute_in_mlp"
+                    in inspect.signature(te.pytorch.ops.ScaledSiTUGLU).parameters
+                ):
+                    situ_glu_kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
+                op = te.pytorch.ops.ScaledSiTUGLU(**situ_glu_kwargs)
+            elif clamp_value is not None:
                 clamped_glu_kwargs = {
                     "glu_interleave_size": glu_interleave,
                     "alpha": 1.0,

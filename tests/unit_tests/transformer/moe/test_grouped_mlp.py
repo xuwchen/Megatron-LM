@@ -367,6 +367,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
         moe_mlp_glu_interleave_size=16,
         delay_wgrad_compute=False,
         activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=None,
         activation_func=F.silu,
     )
     module.activation_func = F.silu
@@ -723,6 +724,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
         moe_mlp_glu_interleave_size=8,
         delay_wgrad_compute=False,
         activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=None,
         activation_func=F.silu,
         gated_linear_unit=True,
     )
@@ -842,6 +844,16 @@ def _make_fake_te_namespace():
             self.tanh_clamp_scale = tanh_clamp_scale
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
+    class FakeScaledSiTUGLU(torch.nn.Module):
+        def __init__(
+            self, glu_interleave_size=None, *, activation_recompute_in_mlp=False, beta1, beta2
+        ):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
+            self.beta1 = beta1
+            self.beta2 = beta2
+
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
             self.forward_pre_hook = hook
@@ -856,6 +868,7 @@ def _make_fake_te_namespace():
                     ScaledClampedQGeGLU=FakeScaledClampedQGeGLU,
                     ScaledSReLU=FakeScaledSReLU,
                     ScaledTanhSReLU=FakeScaledTanhSReLU,
+                    ScaledSiTUGLU=FakeScaledSiTUGLU,
                     Sequential=FakeSequential,
                 ),
             )
@@ -883,6 +896,7 @@ def test_make_fused_ops_uses_clamped_qgeglu(
         moe_mlp_glu_interleave_size=4,
         delay_wgrad_compute=False,
         activation_func_clamp_value=7.0,
+        activation_func_tanh_clamp_scale=None,
         activation_func=activation_func,
         gated_linear_unit=True,
     )
@@ -989,6 +1003,49 @@ def test_make_fused_ops_uses_scaled_tanh_srelu_when_clamp_is_set(monkeypatch):
     assert ops[1].activation_recompute_in_mlp is True
 
 
+def test_make_fused_ops_uses_scaled_situ_glu_for_gated_clamp(monkeypatch):
+    """SwiGLU with the tanh clamps (SiTU-GLU) selects ScaledSiTUGLU with beta1/beta2."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=32,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=4.0,
+        activation_func_tanh_clamp_scale_linear=25.0,
+        glu_linear_offset=0.0,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+    )
+    module.activation_func = F.silu
+    module.activation_recompute = True
+    common = dict(
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_weight=False,
+    )
+    module.linear_fc1 = FakeGroupedLinear(2, 4, 8, bias=False, **common)
+    module.linear_fc2 = FakeGroupedLinear(2, 8, 4, bias=False, **common)
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
+
+    ops = module._make_fused_ops()
+
+    activation = ops[1]
+    assert type(activation).__name__ == "FakeScaledSiTUGLU"
+    assert activation.glu_interleave_size == 32
+    assert activation.beta1 == 4.0
+    assert activation.beta2 == 25.0
+    assert activation.activation_recompute_in_mlp is True
+
+
 def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
@@ -1000,6 +1057,7 @@ def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch)
         moe_mlp_glu_interleave_size=None,
         delay_wgrad_compute=False,
         activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=None,
         activation_func=squared_relu,
         gated_linear_unit=True,
         use_fused_weighted_squared_relu=True,
@@ -1029,6 +1087,7 @@ def _install_fake_te_ops_modules(
     include_clamped_qgeglu=True,
     include_scaled_srelu=True,
     include_scaled_tanh_srelu=False,
+    include_scaled_situ_glu=False,
 ):
     transformer_engine = ModuleType("transformer_engine")
     pytorch = ModuleType("transformer_engine.pytorch")
@@ -1041,6 +1100,8 @@ def _install_fake_te_ops_modules(
         ops.ScaledSReLU = fake_te.pytorch.ops.ScaledSReLU
     if include_scaled_tanh_srelu:
         ops.ScaledTanhSReLU = fake_te.pytorch.ops.ScaledTanhSReLU
+    if include_scaled_situ_glu:
+        ops.ScaledSiTUGLU = fake_te.pytorch.ops.ScaledSiTUGLU
     pytorch.ops = ops
     transformer_engine.pytorch = pytorch
     monkeypatch.setitem(sys.modules, "transformer_engine", transformer_engine)
@@ -1056,6 +1117,8 @@ def _make_fused_impl_support_module(
     use_fused_weighted_squared_relu=False,
     activation_func_clamp_value=None,
     activation_func_tanh_clamp_scale=None,
+    activation_func_tanh_clamp_scale_linear=None,
+    glu_linear_offset=0.0,
 ):
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
@@ -1063,6 +1126,8 @@ def _make_fused_impl_support_module(
         activation_func=activation_func,
         activation_func_clamp_value=activation_func_clamp_value,
         activation_func_tanh_clamp_scale=activation_func_tanh_clamp_scale,
+        activation_func_tanh_clamp_scale_linear=activation_func_tanh_clamp_scale_linear,
+        glu_linear_offset=glu_linear_offset,
         gated_linear_unit=gated_linear_unit,
         use_fused_weighted_squared_relu=use_fused_weighted_squared_relu,
         moe_apply_probs_on_input=False,
@@ -1193,11 +1258,12 @@ def test_is_fused_impl_supported_gates_scaled_srelu_on_weighted_flag_and_non_glu
         (squared_relu, False, False, False),
         (F.silu, True, True, False),
     ],
-    ids=["srelu-te-has-op", "srelu-te-lacks-op", "gated-clamp-is-situ-glu"],
+    ids=["srelu-te-has-op", "srelu-te-lacks-op", "gated-clamp-needs-situ-glu-op"],
 )
 def test_is_fused_impl_supported_gates_tanh_clamp_on_te_capability(
     monkeypatch, activation_func, gated_linear_unit, te_has_tanh_srelu, expected
 ):
+    """ScaledTanhSReLU admits the non-gated clamp only; a gated clamp is SiTU-GLU."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
@@ -1210,25 +1276,79 @@ def test_is_fused_impl_supported_gates_tanh_clamp_on_te_capability(
         gated_linear_unit=gated_linear_unit,
         use_fused_weighted_squared_relu=not gated_linear_unit,
         activation_func_tanh_clamp_scale=16.0,
+        activation_func_tanh_clamp_scale_linear=25.0 if gated_linear_unit else None,
     )
 
     assert module._is_fused_impl_supported() is expected
 
 
 @pytest.mark.parametrize(
-    ("tanh_clamp_scale", "te_has_tanh_srelu", "raises"),
-    [(16.0, False, True), (16.0, True, False), (None, False, False)],
-    ids=["clamp-te-lacks-op", "clamp-te-has-op", "unclamped"],
+    ("te_has_situ_glu", "linear_scale", "glu_linear_offset", "expected"),
+    [
+        (True, 25.0, 0.0, True),
+        (False, 25.0, 0.0, False),
+        (True, None, 0.0, False),
+        (True, 25.0, 1.0, False),
+    ],
+    ids=["te-has-op", "te-lacks-op", "no-linear-scale", "linear-offset"],
 )
-def test_require_te_tanh_clamp_support(monkeypatch, tanh_clamp_scale, te_has_tanh_srelu, raises):
+def test_is_fused_impl_supported_gates_situ_glu_on_te_capability(
+    monkeypatch, te_has_situ_glu, linear_scale, glu_linear_offset, expected
+):
+    """SiTU-GLU fuses through ScaledSiTUGLU, which clamps both halves and adds no offset."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te, include_scaled_situ_glu=te_has_situ_glu)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        activation_func_tanh_clamp_scale=4.0,
+        activation_func_tanh_clamp_scale_linear=linear_scale,
+        glu_linear_offset=glu_linear_offset,
+    )
+
+    assert module._is_fused_impl_supported() is expected
+
+
+@pytest.mark.parametrize(
+    ("tanh_clamp_scale", "gated_linear_unit", "te_has_tanh_srelu", "te_has_situ_glu", "match"),
+    [
+        (16.0, False, False, True, "ScaledTanhSReLU"),
+        (16.0, False, True, False, None),
+        (4.0, True, True, False, "ScaledSiTUGLU"),
+        (4.0, True, False, True, None),
+        (None, False, False, False, None),
+    ],
+    ids=[
+        "clamp-te-lacks-op",
+        "clamp-te-has-op",
+        "situ-glu-te-lacks-op",
+        "situ-glu-te-has-op",
+        "unclamped",
+    ],
+)
+def test_require_te_tanh_clamp_support(
+    monkeypatch, tanh_clamp_scale, gated_linear_unit, te_has_tanh_srelu, te_has_situ_glu, match
+):
     fake_te, _ = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
-    _install_fake_te_ops_modules(monkeypatch, fake_te, include_scaled_tanh_srelu=te_has_tanh_srelu)
+    _install_fake_te_ops_modules(
+        monkeypatch,
+        fake_te,
+        include_scaled_tanh_srelu=te_has_tanh_srelu,
+        include_scaled_situ_glu=te_has_situ_glu,
+    )
 
-    config = SimpleNamespace(activation_func_tanh_clamp_scale=tanh_clamp_scale)
-    if raises:
-        with pytest.raises(RuntimeError, match="ScaledTanhSReLU"):
+    config = SimpleNamespace(
+        activation_func_tanh_clamp_scale=tanh_clamp_scale, gated_linear_unit=gated_linear_unit
+    )
+    if match is not None:
+        with pytest.raises(RuntimeError, match=match):
             experts_module._require_te_tanh_clamp_support(config)
     else:
         experts_module._require_te_tanh_clamp_support(config)
@@ -1263,6 +1383,7 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
         moe_mlp_glu_interleave_size=2,
         delay_wgrad_compute=False,
         activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=None,
         activation_func=F.silu,
         gated_linear_unit=True,
     )
