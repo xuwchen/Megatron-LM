@@ -1331,6 +1331,10 @@ def test_chunked_step_stages_the_next_subsets_groups_with_the_optimizer(offload_
     manager.synchronize_for_checkpoint()
     before = [param.detach().clone() for param in params]
 
+    # Bind the masters to CUDA storage first so the gradients attach on the device (the
+    # training loop's gradient finalization runs after this prefetch as well).
+    manager.prefetch_master_for_step()
+    assert all(param.is_cuda for param in params)
     for param in params:
         param.grad = torch.ones_like(param)
     manager.step()
