@@ -1090,3 +1090,64 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
             )
 
     Utils.destroy_model_parallel()
+
+
+class TestPartitionBucketsGradDtype:
+    """fp8 bucket-group merging must not mix gradient dtypes on the all-reduce path."""
+
+    @staticmethod
+    def _fake_buffer(param_dtype, grad_dtype, num_buckets, ddp_config, group):
+        from types import SimpleNamespace
+
+        buckets = [
+            SimpleNamespace(
+                params_list=[torch.nn.Parameter(torch.zeros(2, dtype=torch.bfloat16))],
+                grad_data=torch.zeros(2, dtype=grad_dtype),
+            )
+            for _ in range(num_buckets)
+        ]
+        return SimpleNamespace(
+            params=[p for b in buckets for p in b.params_list],
+            param_dtype=param_dtype,
+            grad_dtype=grad_dtype,
+            buckets=buckets,
+            ddp_config=ddp_config,
+            data_parallel_group=group,
+            data_parallel_world_size=2,
+        )
+
+    @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+    def test_fp8_merge_splits_foreign_grad_dtype_only_for_all_reduce(
+        self, use_distributed_optimizer
+    ):
+        """bf16 biases merge into the last fp8 group; fp32-grad buckets do so only under DistOpt."""
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=use_distributed_optimizer,
+            overlap_grad_reduce=False,
+            average_in_collective=False,
+        )
+        group = mock.MagicMock()
+        group.rank.return_value = 0
+        fp8 = self._fake_buffer(torch.uint8, torch.bfloat16, 2, ddp_config, group)
+        bf16 = self._fake_buffer(torch.bfloat16, torch.bfloat16, 1, ddp_config, group)
+        fp32 = self._fake_buffer(torch.float32, torch.float32, 1, ddp_config, group)
+
+        groups = partition_buckets([fp8, bf16, fp32])
+
+        def has(group, bucket):
+            return any(b is bucket for b in group.buckets)
+
+        last_fp8 = fp8.buckets[-1]
+        merged = next(g for g in groups if has(g, last_fp8))
+        assert has(merged, bf16.buckets[0])
+        if use_distributed_optimizer:
+            # Reduce-scatter per bucket: the historical merge of every non-fp8 bucket is kept.
+            assert has(merged, fp32.buckets[0])
+            assert len(groups) == 2
+        else:
+            # One coalesced all-reduce per group: the fp32 bucket gets a group of its own.
+            assert not has(merged, fp32.buckets[0])
+            assert any(len(g.buckets) == 1 and has(g, fp32.buckets[0]) for g in groups)
+            assert len(groups) == 3
+            for g in groups:
+                assert len({b.grad_data.dtype for b in g.buckets}) == 1

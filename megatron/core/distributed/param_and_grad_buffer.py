@@ -2016,8 +2016,30 @@ def partition_buckets(
                             )
 
                     continue  # Skip the default bucket group creation below
-                else:
+                elif buffer.ddp_config.use_distributed_optimizer:
                     group_buckets = [bucket] + non_fp8_buckets
+                else:
+                    # Without the distributed optimizer the group all-reduces its buckets in one
+                    # coalesced call, which needs one gradient dtype (allreduce_coalesced raises
+                    # "Tensors must have identical type"); reduce-scatter has no such limit.
+                    # Merge only the non-fp8 buckets whose gradient dtype matches (e.g. the bf16
+                    # biases) and give the others (fp32 router weights under bf16 gradient
+                    # reduction) groups of their own.
+                    grad_dtype = bucket.grad_data.dtype
+                    group_buckets = [bucket] + [
+                        b for b in non_fp8_buckets if b.grad_data.dtype == grad_dtype
+                    ]
+                    for other_bucket in non_fp8_buckets:
+                        if other_bucket.grad_data.dtype == grad_dtype:
+                            continue
+                        bucket_groups.append(
+                            _ParamAndGradBucketGroup(
+                                [other_bucket],
+                                buffer.ddp_config,
+                                buffer.data_parallel_group,
+                                buffer.data_parallel_world_size,
+                            )
+                        )
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]
