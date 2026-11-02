@@ -78,6 +78,30 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     return sharded_buffer
 
 
+def _copy_layerwise_gathered_params(bucket, local_rank: int) -> None:
+    """Copy the LayerWise variable-size all-gather result into the model parameters.
+
+    Every other rank's slot is unflattened and copied into that rank's params. The local
+    rank's own non-quantized params were the gather source and need no copy. Its MXFP8 params
+    do: the optimizer wrote them straight from the fp32 master (fp32 -> MXFP8), while the slot
+    carries the master staged in BF16 and every other rank quantizes that (fp32 -> BF16 ->
+    MXFP8). The two roundings differ, so without this copy a parameter is not bitwise
+    identical across data-parallel ranks and the trajectory depends on who owns what. The
+    full-layout path (``copy_tensors_to_quantized_params`` in ``_post_param_sync``) already
+    re-quantizes the owner from the staged BF16 slot; this keeps the legacy path symmetric.
+    """
+    for idx, params in enumerate(bucket.layerwise_params_list):
+        if len(params) == 0:
+            continue
+        if idx == local_rank and not any(is_mxfp8tensor(p) for p in params):
+            continue
+        updated_params = _unflatten_dense_tensors(bucket.layerwise_gather_list[idx], params)
+        for updated_p, model_p in zip(updated_params, params):
+            if idx == local_rank and not is_mxfp8tensor(model_p):
+                continue
+            model_p.data.copy_(updated_p)
+
+
 def _param_uses_quantized_storage(param: torch.nn.Parameter) -> bool:
     """Return whether the parameter owns TE quantized storage instead of plain tensor storage."""
     # In TE2, is_float8tensor() checks QuantizedTensor, so it includes plain MXFP8Tensor.
@@ -543,14 +567,7 @@ class _ParamAndGradBucketGroup:
                 for bucket in self.buckets:
                     if bucket.layerwise_gather_list is None:
                         continue
-                    for idx, params in enumerate(bucket.layerwise_params_list):
-                        if len(params) == 0 or idx == local_rank:
-                            continue
-                        updated_params = _unflatten_dense_tensors(
-                            bucket.layerwise_gather_list[idx], params
-                        )
-                        for updated_p, model_p in zip(updated_params, params):
-                            model_p.data.copy_(updated_p)
+                    _copy_layerwise_gathered_params(bucket, local_rank)
                     bucket.layerwise_gather_list = None
                     # Zero out grad_data since it was reused as the all-gather
                     # receive buffer. Without this, accumulation into main_grad
@@ -643,18 +660,9 @@ class _ParamAndGradBucketGroup:
                     if bucket.layerwise_gather_list is None:
                         continue
                     # Unflatten and copy gathered params for each rank.
-                    for idx, params in enumerate(bucket.layerwise_params_list):
-                        # Skip local params and empty tensors.
-                        if (
-                            len(params) == 0
-                            or idx == self.intra_distributed_optimizer_instance_rank
-                        ):
-                            continue
-                        updated_params = _unflatten_dense_tensors(
-                            bucket.layerwise_gather_list[idx], params
-                        )
-                        for updated_p, model_p in zip(updated_params, params):
-                            model_p.data.copy_(updated_p)
+                    _copy_layerwise_gathered_params(
+                        bucket, self.intra_distributed_optimizer_instance_rank
+                    )
                     bucket.layerwise_gather_list = None
                     # Zero out grad_data since it was reused as the all-gather
                     # receive buffer. Without this, accumulation into main_grad
