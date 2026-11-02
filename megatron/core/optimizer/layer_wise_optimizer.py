@@ -741,11 +741,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     # one fp32 full-size momentum. Reject subclasses such as AdaptiveMuon rather
                     # than silently underestimating their tensor-state window.
                     raw_optimizer = optimizer.optimizer
+                    if not isinstance(raw_optimizer, TensorParallelMuon):
+                        # The scalar-optimizer child that holds the non-Muon parameter groups
+                        # when no full param layout routes them to a sibling DistributedOptimizer
+                        # (--no-use-layer-wise-param-layout). It is small (embeddings, norms,
+                        # scalars) and keeps its state on the GPU.
+                        continue
                     assert type(raw_optimizer) is TensorParallelMuon, (
                         "LayerWise chunked optimizer state offload currently supports exactly "
                         "TensorParallelMuon with one fp32 full-size momentum tensor; got "
-                        f"{type(raw_optimizer).__name__}. Only Muon-managed parameter groups may "
-                        "be LayerWise optimizer children"
+                        f"{type(raw_optimizer).__name__}"
                     )
                     # Whole-parameter sharding can leave this rank with an optimizer object but
                     # no locally owned Muon parameters. Preserve the no-offloader path for it.

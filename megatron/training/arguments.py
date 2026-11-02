@@ -1731,14 +1731,12 @@ def validate_args(args, defaults={}):
         ):
             assert args.use_layer_wise_distributed_optimizer, (
                 "Muon optimizer state offload requires the LayerWise distributed optimizer "
-                "(--use-distributed-optimizer) so non-Muon parameter groups are routed through "
-                "a sibling DistributedOptimizer"
+                "(--use-distributed-optimizer)"
             )
-            assert args.use_layer_wise_param_layout, (
-                "Muon optimizer state offload requires the precomputed LayerWise param layout: "
-                "--no-use-layer-wise-param-layout keeps non-Muon parameter groups inside the "
-                "LayerWise optimizer, and only TensorParallelMuon children can be offloaded"
-            )
+            # With --no-use-layer-wise-param-layout the non-Muon parameter groups stay inside
+            # the LayerWise optimizer as a scalar-optimizer child; only the TensorParallelMuon
+            # child is offloaded and the scalar child's state stays on the GPU (see
+            # LayerWiseDistributedOptimizer.__init__).
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
