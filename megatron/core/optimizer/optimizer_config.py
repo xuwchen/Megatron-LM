@@ -521,12 +521,9 @@ class OptimizerConfig:
                     self.use_layer_wise_distributed_optimizer
                 ), "Muon optimizer state offload requires LayerWiseDistributedOptimizer"
                 assert self.bf16, "Muon optimizer state offload currently requires bf16"
-                assert self.use_layer_wise_param_layout, (
-                    "Muon optimizer state offload requires the precomputed LayerWise param layout "
-                    "(the default; do not pass --no-use-layer-wise-param-layout): the legacy "
-                    "ping-pong layout keeps non-Muon parameter groups inside the LayerWise "
-                    "optimizer, and only TensorParallelMuon children can be offloaded"
-                )
+                # Both LayerWise layouts are supported: with the precomputed layout the non-Muon
+                # groups live in a sibling DistributedOptimizer; without it they stay in the
+                # LayerWise optimizer as a scalar-optimizer child, which is simply not offloaded.
             else:
                 assert not self.use_layer_wise_distributed_optimizer, (
                     "Adam optimizer state offload does not support " "LayerWiseDistributedOptimizer"
