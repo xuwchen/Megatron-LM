@@ -737,15 +737,35 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for optimizer in optimizers:
                     if optimizer.optimizer is None:
                         continue
+                    raw_optimizer = optimizer.optimizer
+                    if not isinstance(raw_optimizer, TensorParallelMuon):
+                        # The scalar-optimizer child that holds the non-Muon parameter groups
+                        # when no full param layout routes them to a sibling DistributedOptimizer
+                        # (--no-use-layer-wise-param-layout): embeddings, output layer, norms,
+                        # scalars. It is not offloaded, so the configured offload fraction
+                        # covers the Muon state only; say how much stays resident.
+                        resident_numel = sum(
+                            param.numel()
+                            for group in raw_optimizer.param_groups
+                            for param in group["params"]
+                        )
+                        if resident_numel:
+                            log_single_rank(
+                                logger,
+                                logging.INFO,
+                                "LayerWise chunked optimizer state offload: the "
+                                f"{type(raw_optimizer).__name__} child ({resident_numel:,} "
+                                "parameter elements on this rank) is not offloaded; its "
+                                "optimizer state and fp32 masters stay on the GPU.",
+                            )
+                        continue
                     # The chunk planner assumes exactly the state schema of TensorParallelMuon:
                     # one fp32 full-size momentum. Reject subclasses such as AdaptiveMuon rather
                     # than silently underestimating their tensor-state window.
-                    raw_optimizer = optimizer.optimizer
                     assert type(raw_optimizer) is TensorParallelMuon, (
                         "LayerWise chunked optimizer state offload currently supports exactly "
                         "TensorParallelMuon with one fp32 full-size momentum tensor; got "
-                        f"{type(raw_optimizer).__name__}. Only Muon-managed parameter groups may "
-                        "be LayerWise optimizer children"
+                        f"{type(raw_optimizer).__name__}"
                     )
                     # Whole-parameter sharding can leave this rank with an optimizer object but
                     # no locally owned Muon parameters. Preserve the no-offloader path for it.
