@@ -958,6 +958,16 @@ class TransformerConfig(ModelParallelConfig):
     use_grouped_gemm_for_shared_expert is set.
     Requires BF16 or FP16 model parameters when GLU is enabled.
     """
+
+    moe_glu_interleave_with_gtp_sharding: bool = False
+    """Allow GLU interleave on FC1 weights that GTP shards along their output dimension
+    (expert_gtp_weight_remat_size > 1 for routed experts, gtp_weight_remat_size > 1 for grouped
+    shared experts). The runtime needs nothing else: interleaving is a fixed row permutation of
+    the whole FC1 weight and the GTP all-gather restores that whole weight before the GEMM. What
+    stays unsupported is the contiguous <-> interleaved checkpoint layout conversion of
+    GTP-sharded rows, so saving or loading model weights raises with this option set. Use it for
+    training runs that neither save nor load checkpoints.
+    """
     moe_shortcut_connection: bool = False
     """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
     process the preceding layer's output (via a shortcut connection) instead of the current layer's
@@ -3965,19 +3975,26 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "GLU interleave is not supported with FP32 model parameters. Use BF16 or FP16."
             )
-        if self.gated_linear_unit and self.moe_mlp_glu_interleave_size is not None:
+        if (
+            self.gated_linear_unit
+            and self.moe_mlp_glu_interleave_size is not None
+            and not self.moe_glu_interleave_with_gtp_sharding
+        ):
             assert self.expert_gtp_weight_remat_size == 1, (
                 "Routed expert GLU interleave is not supported with GTP weight sharding. "
-                "Disable routed expert GLU interleave or expert GTP weight sharding."
+                "Disable routed expert GLU interleave or expert GTP weight sharding, or set "
+                "moe_glu_interleave_with_gtp_sharding for runs without checkpoints."
             )
         if (
             self.gated_linear_unit
             and self.use_grouped_gemm_for_shared_expert
             and self.moe_shared_expert_glu_interleave_size is not None
+            and not self.moe_glu_interleave_with_gtp_sharding
         ):
             assert self.gtp_weight_remat_size == 1, (
                 "Shared expert GLU interleave is not supported with GTP weight sharding. "
-                "Disable shared expert GLU interleave or GTP weight sharding."
+                "Disable shared expert GLU interleave or GTP weight sharding, or set "
+                "moe_glu_interleave_with_gtp_sharding for runs without checkpoints."
             )
 
         if self.bias_activation_fusion:
