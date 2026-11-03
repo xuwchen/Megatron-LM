@@ -24,6 +24,7 @@ from megatron.core.optimizer.cpu_offloading.chunked_optimizer_state_offload impo
     ChunkedOptimizerStateOffloader,
     _PinnedHostArena,
 )
+from megatron.core.optimizer.optimizer import offload_chunk_partition_key
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import parse_args, validate_args
@@ -480,6 +481,96 @@ def test_oversized_atomic_state_chunks_log_once():
     assert oversized_count == 2
     assert largest_mib == pytest.approx(400_000 * torch.float32.itemsize / 1024**2)
     assert optimizer_name == "SimpleNamespace"
+
+
+def _chunk_planner(chunk_size_bytes, partition_key=None):
+    """A ChunkedOptimizerStateOffloader with only the byte-planning state populated."""
+
+    manager = object.__new__(ChunkedOptimizerStateOffloader)
+    manager.chunk_size_bytes = chunk_size_bytes
+    manager._state_bytes_per_param = 1
+    manager._chunk_partition_key = partition_key
+    manager.optimizer = SimpleNamespace()
+    return manager
+
+
+def _tagged_params(spec):
+    """Parameters from ``[(numel, expert_tp), ...]``; ``expert_tp`` is the MCore expert tag."""
+
+    params = []
+    for numel, expert_tp in spec:
+        param = nn.Parameter(torch.empty(numel))
+        param.expert_tp = expert_tp
+        params.append(param)
+    return tuple(params)
+
+
+def _chunk_shapes(chunks):
+    return [tuple(param.numel() for param in chunk.params) for chunk in chunks]
+
+
+def test_chunk_partition_key_gives_every_partition_its_own_chunks():
+    """Ranks with different dense bytes must pack the (shared) expert parameters identically.
+
+    The duplicated-GTP Muon step batches the parameters of one chunk and issues one all-gather
+    per batch over the expert GTP remat group, whose ranks own different dense parameters. Two
+    such ranks are modelled here: a dense prefix of 150 or 30 bytes before the same four expert
+    weights, with 200-byte chunks. Byte packing alone splits the experts as (3, 1) on one rank
+    and (2, 2) on the other; with the partition key both ranks produce the same expert chunks.
+    """
+
+    experts = [(60, True)] * 4
+    rank_a = _tagged_params([(100, False), (50, False)] + experts)
+    rank_b = _tagged_params([(30, False)] + experts)
+
+    plain = [_chunk_shapes(_chunk_planner(200)._build_chunks(p)) for p in (rank_a, rank_b)]
+    assert plain == [[(100, 50), (60, 60, 60), (60,)], [(30, 60, 60), (60, 60)]]
+
+    keyed = [
+        _chunk_shapes(_chunk_planner(200, offload_chunk_partition_key)._build_chunks(p))
+        for p in (rank_a, rank_b)
+    ]
+    assert keyed == [[(100, 50), (60, 60, 60), (60,)], [(30,), (60, 60, 60), (60,)]]
+    assert keyed[0][1:] == keyed[1][1:]
+
+
+def test_chunk_partition_key_separates_a_dense_run_that_follows_the_experts():
+    """A boundary falls at every key change, not only at the first one."""
+
+    params = _tagged_params([(10, False), (10, True), (10, True), (10, False), (10, False)])
+    chunks = _chunk_planner(100, offload_chunk_partition_key)._build_chunks(params)
+    assert _chunk_shapes(chunks) == [(10,), (10, 10), (10, 10)]
+    assert [tuple(p.expert_tp for p in c.params) for c in chunks] == [
+        (False,),
+        (True, True),
+        (False, False),
+    ]
+
+
+def test_partial_offload_selection_stops_only_between_partition_runs():
+    """A byte budget must not cut a run of equal keys at a rank-dependent position."""
+
+    params = _tagged_params([(100, False), (60, True), (60, True), (60, True), (20, False)])
+    manager = _chunk_planner(0, offload_chunk_partition_key)
+    manager._params = params
+    manager.offload_fraction = 0.5  # 150 of 300 bytes: lands inside the expert run
+    manager._explicit_master_param_ids = set()
+    manager._optimizer_owned_master_dtypes = {}
+
+    selected = manager._select_params_for_offload()
+    assert tuple(p.numel() for p in selected) == (100, 60, 60, 60)
+
+    manager._chunk_partition_key = None
+    selected = manager._select_params_for_offload()
+    assert tuple(p.numel() for p in selected) == (100, 60)
+
+
+def test_mcore_offload_chunk_partition_key_is_the_expert_tp_tag():
+    dense = nn.Parameter(torch.empty(1))
+    expert = nn.Parameter(torch.empty(1))
+    expert.expert_tp = True
+    assert offload_chunk_partition_key(dense) is False
+    assert offload_chunk_partition_key(expert) is True
 
 
 def test_h2d_targets_record_the_transfer_stream():

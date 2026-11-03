@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from packaging.version import Version
 
+import megatron.core.optimizer.emerging_optimizers as eo_mod
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -343,6 +345,191 @@ def test_muon_optimizer_gtp_remat_pad_length_scale_correction(monkeypatch, tp_mo
     torch.testing.assert_close(result, expected)
 
 
+def _fake_two_rank_gtp(monkeypatch, gtp_rank):
+    """A 2-rank GTP_remat group faked in one process: the peer's shard is derived from the
+    local one, so both the batched and the per-parameter path see the same gathered data."""
+    from types import SimpleNamespace
+
+    gtp_group = object()
+    pg_collection = SimpleNamespace(
+        gtp_remat=gtp_group, expt_gtp_remat=gtp_group, tp=None, expt_tp=None
+    )
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda g: 2)
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda g: gtp_rank
+    )
+    gathers = []
+
+    def fake_all_gather(shards, local, _group):
+        gathers.append(tuple(local.shape))
+        shards[gtp_rank].copy_(local)
+        # Roll along the last dim so a stacked [batch, rows, cols] gather derives the same
+        # peer shard as the per-weight [rows, cols] one.
+        shards[1 - gtp_rank].copy_(torch.roll(local, 1, dims=-1) * 0.5)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+
+    # The batch-plan guard's hash exchange: the faked peer formed the same plan.
+    def fake_plan_hash(self, gathered, local, _group):
+        gathered.fill_(local.item())
+
+    monkeypatch.setattr(TensorParallelMuon, "_all_gather_plan_hash", fake_plan_hash)
+    return pg_collection, gathers
+
+
+def _gtp_param(rows, cols, seed, pad_length=0, gtp=True):
+    g = torch.Generator().manual_seed(seed)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    p = torch.nn.Parameter(torch.randn(rows, cols, generator=g).to(device))
+    p.grad = torch.randn(rows, cols, generator=g).to(device)
+    if gtp:
+        p.is_gtp_weight_remat = True
+        p.pad_length = pad_length
+    return p
+
+
+@pytest.mark.parametrize("gtp_rank", [0, 1])
+@pytest.mark.parametrize("nesterov", [True, False])
+def test_muon_batched_duplicated_gtp_step_matches_per_param_step(monkeypatch, gtp_rank, nesterov):
+    """ns_batch_size > 1 stacks same-shape duplicated-GTP weights into one batched
+    Newton-Schulz with one all-gather per batch; the update must equal the per-parameter path
+    (same gathers, same padding handling, same scale), and weights that are not eligible
+    (no GTP sharding, other shape) must still be updated through the plain path."""
+    pg_collection, gathers = _fake_two_rank_gtp(monkeypatch, gtp_rank)
+
+    def make_params():
+        # 5 same-shape GTP weights (pad 2 rows), 1 GTP weight of another shape, 1 plain weight.
+        return (
+            [_gtp_param(6, 5, seed=i, pad_length=2) for i in range(5)]
+            + [_gtp_param(4, 7, seed=10, pad_length=0)]
+            + [_gtp_param(6, 5, seed=11, gtp=False)]
+        )
+
+    kwargs = dict(
+        lr=0.1,
+        momentum=0.9,
+        nesterov=nesterov,
+        weight_decay=0.01,
+        num_ns_steps=3,
+        fp32_matmul_prec="highest",
+        pg_collection=pg_collection,
+        tp_mode="duplicated",
+    )
+    ref_params = make_params()
+    ref = TensorParallelMuon(ref_params, ns_batch_size=1, **kwargs)
+    batched_params = make_params()
+    batched = TensorParallelMuon(batched_params, ns_batch_size=3, **kwargs)
+
+    import megatron.core.optimizer.emerging_optimizers as eo_mod
+
+    ns_calls = []
+    real_newton_schulz = eo_mod.newton_schulz
+
+    def counting_newton_schulz(x, *args, **kw):
+        ns_calls.append(tuple(x.shape))
+        return real_newton_schulz(x, *args, **kw)
+
+    monkeypatch.setattr(eo_mod, "newton_schulz", counting_newton_schulz)
+
+    for _ in range(2):  # two steps: the momentum state must evolve identically too
+        gathers.clear()
+        ref.step()
+        ref_gathers = list(gathers)
+        gathers.clear()
+        ns_calls.clear()
+        batched.step()
+        # The per-parameter path gathers each GTP weight on its own; the batched path stacks
+        # a batch into one [batch, rows, cols] gather. Same weights, same shapes, fewer calls.
+        assert all(len(shape) == 2 for shape in ref_gathers)
+        assert all(len(shape) == 3 for shape in gathers)
+        assert sorted(shape[1:] for shape in gathers for _ in range(shape[0])) == sorted(
+            ref_gathers
+        )
+        assert len(gathers) == 3  # [3, 6, 5], [2, 6, 5] and [1, 4, 7]
+        for p_ref, p_batched in zip(ref_params, batched_params):
+            p_batched.grad = p_ref.grad = torch.randn_like(p_ref) * 0.1
+
+    # 5 same-shape weights in batches of 3 -> [3, 10, 5] and [2, 10, 5] (12 rows, 2 pad rows
+    # stripped); the other GTP shape is a batch of one, still 3-D. The plain weight went
+    # through newton_schulz_tp and is not in this list.
+    assert sorted(ns_calls) == [(1, 8, 7), (2, 10, 5), (3, 10, 5)]
+    assert batched.gtp_batch_counts == (6, 12)
+    assert ref.gtp_batch_counts == (0, 0)
+    for p_ref, p_batched in zip(ref_params, batched_params):
+        torch.testing.assert_close(p_batched, p_ref, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            batched.state[p_batched]["momentum_buffer"], ref.state[p_ref]["momentum_buffer"]
+        )
+
+
+def test_muon_batched_duplicated_gtp_step_respects_byte_cap(monkeypatch):
+    """ns_batch_max_mb bounds the stacked gathered bytes: a cap below two gathered matrices
+    degrades every batch to one matrix (still the batched code path, 3-D with batch 1)."""
+    pg_collection, _ = _fake_two_rank_gtp(monkeypatch, gtp_rank=0)
+    params = [_gtp_param(64, 64, seed=i) for i in range(4)]  # 2 x 64 x 64 x 4 B = 32 KiB each
+    import megatron.core.optimizer.emerging_optimizers as eo_mod
+
+    ns_shapes = []
+    real_newton_schulz = eo_mod.newton_schulz
+    monkeypatch.setattr(
+        eo_mod,
+        "newton_schulz",
+        lambda x, *a, **kw: (ns_shapes.append(tuple(x.shape)), real_newton_schulz(x, *a, **kw))[1],
+    )
+    optimizer = TensorParallelMuon(
+        params, num_ns_steps=1, pg_collection=pg_collection, ns_batch_size=4, ns_batch_max_mb=1
+    )
+    optimizer.ns_batch_max_bytes = 40 * 1024  # between one and two gathered matrices
+    optimizer.step()
+    assert ns_shapes == [(1, 128, 64)] * 4
+    assert optimizer.gtp_batch_counts == (4, 4)
+
+
+def test_muon_batched_gtp_step_detects_mismatched_batch_plans(monkeypatch):
+    """Every batch is one collective over the GTP remat group, so a peer that formed other
+    batches (e.g. a chunked offload that split the parameters differently on its rank) must
+    be reported: NCCL would otherwise misalign the gathers silently. The hash exchange is
+    checked lazily, so the mismatch surfaces on the next step() or on an explicit verify."""
+    pg_collection, _ = _fake_two_rank_gtp(monkeypatch, gtp_rank=0)
+
+    def peer_with_another_plan(self, gathered, local, _group):
+        gathered.fill_(local.item())
+        gathered[1] = local.item() ^ 1
+
+    monkeypatch.setattr(TensorParallelMuon, "_all_gather_plan_hash", peer_with_another_plan)
+    params = [_gtp_param(8, 4, seed=i) for i in range(4)]
+    optimizer = TensorParallelMuon(
+        params, num_ns_steps=1, pg_collection=pg_collection, ns_batch_size=2
+    )
+    optimizer.step()  # the exchange is queued; the batches still run
+    assert optimizer.gtp_batch_counts == (2, 4)
+    with pytest.raises(RuntimeError, match="did not form the same batches"):
+        optimizer.step()
+    # An explicit verification reports the same thing and clears nothing on failure.
+    with pytest.raises(RuntimeError, match="group ranks with another plan: \\[1\\]"):
+        optimizer.verify_gtp_batch_plans()
+
+
+def test_muon_batched_gtp_step_plan_hash_is_order_and_size_sensitive():
+    h = TensorParallelMuon._gtp_batch_plan_hash
+    a = [(8, 4, 0, "torch.float32", 2), (8, 4, 0, "torch.float32", 2)]
+    assert h(a) == h(list(a))
+    assert h(a) != h(a[:1])
+    assert h(a) != h([(8, 4, 0, "torch.float32", 1), (8, 4, 0, "torch.float32", 3)])
+    assert h([(8, 4, 0, "torch.float32", 1), (6, 4, 0, "torch.float32", 1)]) != h(
+        [(6, 4, 0, "torch.float32", 1), (8, 4, 0, "torch.float32", 1)]
+    )
+    assert -(2**63) <= h(a) < 2**63
+
+
+def test_muon_ns_batch_size_rejects_invalid_values():
+    p = _gtp_param(4, 4, seed=0, gtp=False)
+    with pytest.raises(ValueError, match="ns_batch_size"):
+        TensorParallelMuon([p], ns_batch_size=0)
+    with pytest.raises(ValueError, match="ns_batch_max_mb"):
+        TensorParallelMuon([p], ns_batch_size=2, ns_batch_max_mb=0)
+
+
 @pytest.mark.parametrize("scale_mode", ["spectral", "unit_rms_norm", "shape_scaling"])
 def test_muon_optimizer_gtp_distributed_padding_uses_logical_scale_shape(monkeypatch, scale_mode):
     """Distributed NS keeps aligned rows, but Muon scaling uses the logical matrix shape."""
@@ -602,12 +789,16 @@ def _dispatch_cfg(layer_sharded: bool) -> OptimizerConfig:
 
 
 def test_shared_muon_kwargs_ignore_layer_sharding_flag():
-    """The shared builder must stay pure even with the lsh flag set."""
+    """The shared builder must stay pure even with the lsh flag set.
+
+    ``ns_batch_size`` / ``ns_batch_max_mb`` are deliberately absent from the list: since the
+    batched duplicated-GTP step they are ``TensorParallelMuon`` kwargs shared by every mode."""
     kwargs = eo_mod._muon_config_to_kwargs(
         _dispatch_cfg(True), [_DispatchChunk()], pg_collection=None
     )
-    for lsh_only in ("gtp_remat_group", "tp_group", "ns_batch_size", "concurrent_groups"):
+    for lsh_only in ("gtp_remat_group", "tp_group", "concurrent_groups"):
         assert lsh_only not in kwargs, f"LayerShardedMuon-only kwarg leaked: {lsh_only}"
+    assert kwargs["ns_batch_size"] == 1 and kwargs["ns_batch_max_mb"] == 2048
     assert "is_qkv_fn" in kwargs
     assert "qkv_split_shapes" in kwargs
     assert "pg_collection" in kwargs
