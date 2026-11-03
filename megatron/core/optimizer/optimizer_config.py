@@ -317,16 +317,26 @@ class OptimizerConfig:
     """Additional scale factor for the muon update."""
 
     muon_ns_batch_size: int = 1
-    """Max number of same-shape matrices fused into one batched Newton-Schulz under
-    muon_tp_mode='layer_sharded', on each NS home or in a single-rank (GTP_remat x TP)
-    domain. MoE gives such a rank hundreds of identically shaped expert weights, where
-    the per-matrix loop is kernel-launch bound; batching trades transient memory for
-    fewer launches. Local NS inputs and updates are consumed one batch at a time. The
-    value is an upper bound per same-shape bucket, so a value above the matrix count
-    adds no memory. Batches of more than one use baddbmm instead of addmm and differ
-    from the per-matrix path by kernel-level rounding, so bitwise parity with duplicated
-    mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
-    emerging-optimizers >= 0.3.0."""
+    """Max number of same-shape matrices fused into one batched Newton-Schulz. Under
+    muon_tp_mode='layer_sharded' MoE assigns hundreds of identically shaped expert weights
+    to a single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
+    transient stack of this many matrices for far fewer launches. Under
+    muon_tp_mode='duplicated' with GTP, same-shape GTP-sharded weights whose gathered matrix
+    carries no TP sharding are likewise stacked: the batch's GTP shards are all-gathered
+    with one collective instead of one per weight, and the per-matrix Newton-Schulz becomes
+    one batched call (bounded by muon_ns_batch_max_mb). The value is
+    an upper bound per same-shape bucket, so oversizing it is harmless. Batches of more than
+    one use baddbmm instead of addmm and differ from the per-matrix path by kernel-level
+    rounding, so bitwise parity with the unbatched step is lost; the default of 1 keeps the
+    bit-exact path. Values > 1 require emerging-optimizers >= 0.3.0."""
+
+    muon_ns_batch_max_mb: int = 2048
+    """Upper bound, in MiB, on the gathered fp32 momentum one batched Newton-Schulz of the
+    duplicated-GTP path stacks (muon_ns_batch_size matrices at most). It caps the transient
+    memory of the batch: the stacked shards, the (rank-major) gather buffer and its
+    per-weight reordering, the result, and the bf16 Newton-Schulz working set. Only
+    used when muon_ns_batch_size > 1 under
+    muon_tp_mode='duplicated'. Defaults to 2048."""
 
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
