@@ -754,7 +754,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 config.chunked_optimizer_state_offload
                 and config.optimizer_state_offload_fraction > 0.0
             ):
-                from .emerging_optimizers import TensorParallelMuon
+                from .emerging_optimizers import TensorParallelMuon, offload_chunk_partition_key
 
                 offload_children = []
                 state_dtypes = (torch.float32,)
@@ -805,8 +805,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     f"TensorParallelMuon child; got {len(offload_children)}"
                 )
                 for optimizer, master_params in offload_children:
+                    # Expert weights get state chunks of their own: the batched Muon step
+                    # issues one collective per batch, and every rank of an expert GTP remat
+                    # group must form the same batches (see offload_chunk_partition_key).
                     optimizer.enable_chunked_optimizer_state_offload(
-                        master_params=master_params, state_dtypes=state_dtypes
+                        master_params=master_params,
+                        state_dtypes=state_dtypes,
+                        chunk_partition_key=offload_chunk_partition_key,
                     )
                     # The fp8 / MXFP8 LayerWise gather stages from fp32 main_param. With
                     # overlap enabled, force that gather at the next iteration boundary before
