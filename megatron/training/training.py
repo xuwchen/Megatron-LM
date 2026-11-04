@@ -1330,6 +1330,7 @@ def num_floating_point_operations(
                      kda_num_qk_heads=16, kda_num_v_heads=16,
                      kda_conv_kernel_dim=4, kda_f_lora_rank=None, kda_gate_lora_rank=None,
                      enable_attention_residuals=False, attn_res_block_layers=None,
+                     attention_output_gate=False,
                      vocab_size=256000, mtp_num_layers=0):
         """Calculate total training FLOPs for the hybrid model, including DSA."""
         attn_res_flops_total = 0
@@ -1378,12 +1379,14 @@ def num_floating_point_operations(
                 num_dsa_layers * dsa_attention_flops +
                 num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
                                                    hidden_size, num_attn_heads, gqa,
-                                                   gqa_groups, kv_channels) +
+                                                   gqa_groups, kv_channels,
+                                                   attention_output_gate=attention_output_gate) +
                 num_mla_layers * mla_attn_layer_flops(total_tokens, seqlen_squared_sum,
                                                       hidden_size, num_attn_heads,
                                                       args.q_lora_rank, args.kv_lora_rank,
                                                       args.qk_head_dim, args.qk_pos_emb_head_dim,
-                                                      args.v_head_dim) +
+                                                      args.v_head_dim,
+                                                      attention_output_gate=attention_output_gate) +
                 num_kda_layers * kda_layer_flops(total_tokens, hidden_size,
                                                  kda_qk_head_dim, kda_v_head_dim,
                                                  kda_num_qk_heads, kda_num_v_heads,
@@ -1880,8 +1883,16 @@ def num_floating_point_operations(
             gdn_num_v_heads=args.linear_num_value_heads or 32,
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
+            kda_qk_head_dim=args.linear_key_head_dim or 128,
+            kda_v_head_dim=args.linear_value_head_dim or 128,
+            kda_num_qk_heads=args.linear_num_key_heads or 16,
+            kda_num_v_heads=args.linear_num_value_heads or 16,
+            kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             kda_f_lora_rank=getattr(args, "kda_f_lora_rank", None),
             kda_gate_lora_rank=getattr(args, "kda_gate_lora_rank", None),
+            enable_attention_residuals=getattr(args, "enable_attention_residuals", False),
+            attn_res_block_layers=getattr(args, "attn_res_block_layers", None),
+            attention_output_gate=getattr(args, "attention_output_gate", False),
             vocab_size=cfg.tokenizer.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
         ))
