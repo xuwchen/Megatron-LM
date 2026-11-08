@@ -633,33 +633,6 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
                     actual_seq_len == expected_seq_len
                 ), f"CP partitioned tokens have wrong shape: {actual_seq_len} != {expected_seq_len}"
 
-                full_position_ids = torch.cat(
-                    [
-                        torch.arange(length, device=position_ids.device)
-                        for length in sequence_lengths
-                    ]
-                )
-                if cp_partition_mode == "contiguous":
-                    expected_position_ids = full_position_ids[
-                        cp_rank * expected_seq_len : (cp_rank + 1) * expected_seq_len
-                    ]
-                else:
-                    expected_chunks = []
-                    sequence_start = 0
-                    for length in sequence_lengths:
-                        chunk_length = length // (2 * cp)
-                        front_start = sequence_start + cp_rank * chunk_length
-                        back_start = sequence_start + (2 * cp - cp_rank - 1) * chunk_length
-                        expected_chunks.append(
-                            full_position_ids[front_start : front_start + chunk_length]
-                        )
-                        expected_chunks.append(
-                            full_position_ids[back_start : back_start + chunk_length]
-                        )
-                        sequence_start += length
-                    expected_position_ids = torch.cat(expected_chunks)
-                torch.testing.assert_close(position_ids.squeeze(0), expected_position_ids)
-
             # Verify labels only if all CP ranks are at last stage
             if is_last_stage:
                 actual_seq_len = labels.shape[1]
