@@ -308,7 +308,10 @@ class OptimizerConfig:
     stages scatter the result back to the original shards. layer_sharded requires
     optimizer='muon', the layer-wise distributed optimizer path and muon_split_qkv=False
     (split-QKV Newton-Schulz is not implemented on the layer-sharded path); __post_init__
-    checks all three. Defaults to "duplicated"."""
+    checks all three. Works with chunked_optimizer_state_offload: the optimizer is then
+    stepped once per state chunk, each chunk's weights are routed to NS homes balanced
+    within that chunk, and the exchange buffers are bounded by the chunk size. Defaults to
+    "duplicated"."""
 
     muon_use_syrk: bool = False
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
