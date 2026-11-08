@@ -149,3 +149,69 @@ class TestGTPParallelLayout:
         )
         assert config.gtp_remat_num_sequence_shards == 1
         assert config.context_parallel_size == 2
+
+
+class TestPackingSchedulerSlot:
+    """The packing scheduler's DP x CP slot must follow the runtime CP group."""
+
+    @staticmethod
+    def _group(ranks, rank):
+        return SimpleNamespace(size=lambda: len(ranks), rank=lambda: ranks.index(rank))
+
+    @pytest.mark.parametrize(
+        "world,tp,cp,weight,shards",
+        [
+            (8, 1, 1, 4, 4),  # 2-node proxy: all GTP ranks share one sequence
+            (256, 1, 1, 64, 8),  # 128K target: 8 sequence shards x 8 batch shards per group
+            (8, 1, 1, 4, 2),  # batch shards without configured CP
+            (16, 1, 2, 4, 2),  # configured CP 2 x batch shards 2: DPxCP is not CP-fastest
+        ],
+    )
+    def test_slot_from_dp_and_cp_ranks_follows_runtime_cp_group(
+        self, world, tp, cp, weight, shards
+    ):
+        from megatron.core.datasets.data_schedule_utils import get_scheduler_dp_cp_rank
+
+        layout = GTPParallelLayout(world, tp, 1, cp, weight, num_sequence_shards=shards)
+        data = layout.data
+        cp_groups = data.get_ranks("cp")
+        cp_by_rank = _by_rank(cp_groups)
+        dp_by_rank = _by_rank(data.get_ranks("gtp_remat-dp"))
+        dp_cp_by_rank = _by_rank(data.get_ranks("gtp_remat-dp-cp"))
+        cp_size = cp * shards
+        assert all(len(group) == cp_size for group in cp_groups)
+
+        def slot(rank):
+            return get_scheduler_dp_cp_rank(
+                self._group(dp_by_rank[rank], rank),
+                self._group(cp_by_rank[rank], rank),
+                self._group(dp_cp_by_rank[rank], rank),
+            )
+
+        for dp_cp_ranks in data.get_ranks("gtp_remat-dp-cp"):
+            slots = {rank: slot(rank) for rank in dp_cp_ranks}
+            # Slots tile the DPxCP grid exactly once.
+            assert sorted(slots.values()) == list(range(len(dp_cp_ranks)))
+            # Every runtime CP group owns the cp_size consecutive slots of one packed sequence.
+            for cp_ranks in cp_groups:
+                if cp_ranks[0] not in slots:
+                    continue
+                sequence_ids = {slots[rank] // cp_size for rank in cp_ranks}
+                assert len(sequence_ids) == 1
+                assert sorted(slots[rank] % cp_size for rank in cp_ranks) == list(range(cp_size))
+
+        # The positional dp_cp_group.rank() only agrees when the DPxCP group enumerates the
+        # runtime CP group contiguously, i.e. when the configured CP is 1 or there is a single
+        # batch shard. This is the case the explicit slot exists for.
+        positional_matches = all(
+            dp_cp_ranks[k : k + cp_size] in cp_groups
+            for dp_cp_ranks in data.get_ranks("gtp_remat-dp-cp")
+            for k in range(0, len(dp_cp_ranks), cp_size)
+        )
+        assert positional_matches == (cp == 1 or weight // shards == 1)
+
+    def test_slot_falls_back_to_positional_rank_without_cp_group(self):
+        from megatron.core.datasets.data_schedule_utils import get_scheduler_dp_cp_rank
+
+        dp_cp_group = self._group([0, 1, 2, 3], 3)
+        assert get_scheduler_dp_cp_rank(self._group([0, 2], 2), None, dp_cp_group) == 3

@@ -437,6 +437,33 @@ def create_data_iterator(
     return new_data_iterator
 
 
+def get_scheduler_dp_cp_rank(dp_group, cp_group, dp_cp_group=None) -> int:
+    """Return this rank's slot in the scheduler's DP x CP sample grid.
+
+    The packing schedulers lay out ``sample_id_groups[i]`` DP-major and CP-minor:
+    slot ``j`` holds the packed sequence ``j // cp_size`` and the ``cp_size``
+    consecutive slots of one sequence belong to the ranks of one runtime CP
+    group. Deriving the slot from the real ``dp_group`` and ``cp_group`` ranks
+    keeps that contract for every rank layout; ``dp_cp_group.rank()`` only
+    matches it when the DPxCP group happens to enumerate CP fastest, which GTP
+    sequence sharding with batch shards and a configured CP > 1 does not.
+
+    ``cp_group`` may be ``None`` for callers that still pass only ``dp_cp_group``;
+    the positional rank is then used unchanged.
+    """
+    if cp_group is None:
+        assert dp_cp_group is not None, "cp_group or dp_cp_group is required"
+        return dp_cp_group.rank()
+    cp_size = cp_group.size()
+    slot = dp_group.rank() * cp_size + cp_group.rank()
+    if dp_cp_group is not None:
+        assert slot < dp_cp_group.size(), (
+            f"DP rank {dp_group.rank()} x CP size {cp_size} + CP rank {cp_group.rank()} "
+            f"exceeds the DPxCP group size {dp_cp_group.size()}"
+        )
+    return slot
+
+
 def reroute_samples_to_dcp_ranks(
     batch,
     global_ids_this_rank,
@@ -446,6 +473,7 @@ def reroute_samples_to_dcp_ranks(
     dp_group,
     dp_cp_group,
     sample_keys=None,
+    cp_group=None,
 ):
     """
     Reroutes the sub-samples to the correct rank after scheduling.
@@ -461,9 +489,13 @@ def reroute_samples_to_dcp_ranks(
 
     This is intentionally a text-only contract. Multimodal fields are rejected
     until their per-token, per-sample, or per-media routing layout is defined.
+
+    ``cp_group`` selects this rank's DPxCP slot from its real DP and CP ranks
+    (see :func:`get_scheduler_dp_cp_rank`); without it the positional
+    ``dp_cp_group.rank()`` is used.
     """
 
-    dcp_rank = dp_cp_group.rank()
+    dcp_rank = get_scheduler_dp_cp_rank(dp_group, cp_group, dp_cp_group)
     dp_rank = dp_group.rank()
     dp_size = dp_group.size()
 

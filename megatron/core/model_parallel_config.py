@@ -701,8 +701,17 @@ class ModelParallelConfig:
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
 
-        if self.gtp_remat_num_sequence_shards > 1 and self.sequence_packing_scheduler is not None:
-            raise ValueError("GTP sequence sharding does not support sequence_packing_scheduler")
+        if (
+            self.gtp_remat_num_sequence_shards > 1
+            and self.sequence_packing_scheduler == 'default_dynamic_cp'
+        ):
+            # Dynamic CP builds its per-microbatch runtime groups from plain CP ranks; the
+            # static schedulers address ranks through the real DP and CP groups and work with
+            # GTP sequence shards (see get_scheduler_dp_cp_rank).
+            raise ValueError(
+                "GTP sequence sharding does not support "
+                "sequence_packing_scheduler='default_dynamic_cp'"
+            )
 
         if self.sequence_packing_scheduler is not None:
             supported_schedulers = ['dp_balanced', 'default_dynamic_cp']

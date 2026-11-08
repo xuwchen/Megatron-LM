@@ -942,3 +942,37 @@ def test_wrap_data_iterator_raises_stop_iteration_on_every_rank(tp):
     finally:
         Utils.destroy_model_parallel()
         unset_global_variables()
+
+
+def test_scheduler_reroute_slot_from_dp_and_cp_ranks(monkeypatch):
+    """With ``cp_group`` the kept samples follow the real DP x CP ranks, not the DPxCP position."""
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    dp_group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    # This rank is CP rank 1 of a two-rank runtime CP group, but position 0 of the DPxCP group:
+    # the layout GTP sequence shards produce with a configured CP > 1 and batch shards.
+    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
+    dp_cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+    batch = [
+        {
+            'tokens': torch.tensor([10, 11]),
+            'original_seq_len': torch.tensor([2], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([2], dtype=torch.int32),
+        },
+        {
+            'tokens': torch.tensor([20]),
+            'original_seq_len': torch.tensor([1], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([1], dtype=torch.int32),
+        },
+    ]
+    kwargs = dict(
+        batch=batch,
+        global_ids_this_rank=torch.tensor([0, 1]),
+        global_id_seqlens=[(0, 2), (1, 1)],
+        sample_id_groups=[[[0], [1]]],
+        offsets=torch.tensor([0, 2]),
+        dp_group=dp_group,
+        dp_cp_group=dp_cp_group,
+    )
+
+    assert list(reroute_samples_to_dcp_ranks(**kwargs, cp_group=cp_group)) == [1]
+    assert list(reroute_samples_to_dcp_ranks(**kwargs)) == [0]

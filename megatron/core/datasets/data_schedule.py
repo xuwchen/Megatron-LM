@@ -17,6 +17,7 @@ from megatron.core.datasets.data_schedule_utils import (
     get_batch_and_global_seqlens,
     get_packed_sequence_alignment,
     get_packed_sequence_length,
+    get_scheduler_dp_cp_rank,
     next_hdp_group_packing_aware,
     pad_packed_batch_before_cp_slice,
     reroute_samples_to_dcp_ranks,
@@ -124,6 +125,7 @@ class BasePackingScheduler:
         dp_cp_group,
         dev,
         config,
+        cp_group=None,
     ):
         """
         Run the scheduler and return the new data_iterator.
@@ -137,6 +139,10 @@ class BasePackingScheduler:
             dp_cp_group: Data parallel + context parallel process group.
             dev: CUDA device.
             config: Model parallel config.
+            cp_group: Runtime context parallel process group. With it, this rank's
+                DPxCP slot is ``dp_group.rank() * cp_size + cp_group.rank()``, which
+                holds for every rank layout (GTP sequence shards included); without
+                it the positional ``dp_cp_group.rank()`` is used.
 
         Returns:
             new_data_iterator: The new data iterator (or list for VPP).
@@ -234,6 +240,7 @@ class DpBalancedScheduler(BasePackingScheduler):
         dp_cp_group,
         dev: torch.device,
         config,
+        cp_group=None,
     ):
         """
         Run the complete scheduling pipeline.
@@ -253,6 +260,10 @@ class DpBalancedScheduler(BasePackingScheduler):
             dp_cp_group: Data parallel + context parallel process group.
             dev: CUDA device.
             config: Model parallel config.
+            cp_group: Runtime context parallel process group. With it, this rank's
+                DPxCP slot is ``dp_group.rank() * cp_size + cp_group.rank()``, which
+                holds for every rank layout (GTP sequence shards included); without
+                it the positional ``dp_cp_group.rank()`` is used.
 
         Returns:
             new_data_iterator: The new data iterator (or list for VPP).
@@ -360,9 +371,10 @@ class DpBalancedScheduler(BasePackingScheduler):
                 dp_group,
                 dp_cp_group,
                 sample_keys=keys_to_keep,
+                cp_group=cp_group,
             )
 
-            dcp_rank = dp_cp_group.rank()
+            dcp_rank = get_scheduler_dp_cp_rank(dp_group, cp_group, dp_cp_group)
             num_micro_batches = len(sample_id_groups)
 
             # Step 5: Build packed microbatches
@@ -556,7 +568,21 @@ def wrap_data_iterator(
         seqlen_sum_this_global_batch,
         seqlen_squared_sum_this_global_batch,
     ) = scheduler.run(
-        data_iterator, num_microbatches, dp_group, tp_group, pp_group, dp_cp_group, dev, config
+        data_iterator,
+        num_microbatches,
+        dp_group,
+        tp_group,
+        pp_group,
+        dp_cp_group,
+        dev,
+        config,
+        # Static schedulers address this rank's DPxCP slot through its real DP and CP ranks so
+        # the slot stays valid for every rank layout (GTP sequence shards split the DPxCP group
+        # CP-fastest only when the configured CP is 1). Dynamic CP keeps the positional slot: it
+        # derives each microbatch's runtime group from slot adjacency.
+        cp_group=(
+            None if scheduler_type == PackingSchedulerEnum.DEFAULT_DYNAMIC_CP else pg_collection.cp
+        ),
     )
 
     return (
