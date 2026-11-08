@@ -56,6 +56,23 @@ def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
     return True
 
 
+def _is_offloadable_muon(raw_optimizer) -> bool:
+    """Whether the chunked optimizer-state offload may drive this Muon instance.
+
+    The chunk planner assumes exactly the state schema of ``TensorParallelMuon``: one fp32
+    full-size ``momentum_buffer`` per param. ``LayerShardedMuon`` keeps that schema (it only
+    changes where Newton-Schulz runs and how the shards get there) and its ``step`` works
+    on whatever ``param_groups`` it is given, which is what the per-chunk stepping needs.
+    Other subclasses (``TensorParallelAdaptiveMuon`` adds second-moment state) are rejected
+    by exact type rather than ``isinstance`` so a new subclass cannot slip in with an
+    unplanned state window.
+    """
+    from .emerging_optimizers import TensorParallelMuon
+    from .layer_sharded_muon import LayerShardedMuon
+
+    return type(raw_optimizer) in (TensorParallelMuon, LayerShardedMuon)
+
+
 def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: bool = True) -> bool:
     """Whether a DDP bucket belongs to a LayerWise-managed buffer.
 
@@ -510,23 +527,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         Returns:
             Dict mapping ``id(param)`` -> ``(g_home, t_home)``.
         """
-        from megatron.core.optimizer.layer_sharded_muon import ParamSharding
+        from megatron.core.optimizer.layer_sharded_muon import assign_ns_homes_lpt
 
-        num_bins = gtp_remat_size * tp_size
-        candidates = [
-            (spec.ns_cost, p)
-            for p, spec in zip(params, specs)
-            if spec.sharding is not ParamSharding.REPLICATED
-        ]
-        candidates.sort(key=lambda c: -c[0])  # stable: equal costs keep param order
-        bin_cost = [0] * num_bins
-        assignment = {}
-        for cost, p in candidates:
-            min_bin = min(range(num_bins), key=lambda b: bin_cost[b])
-            # Bin b -> (g_home, t_home) = (b // tp_size, b % tp_size).
-            assignment[id(p)] = (min_bin // tp_size, min_bin % tp_size)
-            bin_cost[min_bin] += cost
-        return assignment
+        # The same LPT LayerShardedMuon runs per step() call under chunked offload; one
+        # implementation so the two balancing paths cannot drift apart.
+        by_index = assign_ns_homes_lpt(specs, gtp_remat_size, tp_size)
+        return {id(params[i]): home for i, home in by_index.items()}
 
     @staticmethod
     def compute_full_param_layout(
@@ -766,10 +772,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         # (--no-use-layer-wise-param-layout). It is small (embeddings, norms,
                         # scalars) and keeps its state on the GPU.
                         continue
-                    assert type(raw_optimizer) is TensorParallelMuon, (
+                    assert _is_offloadable_muon(raw_optimizer), (
                         "LayerWise chunked optimizer state offload currently supports exactly "
-                        "TensorParallelMuon with one fp32 full-size momentum tensor; got "
-                        f"{type(raw_optimizer).__name__}"
+                        "TensorParallelMuon and LayerShardedMuon (one fp32 full-size momentum "
+                        f"tensor); got {type(raw_optimizer).__name__}"
                     )
                     # Whole-parameter sharding can leave this rank with an optimizer object but
                     # no locally owned Muon parameters. Preserve the no-offloader path for it.
@@ -912,8 +918,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     'LayerShardedMuon: no NS homes to assign (single-rank domains or '
                     'replicated params only); step() runs local Newton-Schulz.',
                 )
-            inner.set_group_process_groups(group_axes)
+            # The marker mapping keeps the domain resolution valid when the chunked
+            # optimizer-state offload steps the optimizer on per-chunk subsets of its param
+            # groups (positions change, the cloned groups keep their marker).
+            inner.set_group_process_groups(
+                group_axes, marker_process_groups={False: dense_axes, True: expert_axes}
+            )
             inner.set_param_ns_homes(assignment)
+            # Under chunked offload each step() call sees one state chunk: balance the NS
+            # homes within the call, not over the whole domain (see
+            # LayerShardedMuon.set_rebalance_homes_per_call).
+            inner.set_rebalance_homes_per_call(
+                getattr(opt, '_optimizer_state_offloader', None) is not None
+            )
 
     @staticmethod
     def _check_gtp_group_matches(params: list, specs: list, gtp_remat_group) -> None:
