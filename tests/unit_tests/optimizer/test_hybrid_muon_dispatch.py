@@ -277,3 +277,36 @@ class TestHybridMuonExpertIdentity:
         plain = _get_param_groups([model], cfg, {})
         assert len(plain) == 1
         assert 'is_expert' not in plain[0]
+
+
+def test_hybrid_offload_prefetch_waits_for_each_child_step():
+    from types import SimpleNamespace
+
+    from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+    calls = []
+
+    class Child:
+        def __init__(self, name):
+            self.name = name
+
+        def prefetch_optimizer_master_weights_for_step(self):
+            calls.append((self.name, 'masters'))
+
+        def prefetch_optimizer_state_for_step(self):
+            calls.append((self.name, 'state'))
+
+    optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.config = SimpleNamespace(
+        chunked_optimizer_state_offload=True, optimizer_state_offload_fraction=1.0
+    )
+    optimizer.chained_optimizers = [Child('dense'), Child('expert')]
+    optimizer._managed_optimizer_state_offload_indices = (0, 1)
+    optimizer.prefetch_optimizer_state_for_gradient_finalization()
+    assert calls == [('dense', 'masters'), ('expert', 'masters'), ('dense', 'state')]
+    calls.clear()
+    optimizer._before_child_step(0)
+    assert calls == [('dense', 'state')]
+    calls.clear()
+    optimizer._before_child_step(1)
+    assert calls == [('expert', 'state')]

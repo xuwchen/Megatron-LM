@@ -1811,7 +1811,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
         This general-purpose entry can exceed a configured chunk staging bound because every
         child may hold a prefetched window concurrently. LayerWise uses a dedicated
-        gradient-finalization policy for its single managed Muon child.
+        gradient-finalization policy that stages its managed Muon children sequentially.
         """
 
         for optimizer in self.chained_optimizers:

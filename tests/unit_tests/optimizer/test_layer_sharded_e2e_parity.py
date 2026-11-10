@@ -106,6 +106,7 @@ class _LayerShardedHarness(_Harness):
         # Chunked optimizer-state offload: the wrapper around each LayerShardedMuon owns the
         # offloader; record how many state chunks it will step per iteration.
         self.offload_chunks = []
+        self.all_muon_offload_chunks = {}
 
         def visit_wrappers(opt):
             children = getattr(opt, 'chained_optimizers', None)
@@ -115,6 +116,10 @@ class _LayerShardedHarness(_Harness):
                 return
             inner = vars(opt).get('optimizer')
             offloader = vars(opt).get('_optimizer_state_offloader')
+            from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+
+            if isinstance(inner, TensorParallelMuon) and offloader is not None:
+                self.all_muon_offload_chunks[type(inner).__name__] = len(offloader.chunks)
             if isinstance(inner, LayerShardedMuon) and offloader is not None:
                 self.offload_chunks.append(len(offloader.chunks))
 
@@ -399,6 +404,53 @@ def test_moe_duplicated_batched_ns_matches_per_param_end_to_end():
                 f"max |loss diff| = {(loss_batched - loss_per_param).abs().max().item():.3e}; "
                 f"gather-ahead vs in-order max |loss diff| = "
                 f"{(loss_ahead - loss_batched).abs().max().item():.3e}"
+            )
+    finally:
+        harness.teardown_method(None)
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
+
+        update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)
+
+
+@pytest.mark.launch_on_gb200
+def test_hybrid_muon_kimi_grid_with_chunked_offload_end_to_end():
+    """Dense auto/per-head + expert LSH: offloading both children preserves updates."""
+    if Utils.world_size != 4:
+        pytest.skip("Requires exactly 4 torchrun ranks")
+    harness = _LayerShardedHarness()
+    harness.setup_method(None)
+    harness.seq_length = 64
+    harness.micro_batch_size = 1
+    try:
+        common = {
+            **_COMMON,
+            **_MOE,
+            'expert_tensor_parallel_size': 1,
+            'expert_tensor_parallel_num_weight_shards': 4,
+            'global_batch_size': 4,
+            'muon_tp_mode': 'auto',
+            'muon_expert_tp_mode': 'layer_sharded',
+            'muon_split_qkv': True,
+            'muon_split_qkv_per_head': True,
+        }
+        loss_resident = harness._run_test_helper(
+            tp_size=1, recipe=_RECIPE, fp8_param_gather=False, **common
+        )
+        assert harness.layer_sharded_instances == 1
+        assert harness.wired_groups > 0
+        assert harness.all_muon_offload_chunks == {}
+        loss_offload = harness._run_test_helper(
+            tp_size=1, recipe=_RECIPE, fp8_param_gather=False, **common, **_OFFLOAD
+        )
+        assert harness.layer_sharded_instances == 1
+        assert set(harness.all_muon_offload_chunks) == {'TensorParallelMuon', 'LayerShardedMuon'}
+        assert all(count > 1 for count in harness.all_muon_offload_chunks.values())
+        assert all(harness.rebalance_per_call)
+        _assert_bitwise_across_ranks(loss_resident, loss_offload, 'hybrid-kimi-grid+offload')
+        if torch.distributed.get_rank() == 0:
+            print(
+                f'[HYBRID OFFLOAD PARITY] {len(loss_resident)} steps bitwise identical; '
+                f'chunks={harness.all_muon_offload_chunks}'
             )
     finally:
         harness.teardown_method(None)
