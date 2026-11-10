@@ -1621,3 +1621,16 @@ def test_muon_cli_rejects_nonexistent_low_precision():
     parser = _add_regularization_args(ArgumentParser())
     with pytest.raises(SystemExit):
         parser.parse_args(["--muon-fp32-matmul-prec", "low"])
+
+
+@pytest.mark.parametrize("name", ["gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"])
+def test_gtp_userbuffer_flags_preserve_cli_contract(name):
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    flag = "--" + name.replace("_", "-")
+    assert getattr(parser.parse_args([]), name) is None
+    # A bare flag parses to []; validate_args expands it to both collectives.
+    assert getattr(parser.parse_args([flag]), name) == []
+    assert getattr(parser.parse_args([flag, "rs"]), name) == ["rs"]
+    with pytest.raises(SystemExit):
+        parser.parse_args([flag, "foo"])
