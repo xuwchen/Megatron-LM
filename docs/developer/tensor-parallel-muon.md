@@ -88,3 +88,9 @@ cross-rank expert layer sharding in a smoke test.
 process-group domains, dense split-QKV preservation, and EP1 semantic expert
 identity. GPU end-to-end and chunked-offload validation must accompany a new
 training recipe; constructor tests alone do not establish numerical parity.
+
+Hybrid modes with chunked offload create two state managers. Initialization occurs once
+per child. Gradient finalization stages only the first child's state; subsequent
+children prefetch immediately before their own update. Transfer streams remain shared
+and dense/expert parameter ownership is unchanged. End-to-end hybrid offload coverage
+uses dense auto with per-head splitting and expert layer sharding on TP1/GTP4/EGTP4.

@@ -52,8 +52,12 @@ next chunk, optimizer compute for the current chunk, and D2H for the previous ch
 The normal tensor-state staging bound is therefore about
 `2 * optimizer_state_offload_chunk_size_mb` per manager that is actively stepping, not one
 chunk; a single parameter's atomic tensor-state payload can exceed the target and produces a
-runtime warning. LayerWise has at most one non-empty Muon child, so its internal state manager uses
-the same two-slot bound. In the outer split Muon + Adam chain, however, a sibling
+runtime warning. Hybrid dense/expert Muon creates two LayerWise state managers, initialized once
+per child. Only the first child is state-prefetched during gradient finalization; later children
+are prefetched when reached in the optimizer chain, after the previous child has released its
+state windows and queued D2H. Copy completion remains asynchronous, so these are per-manager
+bounds rather than a strict bound on aggregate CUDA allocator residency at a child transition.
+In the outer split Muon + Adam chain, a sibling
 `DistributedOptimizer` can retain its first prefetched chunk while the LayerWise manager owns two
 slots. The aggregate across those two managers can therefore still approach
 `3 * optimizer_state_offload_chunk_size_mb`; the 256 MiB example can hold about 768 MiB during
@@ -64,9 +68,11 @@ completion does not block the host at the forward boundary.
 
 Every `ChainedOptimizer` recursively shares one copy-stream pair across its LayerWise and sibling
 `DistributedOptimizer` managers, including ordinary Adam dense/expert chains. Stream sharing
-serializes transfer order but does not merge managers' two-slot pools. LayerWise starts its single
+serializes transfer order but does not merge managers' two-slot pools. LayerWise starts its first
 managed child's first state chunk during gradient finalization, then pipelines that child's later
-chunks with optimizer compute. A host synchronization is used only for synchronous
+chunks with optimizer compute. Each following managed child starts state prefetch immediately
+before its own update. Both TensorParallelMuon and LayerShardedMuon retain the same momentum
+schema validation; unsupported optimizer subclasses still fail during setup. A host synchronization is used only for synchronous
 distributed-checkpoint access and one-time lazy state initialization.
 
 Selected master bindings and supported full-size state bindings become CPU tensors as soon as their
