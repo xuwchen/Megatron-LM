@@ -756,98 +756,94 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             optimizer.expert_tp_group = self.expert_tp_group
             optimizer.gtp_group = self.gtp_group
             optimizer.expert_gtp_group = self.expert_gtp_group
-            if (
-                config.chunked_optimizer_state_offload
-                and config.optimizer_state_offload_fraction > 0.0
-            ):
-                from .emerging_optimizers import TensorParallelMuon, offload_chunk_partition_key
+        if config.chunked_optimizer_state_offload and config.optimizer_state_offload_fraction > 0.0:
+            from .emerging_optimizers import TensorParallelMuon, offload_chunk_partition_key
 
-                offload_children = []
-                state_dtypes = (torch.float32,)
-                for optimizer in optimizers:
-                    if optimizer.optimizer is None:
-                        continue
-                    raw_optimizer = optimizer.optimizer
-                    if not isinstance(raw_optimizer, TensorParallelMuon):
-                        # The scalar-optimizer child that holds the non-Muon parameter groups
-                        # when no full param layout routes them to a sibling DistributedOptimizer
-                        # (--no-use-layer-wise-param-layout): embeddings, output layer, norms,
-                        # scalars. It is not offloaded, so the configured offload fraction
-                        # covers the Muon state only; say how much stays resident.
-                        resident_numel = sum(
-                            param.numel()
-                            for group in raw_optimizer.param_groups
-                            for param in group["params"]
-                        )
-                        if resident_numel:
-                            log_single_rank(
-                                logger,
-                                logging.INFO,
-                                "LayerWise chunked optimizer state offload: the "
-                                f"{type(raw_optimizer).__name__} child ({resident_numel:,} "
-                                "parameter elements on this rank) is not offloaded; its "
-                                "optimizer state and fp32 masters stay on the GPU.",
-                            )
-                        continue
-                    # The chunk planner assumes exactly the state schema of TensorParallelMuon:
-                    # one fp32 full-size momentum. Reject subclasses such as AdaptiveMuon rather
-                    # than silently underestimating their tensor-state window.
-                    assert _is_offloadable_muon(raw_optimizer), (
-                        "LayerWise chunked optimizer state offload currently supports exactly "
-                        "TensorParallelMuon and LayerShardedMuon (one fp32 full-size momentum "
-                        f"tensor); got {type(raw_optimizer).__name__}"
-                    )
-                    # Whole-parameter sharding can leave this rank with an optimizer object but
-                    # no locally owned Muon parameters. Preserve the no-offloader path for it.
-                    if not any(group["params"] for group in raw_optimizer.param_groups):
-                        continue
-                    master_params = [
-                        param for group in optimizer.fp32_from_float16_groups for param in group
-                    ]
-                    offload_children.append((optimizer, master_params))
-
-                assert len(offload_children) <= 1, (
-                    "LayerWise chunked optimizer state offload assumes at most one non-empty "
-                    f"TensorParallelMuon child; got {len(offload_children)}"
-                )
-                for optimizer, master_params in offload_children:
-                    # Expert weights get state chunks of their own: the batched Muon step
-                    # issues one collective per batch, and every rank of an expert GTP remat
-                    # group must form the same batches (see offload_chunk_partition_key).
-                    optimizer.enable_chunked_optimizer_state_offload(
-                        master_params=master_params,
-                        state_dtypes=state_dtypes,
-                        chunk_partition_key=offload_chunk_partition_key,
-                    )
-                    # The fp8 / MXFP8 LayerWise gather stages from fp32 main_param. With
-                    # overlap enabled, force that gather at the next iteration boundary before
-                    # master D2H so masters are still absent during forward/backward.
-                    offloader = optimizer._optimizer_state_offloader
-                    optimizer.set_optimizer_state_offload_deferred_lifecycle(
-                        state_prefetch_to_step=offloader is not None,
-                        master_offload_for_param_sync=(
-                            offloader is not None
-                            and bool(offloader.selected_params)
-                            and self.use_fp8_param_sync
-                            and self.overlap_param_gather
-                        ),
-                    )
-
-            # shard_params() removed non-owned params from the local optimizer groups, so the
-            # Float16 wrapping above only clears the TE high-precision init copy (a full-size CPU
-            # tensor per fp8 param) for locally owned params. Without this sweep every DP rank
-            # retains ~(dp-1)/dp of the LayerWise matrix params' bf16 CPU copies for the whole
-            # run. The per-rank ownership lists cover all gathered params (owned entries were
-            # already cleared during master creation; TE's clear is a no-op then). Scoped to
-            # LayerWise-managed params only: sibling DistOpt params must keep their init val
-            # until their own optimizer's master creation consumes it.
-            for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
-                if not params_list:
+            offload_children = []
+            state_dtypes = (torch.float32,)
+            for optimizer in optimizers:
+                if optimizer.optimizer is None:
                     continue
-                for per_rank_params in params_list:
-                    for p in per_rank_params:
-                        if hasattr(p, 'clear_high_precision_init_val'):
-                            p.clear_high_precision_init_val()
+                raw_optimizer = optimizer.optimizer
+                if not isinstance(raw_optimizer, TensorParallelMuon):
+                    # The scalar-optimizer child that holds the non-Muon parameter groups
+                    # when no full param layout routes them to a sibling DistributedOptimizer
+                    # (--no-use-layer-wise-param-layout): embeddings, output layer, norms,
+                    # scalars. It is not offloaded, so the configured offload fraction covers
+                    # the Muon state only; say how much stays resident.
+                    resident_numel = sum(
+                        param.numel()
+                        for group in raw_optimizer.param_groups
+                        for param in group["params"]
+                    )
+                    if resident_numel:
+                        log_single_rank(
+                            logger,
+                            logging.INFO,
+                            "LayerWise chunked optimizer state offload: the "
+                            f"{type(raw_optimizer).__name__} child ({resident_numel:,} parameter "
+                            "elements on this rank) is not offloaded; its optimizer state and "
+                            "fp32 masters stay on the GPU.",
+                        )
+                    continue
+                # The chunk planner assumes exactly the state schema of TensorParallelMuon:
+                # one fp32 full-size momentum. Reject subclasses such as AdaptiveMuon rather
+                # than silently underestimating their tensor-state window.
+                assert _is_offloadable_muon(raw_optimizer), (
+                    "LayerWise chunked optimizer state offload currently supports exactly "
+                    "TensorParallelMuon and LayerShardedMuon (one fp32 full-size momentum "
+                    f"tensor); got {type(raw_optimizer).__name__}"
+                )
+                # Whole-parameter sharding can leave this rank with an optimizer object but
+                # no locally owned Muon parameters. Preserve the no-offloader path for it.
+                if not any(group["params"] for group in raw_optimizer.param_groups):
+                    continue
+                master_params = [
+                    param for group in optimizer.fp32_from_float16_groups for param in group
+                ]
+                offload_children.append((optimizer, master_params))
+
+            # Each dense/expert Muon child owns disjoint parameters and its own state
+            # manager. Initialize each manager once; ChainedOptimizer shares their
+            # transfer streams, and _before_child_step stages each child just in time.
+            for optimizer, master_params in offload_children:
+                # Expert weights get state chunks of their own: the batched Muon step issues
+                # one collective per batch, and every rank of an expert GTP remat group must
+                # form the same batches (see offload_chunk_partition_key).
+                optimizer.enable_chunked_optimizer_state_offload(
+                    master_params=master_params,
+                    state_dtypes=state_dtypes,
+                    chunk_partition_key=offload_chunk_partition_key,
+                )
+                # The fp8 / MXFP8 LayerWise gather stages from fp32 main_param. With
+                # overlap enabled, force that gather at the next iteration boundary before
+                # master D2H so masters are still absent during forward/backward.
+                offloader = optimizer._optimizer_state_offloader
+                optimizer.set_optimizer_state_offload_deferred_lifecycle(
+                    state_prefetch_to_step=offloader is not None,
+                    master_offload_for_param_sync=(
+                        offloader is not None
+                        and bool(offloader.selected_params)
+                        and self.use_fp8_param_sync
+                        and self.overlap_param_gather
+                    ),
+                )
+
+        # shard_params() removed non-owned params from the local optimizer groups, so the
+        # Float16 wrapping above only clears the TE high-precision init copy (a full-size CPU
+        # tensor per fp8 param) for locally owned params. Without this sweep every DP rank
+        # retains ~(dp-1)/dp of the LayerWise matrix params' bf16 CPU copies for the whole
+        # run. The per-rank ownership lists cover all gathered params (owned entries were
+        # already cleared during master creation; TE's clear is a no-op then). Scoped to
+        # LayerWise-managed params only: sibling DistOpt params must keep their init val
+        # until their own optimizer's master creation consumes it.
+        for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
+            if not params_list:
+                continue
+            for per_rank_params in params_list:
+                for p in per_rank_params:
+                    if hasattr(p, 'clear_high_precision_init_val'):
+                        p.clear_high_precision_init_val()
 
         super().__init__(optimizers)
 
@@ -1430,7 +1426,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         return self._managed_optimizer_state_offload_indices
 
     def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
-        """Prefetch all masters and the managed Muon child's first state chunk."""
+        """Prefetch all masters and only the first managed Muon child's state chunk."""
 
         self.prefetch_optimizer_master_weights_for_step()
         managed_indices = self._managed_optimizer_state_offload_child_indices()
@@ -1438,13 +1434,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             self.chained_optimizers[managed_indices[0]].prefetch_optimizer_state_for_step()
 
     def _before_child_step(self, optimizer_idx: int) -> None:
-        """Ensure the managed Muon child's state is prefetched before child steps."""
+        """Stage each managed child when it is reached, after the preceding child stepped."""
 
         managed_indices = self._managed_optimizer_state_offload_child_indices()
         if not managed_indices:
             return
         if optimizer_idx == 0:
             self.chained_optimizers[managed_indices[0]].prefetch_optimizer_state_for_step()
+        elif optimizer_idx in managed_indices:
+            self.chained_optimizers[optimizer_idx].prefetch_optimizer_state_for_step()
 
     def start_param_sync_for_bucket_group_subset(self, force_sync: bool = False) -> None:
         """Trigger ``start_param_sync`` on LayerWise-managed bucket groups only.
