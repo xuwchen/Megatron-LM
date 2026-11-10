@@ -70,3 +70,31 @@ Existing coverage is in `tests/unit_tests/optimizer/test_layer_sharded_muon.py`,
 cases require four GPUs and include dense TP2/GTP2, expert ETP2/EGTP2, and
 Kimi TP1/GTP4/EGTP4. Historical validation on the source branch is not a GPU
 validation of this new combination with the latest PR #7533.
+
+## Separate dense and routed-expert Muon modes
+
+`--muon-tp-mode auto --muon-expert-tp-mode layer_sharded` selects
+TensorParallelMuon for dense weights and LayerShardedMuon for routed MoE expert
+weights. An unset expert mode inherits the dense mode. Shared experts stay in the
+dense family. The override requires Muon, a model with experts, and the layer-wise
+distributed optimizer when either mode is layer-sharded.
+
+The integration ports hybrid dispatch from Shiqing's commits
+`426764af83c9443d7607da07ef81a05fec48d456` and
+`6c77e623b582b024a3a6434ce62223b0a7b20fc0`, preserving the Kimi implementation
+of layer-sharded chunked offload. Semantic expert identity (`param.expert_tp`)
+is independent of the gradient communication marker (`is_expert_parallel`): at
+EP1 with matching dense/expert TP and GTP sizes, expert parameters can use dense
+gradient communication while still requiring the expert optimizer mode.
+
+Dense QKV/per-head splitting remains available with dense `auto`; the expert
+optimizer receives splitting disabled since routed experts have no QKV weights.
+Dense `layer_sharded` continues to require unsplit matrices. Expert sharding
+uses expert GTP/TP process groups, and the existing offloader dispatches each
+chunk to its owning base optimizer. Use EGTP greater than one to exercise
+cross-rank expert layer sharding in a smoke test.
+
+`tests/unit_tests/optimizer/test_hybrid_muon_dispatch.py` checks class selection,
+process-group domains, dense split-QKV preservation, and EP1 semantic expert
+identity. GPU end-to-end and chunked-offload validation must accompany a new
+training recipe; constructor tests alone do not establish numerical parity.
