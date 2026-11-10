@@ -39,3 +39,34 @@ implementation keeps Newton-Schulz arithmetic in FP32 for this setting, while
 `medium` casts its normalized input to BF16. This changes arithmetic precision;
 it does not change the logical TP matrix or per-head splitting domain. Training
 trajectory parity still requires an end-to-end comparison.
+
+## Layer-sharded Muon with chunked optimizer-state offload
+
+The Kimi perf integration carries commit
+[`ace7d48b747561df01b8e8571336d5178637c23f`](https://github.com/xuwchen/Megatron-LM/commit/ace7d48b747561df01b8e8571336d5178637c23f)
+from `gtp-kimi-k3-main-rebase-lsh-offload`. Only this optimizer change is
+cherry-picked; its source branch's AG-storage and RS-output release commits
+are not dependencies and are excluded from `gtp-kimi-k3-perf-1110`.
+
+Use `--optimizer muon --use-distributed-optimizer --muon-tp-mode layer_sharded`
+with `--muon-no-split-qkv --chunked-optimizer-state-offload` and a positive
+`--optimizer-state-offload-fraction`. Disable `muon_split_qkv_per_head` in
+inherited recipes as well. Layer-sharded Newton-Schulz currently operates on
+whole matrices, so a numerical or timing comparison must also disable
+split-QKV in the duplicated reference.
+
+The offloader steps the optimizer on one state chunk at a time. Dense/expert
+process groups are resolved from the `is_expert_parallel` marker, which
+survives chunk repacking, rather than the group's position in the temporary
+list. Newton-Schulz homes are LPT-balanced within each call; exchange plans
+are cached by parameter identities and process-group domain. The duplicated
+optimizer's cross-step gather prefetch hook is inert on the layer-sharded
+path. The state-schema check accepts exactly `TensorParallelMuon` and
+`LayerShardedMuon`, and continues to reject AdaptiveMuon.
+
+Existing coverage is in `tests/unit_tests/optimizer/test_layer_sharded_muon.py`,
+`tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py`, and
+`tests/unit_tests/test_optimizer_state_offloading.py`. The distributed parity
+cases require four GPUs and include dense TP2/GTP2, expert ETP2/EGTP2, and
+Kimi TP1/GTP4/EGTP4. Historical validation on the source branch is not a GPU
+validation of this new combination with the latest PR #7533.
