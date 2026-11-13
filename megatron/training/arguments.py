@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 
 from megatron.core.config import set_experimental_flag
+from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
@@ -1501,14 +1502,21 @@ def validate_args(args, defaults={}):
                 "buffer via replace_raw_data is unsupported)."
             )
 
+        for attr in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
+            setattr(args, attr, normalize_gtp_nccl_ub(getattr(args, attr, None)))
+
+        gtp_ub_collectives = (args.gtp_remat_nccl_ub or []) + (args.gtp_expert_remat_nccl_ub or [])
+
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
         # windows), which contradicts --disable-symmetric-registration.
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        if gtp_ub_collectives:
             assert not getattr(args, 'disable_symmetric_registration', False), (
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
             )
-            if getattr(args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False):
+            if "rs" in gtp_ub_collectives and getattr(
+                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
+            ):
                 print_rank_0(
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
@@ -3383,11 +3391,6 @@ def _add_distributed_args(parser):
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set. '
                        'Cannot be combined with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub, which require symmetric windows.')
-    group.add_argument('--gtp-remat-nccl-ub', action='store_true', dest='gtp_remat_nccl_ub',
-                       default=False, help='Register the wgrad reduce-scatter send buffers with NCCL symmetric '
-                       'memory on the GTP group, independent of --use-nccl-ub (which covers the DP group).')
-    group.add_argument('--gtp-expert-remat-nccl-ub', action='store_true', dest='gtp_expert_remat_nccl_ub',
-                       default=False, help='Like --gtp-remat-nccl-ub but for routed-expert (EGTP) groups.')
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
