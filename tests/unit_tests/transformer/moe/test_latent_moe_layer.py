@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.extensions import transformer_engine as transformer_engine_module
+from megatron.core.extensions.transformer_engine import TELinear, TERMSNormDuplicatedLinear
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -16,6 +17,14 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+
+
+class _FusedLatentNormProcessGroup:
+    def rank(self):
+        return 0
+
+    def size(self):
+        return 2
 
 
 class _RecordingLinear(torch.nn.Module):
