@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from packaging.version import Version
 
+import megatron.core.optimizer.emerging_optimizers as eo_mod
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -29,6 +31,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     _get_qkv_split_shapes,
     _localize_qkv_split_shapes,
     _qkv_split_groups_are_complete,
+    _select_tp_mode,
     get_supported_coefficient_types,
     validate_coefficient_type,
 )
