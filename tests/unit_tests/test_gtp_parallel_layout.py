@@ -136,6 +136,39 @@ class TestGTPParallelLayout:
         assert layout.dp == 1
         assert layout.batch_parallel_size == (64 // tp) // num_sequence_shards
 
+    @pytest.mark.parametrize("cp,consecutive", [(1, True), (2, False)])
+    def test_packed_buffer_ranks_are_consecutive_without_configured_cp(self, cp, consecutive):
+        """DpBalancedScheduler gives packed buffer ``j // cp_size`` to data-group rank ``j``."""
+        num_sequence_shards, weight = 4, 8
+        layout = GTPParallelLayout(2 * cp * weight, 1, 1, cp, weight, num_sequence_shards)
+        cp_group_of = _by_rank(layout.data.get_ranks("cp"))
+        cp_size = cp * num_sequence_shards
+        blocks_are_cp_groups = all(
+            sorted(cp_group_of[group[start]]) == sorted(group[start : start + cp_size])
+            for group in layout.data.get_ranks("dp-cp-gtp_remat")
+            for start in range(0, len(group), cp_size)
+        )
+        assert blocks_are_cp_groups is consecutive
+
+    def test_packing_scheduler_needs_the_shards_to_be_the_whole_cp_group(self):
+        common = dict(
+            tensor_model_parallel_size=1,
+            tensor_parallel_num_weight_shards=8,
+            tensor_parallel_num_sequence_shards=8,
+            max_seqlen_per_dp_cp_rank=4096,
+        )
+        config = ModelParallelConfig(
+            context_parallel_size=8, sequence_packing_scheduler="dp_balanced", **common
+        )
+        assert config.gtp_remat_num_sequence_shards == 8
+        assert config.variable_seq_lengths
+        with pytest.raises(ValueError, match="on top of the sequence shards"):
+            ModelParallelConfig(
+                context_parallel_size=16, sequence_packing_scheduler="dp_balanced", **common
+            )
+        with pytest.raises(ValueError):
+            ModelParallelConfig(context_parallel_size=8, dynamic_context_parallel=True, **common)
+
     @pytest.mark.parametrize("tp,sp", [(1, False), (2, False), (2, True)])
     def test_default_has_one_gtp_sequence_shard(self, tp, sp):
         shards, num_sequence_shards = resolve_tensor_parallel_sequence_shards(tp, None, 4, sp)

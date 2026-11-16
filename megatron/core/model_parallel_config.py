@@ -729,7 +729,25 @@ class ModelParallelConfig:
                 )
 
         if self.gtp_remat_num_sequence_shards > 1 and self.sequence_packing_scheduler is not None:
-            raise ValueError("GTP sequence sharding does not support sequence_packing_scheduler")
+            # The packing scheduler hands packed buffer ``j // cp_size`` to rank ``j`` of the
+            # data-distribution group, so the CP ranks of one buffer must be consecutive there.
+            # With sequence shards the ranks are ordered TP, sequence shard, remaining GTP
+            # ranks, configured CP, DP (GTPParallelLayout): the CP ranks are consecutive only
+            # when the sequence shards are the whole runtime CP group. Dynamic CP regroups the
+            # ranks per microbatch and is not covered.
+            if self.sequence_packing_scheduler != 'dp_balanced':
+                raise ValueError(
+                    "GTP sequence sharding supports only the dp_balanced "
+                    "sequence_packing_scheduler, got "
+                    f"{self.sequence_packing_scheduler!r}"
+                )
+            if self.context_parallel_size != self.gtp_remat_num_sequence_shards:
+                raise ValueError(
+                    "GTP sequence sharding supports sequence_packing_scheduler only without "
+                    "configured context parallelism on top of the sequence shards: runtime "
+                    f"context_parallel_size ({self.context_parallel_size}) must equal the "
+                    f"number of sequence shards ({self.gtp_remat_num_sequence_shards})"
+                )
 
         if self.sequence_packing_scheduler is not None:
             supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
