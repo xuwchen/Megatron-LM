@@ -1973,7 +1973,7 @@ class TransformerConfig(ModelParallelConfig):
         overlap), fine-grained activation offloading, and MTP in the standard
         or hybrid last-stage placement. Everything rejected below either has no
         mechanism yet (CUDA graphs, full recompute, EP-overlap fine-grained
-        schedule, zero-layer virtual chunks, the per-layer CP layout manager,
+        schedule, zero-layer virtual chunks, per-layer CP layout conversion,
         wide residuals, shortcut MoE blocks) or
         would silently bypass the AttnRes residual interception (fused residual
         norms, fp32 residual connection) or the interleaved schedule's uniform
