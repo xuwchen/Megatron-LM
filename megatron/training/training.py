@@ -741,9 +741,18 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     ``_seqlen_stats_active`` flag is set so that ``consume_*`` knows to issue
     the all-reduce; BSHD callers that never invoke this function leave the
     flag at ``False`` and pay zero collective cost.
+
+    A no-op for the rest of an iteration that ``set_seqlen_stats_in_iteration`` has
+    seeded with global totals: those already cover every rank's micro-batches.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if cu_seqlens is None or cu_seqlens.numel() < 2:
+        return
+    if _seqlen_stats_active and _seqlen_stats_are_global:
+        # The training loop already seeded this iteration with the totals of the whole
+        # global batch (``set_seqlen_stats_in_iteration``, sequence-packing scheduler).
+        # Adding this rank's micro-batch would count it twice and, by clearing the
+        # global mark, make ``consume_*`` sum the seeded totals over every rank.
         return
     # Pin the accumulator to the current CUDA device when available so the
     # eventual all-reduce can use NCCL even if a caller passed a CPU tensor
@@ -765,7 +774,12 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
 
 
 def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
-    """Seed per-iteration THD FLOPs stats that were already computed globally."""
+    """Seed per-iteration THD FLOPs stats that were already computed globally.
+
+    The totals cover the whole global batch, so ``consume_*`` returns them as they are
+    (no all-reduce) and later ``update_seqlen_stats_from_cu_seqlens`` calls of the same
+    iteration are ignored.
+    """
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if total_real_tokens is None or seqlen_squared_sum is None:
         return
