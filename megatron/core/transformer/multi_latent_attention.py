@@ -17,6 +17,7 @@ except ImportError:
     HAVE_EINOPS = False
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel.layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_row_copy import contiguous_rows
@@ -538,8 +539,6 @@ class MultiLatentAttention(Attention):
 
         # hidden_states: [sq, b, h]
 
-        gate_input = hidden_states
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
         if inference_context and not inference_context.is_static_batching():
             assert (
@@ -554,17 +553,26 @@ class MultiLatentAttention(Attention):
             if packed_seq_params is not None and packed_seq_params.cp_group is not None
             else self.pg_collection.cp
         )
-        input_partition_mode = (
-            packed_seq_params.cp_partition_mode
-            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
-            else getattr(self, "_cp_input_partition_mode", self.config.cp_partition_mode)
+        # MLA RoPE and core attention consume the zigzag CP layout. Like Attention.forward,
+        # convert the incoming layout to zigzag here and restore the input layout on the
+        # output (upstream pull request 7545).
+        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            key_value_states=key_value_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=cp_group,
+            tp_group=self.pg_collection.tp,
+            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            target_partition_mode="zigzag",
+            sequence_parallel=self.config.sequence_parallel,
+            source_partition_mode=getattr(self, "_cp_input_partition_mode", None),
+            config=self.config,
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
         )
-        if cp_group is not None and get_pg_size(cp_group) > 1 and input_partition_mode != "zigzag":
-            raise ValueError(
-                "MultiLatentAttention requires cp_partition_mode='zigzag', but "
-                f"the input layout is {input_partition_mode!r}. CP partition "
-                "conversion must be handled before entering MLA."
-            )
+        # The output gate is applied to the core attention output, which is in the zigzag
+        # layout, so it must read the converted hidden states.
+        gate_input = hidden_states
 
         # =====================
         # Query, Key, and Value
@@ -719,6 +727,11 @@ class MultiLatentAttention(Attention):
         with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+
+        if back_to_input_converter is not None:
+            output = back_to_input_converter.convert(
+                output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
 
         return output, bias
 
