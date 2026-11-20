@@ -189,6 +189,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "kda_f_lora_rank": None,
     "kda_gate_lora_rank": None,
     "kda_lower_bound": None,
+    "kda_recompute_reuse_forward_state": False,
     "kda_safe_gate": False,
     "kitchen_attention_backend": "sdpa",
     "kv_channels": 128,

@@ -17,6 +17,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net import forward_state_reuse
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
@@ -292,6 +293,12 @@ class KimiDeltaAttention(_GDNBase):
         self.gate_params_dtype = torch.float32
         self.gated_delta_rule = chunk_kda
 
+        # With gdn recompute and chunk-wise CP, the recompute takes the initial state the
+        # forward pass merged across the CP group instead of exchanging it again.
+        self.reuse_forward_state = self.config.kda_recompute_reuse_forward_state
+        if self.reuse_forward_state:
+            forward_state_reuse.install()
+
     def _get_in_proj_qkv_layout(self) -> QKVLayout:
         """Describe KDA's rank-major packed input projection for Muon splitting."""
 
@@ -540,8 +547,14 @@ class KimiDeltaAttention(_GDNBase):
 
         if self.recompute_gdn and self.training:
 
+            forward_state_slot = (
+                forward_state_reuse.ForwardStateSlot() if self.reuse_forward_state else None
+            )
+
             def _checkpointed_compute(hidden_states):
-                return self._forward_compute(
+                return forward_state_reuse.run(
+                    forward_state_slot,
+                    self._forward_compute,
                     hidden_states,
                     batch,
                     seq_len_post_headwise,

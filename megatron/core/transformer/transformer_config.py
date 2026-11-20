@@ -584,6 +584,12 @@ class TransformerConfig(ModelParallelConfig):
     kda_lower_bound: Optional[float] = None
     """Lower bound for the KDA gate when kda_safe_gate=True; must be in [-5, 0)."""
 
+    kda_recompute_reuse_forward_state: bool = False
+    """With 'gdn' in recompute_modules and chunk-wise context parallelism, hand the recompute
+    of a KDA layer the initial state its forward pass already merged across the CP group
+    instead of exchanging it again (one summary kernel, one all-gather and one merge fewer per
+    layer and step). The state is held from the forward pass to the layer's recompute."""
+
     ####################
     # initialization
     ####################
