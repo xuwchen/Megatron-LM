@@ -848,6 +848,10 @@ def get_batch_on_this_rank_for_sequence_packing(
                 tp_cp_group,
             ),
             tokens_per_sample=None,
+            # getattr: callers may pass a stand-in that carries the layouts only.
+            contiguous_padded_qkv_seqlens=getattr(
+                config, "cp_contiguous_padded_qkv_seqlens", False
+            ),
         )
 
     # Extract the data from batch after broadcasting.

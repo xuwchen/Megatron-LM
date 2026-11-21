@@ -1387,6 +1387,15 @@ class TransformerConfig(ModelParallelConfig):
     attention_cp_layout: CPLayout = "zigzag"
     """CP layout for softmax-attention layers."""
 
+    cp_contiguous_padded_qkv_seqlens: bool = False
+    """Give a contiguous CP view of a packed batch the padded sequence lengths.
+
+    By default a contiguous view under CP carries the sequences' actual lengths and padding
+    takes no part in attention, while a batch with a single zigzag view carries the padded
+    lengths. Set this to make a contiguous residual stream (``linear_cp_layout='contiguous'``)
+    compute the same thing as its zigzag counterpart on packed data.
+    """
+
     ##################
     # Cuda Graphs
     ##################

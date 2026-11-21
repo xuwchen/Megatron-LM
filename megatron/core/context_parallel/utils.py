@@ -172,8 +172,14 @@ def _build_packed_seq_params(
     tokens_per_sample: int | None,
     use_logical_qkv_seqlens: bool = False,
     pad_between_seqs: bool | None = None,
+    contiguous_padded_qkv_seqlens: bool = False,
 ) -> PackedSeqParams | None:
-    """Build packed sequence metadata for one physical CP layout."""
+    """Build packed sequence metadata for one physical CP layout.
+
+    A contiguous view under CP hands the layers the sequences' actual lengths, so padding
+    takes no part in attention. ``contiguous_padded_qkv_seqlens`` hands it the padded lengths
+    instead, which is what a batch with a single zigzag view gets from the standard sharder.
+    """
     cu_seqlens = batch.get('cu_seqlens')
     if cu_seqlens is None:
         return None
@@ -185,7 +191,8 @@ def _build_packed_seq_params(
     physical_cu_seqlens = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
     qkv_cu_seqlens = (
         cu_seqlens
-        if (layout == "contiguous" and cp_size > 1) or use_logical_qkv_seqlens
+        if (layout == "contiguous" and cp_size > 1 and not contiguous_padded_qkv_seqlens)
+        or use_logical_qkv_seqlens
         else physical_cu_seqlens
     )
 
@@ -221,6 +228,7 @@ def get_batches_on_this_cp_rank(
     tp_group: torch.distributed.ProcessGroup | None = None,
     tp_cp_group: torch.distributed.ProcessGroup | None = None,
     tokens_per_sample: int | None = None,
+    contiguous_padded_qkv_seqlens: bool = False,
 ) -> ContextParallelBatch:
     """Partition a batch and prepare metadata for the requested CP layouts.
 
@@ -292,6 +300,7 @@ def get_batches_on_this_cp_rank(
                 tokens_per_sample=tokens_per_sample,
                 use_logical_qkv_seqlens=layout == "zigzag",
                 pad_between_seqs=(zigzag_metadata.pad_between_seqs if layout == "zigzag" else None),
+                contiguous_padded_qkv_seqlens=contiguous_padded_qkv_seqlens,
             )
             for layout, layout_batch in batches_by_layout.items()
         }
@@ -355,6 +364,7 @@ def get_batches_on_this_cp_rank(
             layout=layout,
             cp_size=cp_size,
             tokens_per_sample=tokens_per_sample,
+            contiguous_padded_qkv_seqlens=contiguous_padded_qkv_seqlens,
         )
         for layout in requested_layouts
     }
