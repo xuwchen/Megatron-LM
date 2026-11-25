@@ -11,6 +11,16 @@ the full model on 256 GB300 GPUs and 902 TFLOP/s/GPU for the 9L proxy on 64
 GPUs. A separate 9L 64K real-data check qualified the pure-a2a attention
 path; see the validation scope below.**
 
+## GTP at 1M context
+
+A fifth recipe runs the full model on Generalized Tensor Parallelism (GTP), without TP or PP,
+with one 1,048,576-token sequence per microbatch:
+[gb300/mxfp8_THD1M_256GPU_GTP64EP64CP128_muon.yaml](gb300/mxfp8_THD1M_256GPU_GTP64EP64CP128_muon.yaml)
+(GTP64 / EP64 / CP128 on 256 GB300 GPUs; 855.6 TFLOP/s/GPU recorded on 2026-11-22 with mock
+data and no MTP depth). [GTP_1M_TRAINING_GUIDE.md](GTP_1M_TRAINING_GUIDE.md) describes its
+layout, launch scripts and measurements. The rest of this document covers the four TP/PP
+recipes.
+
 ## Known limitations on this main-based branch
 
 - **Context-parallel layout.** These recipes drive CP through the single-knob
@@ -133,7 +143,9 @@ settings, not the complete HybridEP/Quantile Balancing recipe. No full-model
 64K latent CP result is claimed here.
 
 The 512K throughput runs use mock data and do not establish long-context
-convergence. Full-model 1M-context training on 256 GPUs remains future work.
+convergence. Full-model 1M-context training on 256 GPUs remains future work for
+these TP/PP recipes; the GTP recipe's 1M throughput run is recorded in
+[GTP_1M_TRAINING_GUIDE.md](GTP_1M_TRAINING_GUIDE.md).
 
 ## Build the container
 
